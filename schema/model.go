@@ -81,6 +81,17 @@ func (r *Relation) HasColumn(name string) bool {
 	return ok
 }
 
+// ColumnNames returns the column names in ordinal order. It is the whole-row
+// projection a write returns when the client asks for the representation but
+// names no explicit columns.
+func (r *Relation) ColumnNames() []string {
+	out := make([]string, len(r.Columns))
+	for i, c := range r.Columns {
+		out[i] = c.Name
+	}
+	return out
+}
+
 // Key is the canonical map key for a relation. Names are matched
 // case-sensitively, matching PostgreSQL's quoted-identifier behavior; an
 // unqualified request resolves against the first exposed schema via Lookup.

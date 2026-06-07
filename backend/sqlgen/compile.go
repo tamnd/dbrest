@@ -1,7 +1,9 @@
 package sqlgen
 
 import (
+	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/tamnd/dbrest/ir"
@@ -85,6 +87,194 @@ func CompileCount(d Dialect, q *ir.Query) (*Statement, *pgerr.APIError) {
 		}
 	}
 	return &Statement{SQL: b.sb.String(), Args: b.args}, nil
+}
+
+// CompileInsert lowers an insert (or upsert) to a parameterized INSERT. Every
+// payload value is bound; absent columns take the engine DEFAULT or a bound NULL
+// per the missing= preference. An upsert appends the dialect's ON CONFLICT
+// clause. returning names the columns to read back (the projection for the
+// representation, or the primary key for the Location header), or is empty when
+// the client wants no rows back.
+func CompileInsert(d Dialect, q *ir.Query, returning []string) (*Statement, *pgerr.APIError) {
+	w := q.Write
+	if w == nil || len(w.Rows) == 0 {
+		return nil, pgerr.ErrParse("insert payload is empty")
+	}
+	b := &builder{d: d}
+	b.sb.WriteString("INSERT INTO ")
+	b.sb.WriteString(b.qualify(q.Relation))
+
+	if len(w.Columns) == 0 {
+		// An empty object inserts a row of engine defaults.
+		b.sb.WriteString(" DEFAULT VALUES")
+	} else {
+		b.sb.WriteString(" (")
+		for i, c := range w.Columns {
+			if i > 0 {
+				b.sb.WriteString(", ")
+			}
+			b.sb.WriteString(d.QuoteIdent(c))
+		}
+		b.sb.WriteString(") VALUES ")
+		for ri, row := range w.Rows {
+			if ri > 0 {
+				b.sb.WriteString(", ")
+			}
+			b.sb.WriteString("(")
+			for ci, c := range w.Columns {
+				if ci > 0 {
+					b.sb.WriteString(", ")
+				}
+				if val, ok := row[c]; ok {
+					b.sb.WriteString(b.bind(writeArg(val)))
+				} else if w.Missing == ir.MissingNull {
+					b.sb.WriteString(b.bind(nil))
+				} else {
+					b.sb.WriteString("DEFAULT")
+				}
+			}
+			b.sb.WriteString(")")
+		}
+	}
+
+	if w.Conflict != nil {
+		if err := b.writeConflict(w); err != nil {
+			return nil, err
+		}
+	}
+	if err := b.writeReturning(returning); err != nil {
+		return nil, err
+	}
+	return &Statement{SQL: b.sb.String(), Args: b.args}, nil
+}
+
+// CompileUpdate lowers a patch to a parameterized UPDATE ... SET ... WHERE. The
+// SET columns are written in a deterministic order; the filter tree becomes the
+// WHERE so a patch without a filter touches every row (matching PostgREST).
+func CompileUpdate(d Dialect, q *ir.Query, returning []string) (*Statement, *pgerr.APIError) {
+	w := q.Write
+	if w == nil || len(w.Set) == 0 {
+		return nil, pgerr.ErrParse("update payload is empty")
+	}
+	b := &builder{d: d}
+	b.sb.WriteString("UPDATE ")
+	b.sb.WriteString(b.qualify(q.Relation))
+	b.sb.WriteString(" SET ")
+	cols := sortedKeys(w.Set)
+	for i, c := range cols {
+		if i > 0 {
+			b.sb.WriteString(", ")
+		}
+		b.sb.WriteString(d.QuoteIdent(c))
+		b.sb.WriteString(" = ")
+		b.sb.WriteString(b.bind(writeArg(w.Set[c])))
+	}
+	if q.Where != nil {
+		b.sb.WriteString(" WHERE ")
+		if err := b.writeCond(*q.Where); err != nil {
+			return nil, err
+		}
+	}
+	if err := b.writeReturning(returning); err != nil {
+		return nil, err
+	}
+	return &Statement{SQL: b.sb.String(), Args: b.args}, nil
+}
+
+// CompileDelete lowers a delete to a parameterized DELETE ... WHERE. As with
+// update, a delete without a filter removes every row.
+func CompileDelete(d Dialect, q *ir.Query, returning []string) (*Statement, *pgerr.APIError) {
+	b := &builder{d: d}
+	b.sb.WriteString("DELETE FROM ")
+	b.sb.WriteString(b.qualify(q.Relation))
+	if q.Where != nil {
+		b.sb.WriteString(" WHERE ")
+		if err := b.writeCond(*q.Where); err != nil {
+			return nil, err
+		}
+	}
+	if err := b.writeReturning(returning); err != nil {
+		return nil, err
+	}
+	return &Statement{SQL: b.sb.String(), Args: b.args}, nil
+}
+
+// writeConflict appends the upsert clause built from the write's conflict spec,
+// asking the dialect for the engine's spelling.
+func (b *builder) writeConflict(w *ir.WriteSpec) *pgerr.APIError {
+	spec := UpsertSpec{Ignore: w.Conflict.Resolution == ir.ConflictIgnore}
+	for _, t := range w.Conflict.Target {
+		spec.Target = append(spec.Target, b.d.QuoteIdent(t))
+	}
+	if !spec.Ignore {
+		for _, c := range w.Columns {
+			spec.Update = append(spec.Update, b.d.QuoteIdent(c))
+		}
+	}
+	clause, err := b.d.Upsert(spec)
+	if err != nil {
+		return pgerr.ErrInternal(err.Error())
+	}
+	b.sb.WriteString(" ")
+	b.sb.WriteString(clause)
+	return nil
+}
+
+// writeReturning appends the dialect's row-returning clause for the given
+// columns, or nothing when none are requested. An engine that cannot return
+// written rows reports it here as a clear unsupported error.
+func (b *builder) writeReturning(cols []string) *pgerr.APIError {
+	if len(cols) == 0 {
+		return nil
+	}
+	quoted := make([]string, len(cols))
+	for i, c := range cols {
+		quoted[i] = b.d.QuoteIdent(c)
+	}
+	clause, ok := b.d.Returning(quoted)
+	if !ok {
+		return pgerr.ErrUnsupported("returning written rows", "sql")
+	}
+	b.sb.WriteString(" ")
+	b.sb.WriteString(clause)
+	return nil
+}
+
+// writeArg converts a decoded JSON payload value to a driver argument. Numbers
+// arrive as json.Number (the decoder preserves integer precision); objects and
+// arrays are re-encoded to their JSON text so they land in a json/text column.
+func writeArg(v ir.Value) any {
+	switch x := v.JSON.(type) {
+	case nil:
+		return nil
+	case json.Number:
+		if i, err := x.Int64(); err == nil {
+			return i
+		}
+		if f, err := x.Float64(); err == nil {
+			return f
+		}
+		return x.String()
+	case map[string]any, []any:
+		bs, err := json.Marshal(x)
+		if err != nil {
+			return nil
+		}
+		return string(bs)
+	default:
+		return x
+	}
+}
+
+// sortedKeys returns the keys of a value map in lexical order, for deterministic
+// SQL.
+func sortedKeys(m map[string]ir.Value) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // qualify renders a possibly schema-qualified relation reference, each part

@@ -40,6 +40,59 @@ func Read(model *schema.Model, q *ir.Query, searchPath []string) (*ir.Plan, *pge
 	return &ir.Plan{Query: q, Rel: rel, ReadOnly: true}, nil
 }
 
+// Write resolves a parsed write query (insert/update/upsert/delete) against the
+// model and returns an executable plan. It binds the relation, validates the
+// filter and returning-projection columns, validates every column named in the
+// payload (PGRST204 for an unknown one), and defaults an upsert's conflict
+// target to the relation's primary key.
+//
+// Scope: this resolves the base write path. Embedded writes and computed columns
+// arrive with their subsystems; a payload that names a real base column is all
+// this path accepts.
+func Write(model *schema.Model, q *ir.Query, searchPath []string) (*ir.Plan, *pgerr.APIError) {
+	rel, ok := model.Lookup(q.Relation.Name, searchPath)
+	if !ok {
+		return nil, pgerr.ErrUnknownTable(q.Relation.Name)
+	}
+	q.Relation = ir.Ref{Schema: rel.Schema, Name: rel.Name}
+
+	if err := validateSelect(rel, q.Select); err != nil {
+		return nil, err
+	}
+	if err := validateCond(rel, q.Where); err != nil {
+		return nil, err
+	}
+	if err := validateWrite(rel, q.Write); err != nil {
+		return nil, err
+	}
+
+	return &ir.Plan{Query: q, Rel: rel, ReadOnly: false}, nil
+}
+
+// validateWrite checks the payload columns against the model and resolves an
+// upsert's default conflict target.
+func validateWrite(rel *schema.Relation, w *ir.WriteSpec) *pgerr.APIError {
+	if w == nil {
+		return nil
+	}
+	// The insert column set (first-row keys or explicit columns=) is what the
+	// compiler writes; validating it covers the payload that reaches SQL.
+	for _, c := range w.Columns {
+		if !rel.HasColumn(c) {
+			return pgerr.ErrUnknownColumn(c)
+		}
+	}
+	for k := range w.Set {
+		if !rel.HasColumn(k) {
+			return pgerr.ErrUnknownColumn(k)
+		}
+	}
+	if w.Conflict != nil && len(w.Conflict.Target) == 0 {
+		w.Conflict.Target = rel.PrimaryKey
+	}
+	return nil
+}
+
 func validateSelect(rel *schema.Relation, items []ir.SelectItem) *pgerr.APIError {
 	for _, it := range items {
 		col, ok := it.(ir.Column)

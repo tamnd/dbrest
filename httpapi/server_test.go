@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -254,6 +255,208 @@ func TestGetEmptyCountedResult(t *testing.T) {
 	// PostgREST emits */0 for an empty counted result.
 	if cr := resp.Header.Get("Content-Range"); cr != "*/0" {
 		t.Errorf("Content-Range = %q, want */0", cr)
+	}
+}
+
+// send is like do but with a request body and an explicit content type.
+func send(t *testing.T, srv *httpapi.Server, method, target, body string, headers map[string]string) *http.Response {
+	t.Helper()
+	req := httptest.NewRequest(method, target, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	return rec.Result()
+}
+
+func TestPostInsertMinimalIs201WithLocation(t *testing.T) {
+	srv := newServer(t)
+	resp := send(t, srv, http.MethodPost, "/films", `{"id":5,"title":"Dune","year":2021}`, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "/films?id=eq.5" {
+		t.Errorf("Location = %q, want /films?id=eq.5", loc)
+	}
+	// Minimal: no body.
+	buf := make([]byte, 1)
+	if n, _ := resp.Body.Read(buf); n != 0 {
+		t.Error("minimal insert should have no body")
+	}
+}
+
+func TestPostInsertRepresentation(t *testing.T) {
+	srv := newServer(t)
+	resp := send(t, srv, http.MethodPost, "/films", `{"id":6,"title":"Tenet","year":2020}`, map[string]string{
+		"Prefer": "return=representation",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", resp.StatusCode)
+	}
+	rows := decodeArray(t, resp)
+	if len(rows) != 1 || rows[0]["title"] != "Tenet" {
+		t.Fatalf("representation body = %v", rows)
+	}
+}
+
+func TestPostInsertSingularRepresentation(t *testing.T) {
+	srv := newServer(t)
+	resp := send(t, srv, http.MethodPost, "/films", `{"id":8,"title":"Solaris"}`, map[string]string{
+		"Prefer": "return=representation",
+		"Accept": "application/vnd.pgrst.object+json",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", resp.StatusCode)
+	}
+	var obj map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&obj); err != nil {
+		t.Fatalf("decode object: %v", err)
+	}
+	if obj["title"] != "Solaris" {
+		t.Errorf("title = %v", obj["title"])
+	}
+}
+
+func TestPostBulkInsertNoLocation(t *testing.T) {
+	srv := newServer(t)
+	resp := send(t, srv, http.MethodPost, "/films", `[{"id":10,"title":"A"},{"id":11,"title":"B"}]`, map[string]string{
+		"Prefer": "return=representation",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "" {
+		t.Errorf("bulk insert should not set Location, got %q", loc)
+	}
+	if cr := resp.Header.Get("Content-Range"); cr != "0-1/*" {
+		t.Errorf("Content-Range = %q, want 0-1/*", cr)
+	}
+	if len(decodeArray(t, resp)) != 2 {
+		t.Error("want 2 inserted rows")
+	}
+}
+
+func TestPatchUpdateRepresentation(t *testing.T) {
+	srv := newServer(t)
+	resp := send(t, srv, http.MethodPatch, "/films?id=eq.2", `{"rating":"PG"}`, map[string]string{
+		"Prefer": "return=representation",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	rows := decodeArray(t, resp)
+	if len(rows) != 1 || rows[0]["rating"] != "PG" {
+		t.Fatalf("patch body = %v", rows)
+	}
+}
+
+func TestPatchMinimalIs204(t *testing.T) {
+	srv := newServer(t)
+	resp := send(t, srv, http.MethodPatch, "/films?id=eq.2", `{"rating":"PG"}`, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+}
+
+func TestDeleteMinimalIs204(t *testing.T) {
+	srv := newServer(t)
+	resp := send(t, srv, http.MethodDelete, "/films?id=eq.1", "", nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+	// The row is gone.
+	after := do(t, srv, http.MethodGet, "/films?id=eq.1", nil)
+	if len(decodeArray(t, after)) != 0 {
+		t.Error("row should be deleted")
+	}
+}
+
+func TestDeleteRepresentation(t *testing.T) {
+	srv := newServer(t)
+	resp := send(t, srv, http.MethodDelete, "/films?id=eq.3", "", map[string]string{
+		"Prefer": "return=representation",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	rows := decodeArray(t, resp)
+	if len(rows) != 1 || rows[0]["title"] != "Arrival" {
+		t.Fatalf("deleted representation = %v", rows)
+	}
+}
+
+func TestPostUpsertMergeDuplicates(t *testing.T) {
+	srv := newServer(t)
+	resp := send(t, srv, http.MethodPost, "/films", `{"id":1,"title":"Metropolis (restored)"}`, map[string]string{
+		"Prefer": "return=representation, resolution=merge-duplicates",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", resp.StatusCode)
+	}
+	rows := decodeArray(t, resp)
+	if len(rows) != 1 || rows[0]["title"] != "Metropolis (restored)" {
+		t.Fatalf("upsert body = %v", rows)
+	}
+}
+
+func TestPutUpsertIs200(t *testing.T) {
+	srv := newServer(t)
+	resp := send(t, srv, http.MethodPut, "/films?id=eq.20", `{"id":20,"title":"New"}`, map[string]string{
+		"Prefer": "return=representation",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestPostUniqueViolationIs409(t *testing.T) {
+	srv := newServer(t)
+	// id=1 already exists; a plain insert conflicts.
+	resp := send(t, srv, http.MethodPost, "/films", `{"id":1,"title":"Dup"}`, nil)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", resp.StatusCode)
+	}
+	var env map[string]any
+	json.NewDecoder(resp.Body).Decode(&env)
+	if env["code"] != "23505" {
+		t.Errorf("code = %v, want 23505", env["code"])
+	}
+}
+
+func TestPatchUnknownColumnIs400(t *testing.T) {
+	srv := newServer(t)
+	resp := send(t, srv, http.MethodPatch, "/films?id=eq.1", `{"bogus":"x"}`, nil)
+	var env map[string]any
+	json.NewDecoder(resp.Body).Decode(&env)
+	if env["code"] != "PGRST204" {
+		t.Errorf("code = %v, want PGRST204", env["code"])
+	}
+}
+
+func TestPostBadJSONIs400(t *testing.T) {
+	srv := newServer(t)
+	resp := send(t, srv, http.MethodPost, "/films", `{nope`, nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func BenchmarkPostInsert(b *testing.B) {
+	srv := newServer(b)
+	b.ReportAllocs()
+	i := 0
+	for b.Loop() {
+		i++
+		body := `{"id":` + strconv.Itoa(1000+i) + `,"title":"Bench"}`
+		req := httptest.NewRequest(http.MethodPost, "/films", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			b.Fatalf("status = %d", rec.Code)
+		}
 	}
 }
 

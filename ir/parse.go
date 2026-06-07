@@ -1,8 +1,11 @@
 package ir
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/url"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -73,6 +76,154 @@ func parseQueryString(q *Query, vals url.Values) *pgerr.APIError {
 	}
 	q.Where = cond
 	return nil
+}
+
+// ParseWrite parses a POST/PATCH/PUT/DELETE request into a write Query. kind is
+// the mutation the router chose from the method; body is the raw request body
+// (JSON for now). The filter tree from the query string becomes the WHERE for
+// update and delete; the select list is the returning projection. A resolution
+// preference or an on_conflict target promotes an insert to an upsert. All
+// errors are PGRST1xx (*pgerr.APIError). See spec 11-writes.
+func ParseWrite(kind QueryKind, relation, rawQuery string, preferHeaders []string, body []byte) (*Query, *pgerr.APIError) {
+	vals, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return nil, pgerr.ErrParse("could not parse query string")
+	}
+	q := &Query{Kind: kind, Relation: Ref{Name: relation}}
+	q.Prefer = ParsePrefer(preferHeaders)
+	if q.Prefer.Count != nil {
+		q.Count = *q.Prefer.Count
+	}
+	if perr := parseQueryString(q, vals); perr != nil {
+		return nil, perr
+	}
+
+	w := &WriteSpec{}
+	if q.Prefer.Return != nil {
+		w.Return = *q.Prefer.Return
+	}
+	if q.Prefer.Missing != nil {
+		w.Missing = *q.Prefer.Missing
+	}
+	if q.Prefer.Tx != nil {
+		w.Tx = *q.Prefer.Tx
+	}
+
+	// An on_conflict target or a resolution preference makes this an upsert; PUT
+	// is always an upsert. The conflict target defaults to the primary key,
+	// which the planner fills in.
+	onConflict := vals.Get("on_conflict")
+	if kind == Upsert || onConflict != "" || q.Prefer.Resolution != nil {
+		q.Kind = Upsert
+		c := &Conflict{}
+		if onConflict != "" {
+			c.Target = splitComma(onConflict)
+		}
+		if q.Prefer.Resolution != nil {
+			c.Resolution = *q.Prefer.Resolution
+		}
+		w.Conflict = c
+	}
+
+	switch q.Kind {
+	case Insert, Upsert:
+		rows, cols, perr := parseInsertBody(body, vals.Get("columns"))
+		if perr != nil {
+			return nil, perr
+		}
+		w.Rows, w.Columns = rows, cols
+	case Update:
+		set, perr := parseUpdateBody(body)
+		if perr != nil {
+			return nil, perr
+		}
+		w.Set = set
+	case Delete:
+		// A delete carries no body; its scope is the WHERE tree.
+	}
+
+	q.Write = w
+	return q, nil
+}
+
+// parseInsertBody decodes a JSON insert payload into rows and the column set.
+// The body is either a single object or an array of objects. The column list is
+// the explicit columns= parameter when present, else the sorted keys of the
+// first row (matching PostgREST: later rows' extra keys are ignored, missing
+// keys take the missing= behavior).
+func parseInsertBody(body []byte, columnsParam string) ([]map[string]Value, []string, *pgerr.APIError) {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var raw any
+	if err := dec.Decode(&raw); err != nil {
+		return nil, nil, pgerr.ErrParse("request body is not valid JSON")
+	}
+
+	var objs []map[string]any
+	switch v := raw.(type) {
+	case map[string]any:
+		objs = []map[string]any{v}
+	case []any:
+		for _, e := range v {
+			obj, ok := e.(map[string]any)
+			if !ok {
+				return nil, nil, pgerr.ErrParse("insert array must contain objects")
+			}
+			objs = append(objs, obj)
+		}
+	default:
+		return nil, nil, pgerr.ErrParse("insert body must be an object or an array of objects")
+	}
+
+	rows := make([]map[string]Value, len(objs))
+	for i, obj := range objs {
+		row := make(map[string]Value, len(obj))
+		for k, val := range obj {
+			row[k] = Value{JSON: val}
+		}
+		rows[i] = row
+	}
+
+	var cols []string
+	switch {
+	case columnsParam != "":
+		cols = splitComma(columnsParam)
+	case len(objs) > 0:
+		for k := range objs[0] {
+			cols = append(cols, k)
+		}
+		sort.Strings(cols)
+	}
+	return rows, cols, nil
+}
+
+// parseUpdateBody decodes a JSON patch payload, a single object of column
+// assignments.
+func parseUpdateBody(body []byte) (map[string]Value, *pgerr.APIError) {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var obj map[string]any
+	if err := dec.Decode(&obj); err != nil {
+		return nil, pgerr.ErrParse("update body must be a JSON object")
+	}
+	set := make(map[string]Value, len(obj))
+	for k, v := range obj {
+		set[k] = Value{JSON: v}
+	}
+	return set, nil
+}
+
+// splitComma splits a comma-separated parameter, trimming each element and
+// dropping empties.
+func splitComma(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // parseSelect parses the comma-separated select list at the top level. An item

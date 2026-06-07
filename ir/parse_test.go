@@ -1,6 +1,7 @@
 package ir
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
 )
@@ -192,5 +193,118 @@ func TestParsePreferCount(t *testing.T) {
 	}
 	if q2.Count != CountExact {
 		t.Errorf("count = %v, want exact", q2.Count)
+	}
+}
+
+func TestParseWriteInsertSingle(t *testing.T) {
+	q, err := ParseWrite(Insert, "films", "", nil, []byte(`{"title":"Dune","year":2021}`))
+	if err != nil {
+		t.Fatalf("ParseWrite: %v", err)
+	}
+	if q.Kind != Insert {
+		t.Errorf("Kind = %v, want Insert", q.Kind)
+	}
+	if len(q.Write.Rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(q.Write.Rows))
+	}
+	// Columns are the sorted keys of the first object.
+	if got := q.Write.Columns; len(got) != 2 || got[0] != "title" || got[1] != "year" {
+		t.Errorf("columns = %v, want [title year]", got)
+	}
+	// A JSON number is carried as json.Number to preserve integer precision.
+	if v := q.Write.Rows[0]["year"].JSON; v != json.Number("2021") {
+		t.Errorf("year value = %#v, want json.Number 2021", v)
+	}
+}
+
+func TestParseWriteInsertArray(t *testing.T) {
+	q, err := ParseWrite(Insert, "films", "", nil, []byte(`[{"title":"A"},{"title":"B"}]`))
+	if err != nil {
+		t.Fatalf("ParseWrite: %v", err)
+	}
+	if len(q.Write.Rows) != 2 {
+		t.Errorf("rows = %d, want 2", len(q.Write.Rows))
+	}
+}
+
+func TestParseWriteColumnsParam(t *testing.T) {
+	// The explicit columns= parameter overrides the inferred set.
+	q, err := ParseWrite(Insert, "films", "columns=title", nil, []byte(`{"title":"Dune","year":2021}`))
+	if err != nil {
+		t.Fatalf("ParseWrite: %v", err)
+	}
+	if got := q.Write.Columns; len(got) != 1 || got[0] != "title" {
+		t.Errorf("columns = %v, want [title]", got)
+	}
+}
+
+func TestParseWriteUpdate(t *testing.T) {
+	q, err := ParseWrite(Update, "films", "id=eq.2", nil, []byte(`{"rating":"PG"}`))
+	if err != nil {
+		t.Fatalf("ParseWrite: %v", err)
+	}
+	if q.Kind != Update {
+		t.Errorf("Kind = %v, want Update", q.Kind)
+	}
+	if len(q.Write.Set) != 1 || q.Write.Set["rating"].JSON != "PG" {
+		t.Errorf("set = %v", q.Write.Set)
+	}
+	if q.Where == nil {
+		t.Error("update should carry the filter as WHERE")
+	}
+}
+
+func TestParseWriteUpsertViaResolution(t *testing.T) {
+	q, err := ParseWrite(Insert, "films", "", []string{"resolution=merge-duplicates"}, []byte(`{"id":1,"title":"X"}`))
+	if err != nil {
+		t.Fatalf("ParseWrite: %v", err)
+	}
+	if q.Kind != Upsert {
+		t.Errorf("Kind = %v, want Upsert (resolution promotes insert)", q.Kind)
+	}
+	if q.Write.Conflict == nil || q.Write.Conflict.Resolution != ConflictMerge {
+		t.Errorf("conflict = %#v", q.Write.Conflict)
+	}
+}
+
+func TestParseWriteOnConflictTarget(t *testing.T) {
+	q, err := ParseWrite(Insert, "films", "on_conflict=id", nil, []byte(`{"id":1}`))
+	if err != nil {
+		t.Fatalf("ParseWrite: %v", err)
+	}
+	if q.Kind != Upsert {
+		t.Errorf("on_conflict should make it an upsert, got %v", q.Kind)
+	}
+	if got := q.Write.Conflict.Target; len(got) != 1 || got[0] != "id" {
+		t.Errorf("conflict target = %v, want [id]", got)
+	}
+}
+
+func TestParseWriteReturnAndMissing(t *testing.T) {
+	q, err := ParseWrite(Insert, "films", "", []string{"return=representation", "missing=null"}, []byte(`{"title":"X"}`))
+	if err != nil {
+		t.Fatalf("ParseWrite: %v", err)
+	}
+	if q.Write.Return != ReturnRepresentation {
+		t.Errorf("return = %v, want representation", q.Write.Return)
+	}
+	if q.Write.Missing != MissingNull {
+		t.Errorf("missing = %v, want null", q.Write.Missing)
+	}
+}
+
+func TestParseWriteBadJSON(t *testing.T) {
+	if _, err := ParseWrite(Insert, "films", "", nil, []byte(`{not json`)); err == nil {
+		t.Error("malformed JSON body should error PGRST100")
+	}
+}
+
+func TestParseWriteDeleteNoBody(t *testing.T) {
+	q, err := ParseWrite(Delete, "films", "id=eq.1", nil, nil)
+	if err != nil {
+		t.Fatalf("ParseWrite: %v", err)
+	}
+	if q.Kind != Delete || q.Where == nil {
+		t.Errorf("delete = %#v", q)
 	}
 }

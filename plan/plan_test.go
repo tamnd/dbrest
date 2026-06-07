@@ -77,3 +77,82 @@ func TestReadNestedLogicalColumnChecked(t *testing.T) {
 		t.Fatalf("nested unknown column should be caught, got %v", err)
 	}
 }
+
+func modelPK() *schema.Model {
+	return schema.NewModel([]*schema.Relation{
+		{Name: "films", Kind: schema.KindTable, PrimaryKey: []string{"id"}, Columns: []*schema.Column{
+			{Name: "id", Type: "integer", Position: 1},
+			{Name: "title", Type: "text", Position: 2},
+			{Name: "year", Type: "integer", Position: 3},
+		}},
+	})
+}
+
+func TestWriteResolvesRelation(t *testing.T) {
+	q := &ir.Query{
+		Kind:     ir.Insert,
+		Relation: ir.Ref{Name: "films"},
+		Write:    &ir.WriteSpec{Columns: []string{"title"}, Rows: []map[string]ir.Value{{"title": {JSON: "X"}}}},
+	}
+	p, err := Write(model(), q, nil)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if p.Rel == nil || p.Rel.Name != "films" {
+		t.Fatalf("relation not bound: %+v", p.Rel)
+	}
+	if p.ReadOnly {
+		t.Error("write plan should not be ReadOnly")
+	}
+}
+
+func TestWriteUnknownTable(t *testing.T) {
+	q := &ir.Query{Kind: ir.Insert, Relation: ir.Ref{Name: "ghosts"}, Write: &ir.WriteSpec{}}
+	_, err := Write(model(), q, nil)
+	if err == nil || err.Code != "PGRST205" {
+		t.Fatalf("want PGRST205, got %v", err)
+	}
+}
+
+func TestWriteUnknownInsertColumn(t *testing.T) {
+	q := &ir.Query{
+		Kind:     ir.Insert,
+		Relation: ir.Ref{Name: "films"},
+		Write:    &ir.WriteSpec{Columns: []string{"bogus"}, Rows: []map[string]ir.Value{{"bogus": {JSON: "X"}}}},
+	}
+	_, err := Write(model(), q, nil)
+	if err == nil || err.Code != "PGRST204" {
+		t.Fatalf("want PGRST204 for unknown insert column, got %v", err)
+	}
+}
+
+func TestWriteUnknownUpdateColumn(t *testing.T) {
+	q := &ir.Query{
+		Kind:     ir.Update,
+		Relation: ir.Ref{Name: "films"},
+		Write:    &ir.WriteSpec{Set: map[string]ir.Value{"bogus": {JSON: "X"}}},
+	}
+	_, err := Write(model(), q, nil)
+	if err == nil || err.Code != "PGRST204" {
+		t.Fatalf("want PGRST204 for unknown update column, got %v", err)
+	}
+}
+
+func TestWriteUpsertDefaultsConflictToPK(t *testing.T) {
+	q := &ir.Query{
+		Kind:     ir.Upsert,
+		Relation: ir.Ref{Name: "films"},
+		Write: &ir.WriteSpec{
+			Columns:  []string{"id"},
+			Rows:     []map[string]ir.Value{{"id": {JSON: "1"}}},
+			Conflict: &ir.Conflict{Resolution: ir.ConflictMerge},
+		},
+	}
+	_, err := Write(modelPK(), q, nil)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if got := q.Write.Conflict.Target; len(got) != 1 || got[0] != "id" {
+		t.Errorf("conflict target = %v, want the primary key [id]", got)
+	}
+}
