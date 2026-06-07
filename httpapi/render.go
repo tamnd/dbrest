@@ -24,17 +24,17 @@ type rendered struct {
 // renderFor encodes a backend result into the negotiated media type. The JSON
 // family rides renderRows (and the singular PGRST116 rule); CSV and the scalar
 // types shape the row stream directly. See spec 17-content-negotiation.
-func renderFor(media string, res backend.Result) (*rendered, *pgerr.APIError) {
+func renderFor(media string, res backend.Result, rawCols map[string]bool) (*rendered, *pgerr.APIError) {
 	switch media {
 	case mediaJSON, mediaArray:
-		out, err := renderRows(res, false)
+		out, err := renderRows(res, false, rawCols)
 		if err != nil {
 			return nil, err
 		}
 		out.contentType = "application/json; charset=utf-8"
 		return out, nil
 	case mediaObject:
-		out, err := renderRows(res, true)
+		out, err := renderRows(res, true, rawCols)
 		if err != nil {
 			return nil, err
 		}
@@ -59,7 +59,7 @@ func renderFor(media string, res backend.Result) (*rendered, *pgerr.APIError) {
 // This is the Go-shaped assembly path (Result.Rows). The engine-assembled path
 // (Result.Body) is used once the embedding subsystem emits in-engine JSON; the
 // observable body is identical either way.
-func renderRows(res backend.Result, singular bool) (*rendered, *pgerr.APIError) {
+func renderRows(res backend.Result, singular bool, rawCols map[string]bool) (*rendered, *pgerr.APIError) {
 	rs := res.Rows()
 	defer rs.Close()
 	cols := rs.Columns()
@@ -76,7 +76,11 @@ func renderRows(res backend.Result, singular bool) (*rendered, *pgerr.APIError) 
 		}
 		obj := make(map[string]any, len(cols))
 		for i, c := range cols {
-			obj[c] = vals[i]
+			if rawCols[c] {
+				obj[c] = rawJSON(vals[i])
+			} else {
+				obj[c] = vals[i]
+			}
 		}
 		// Encode each row independently so a large result streams in bounded
 		// memory once the engine-assembled path replaces this shaper.
@@ -155,6 +159,22 @@ func renderCSV(res backend.Result) (*rendered, *pgerr.APIError) {
 		out.total, out.hasTotl = total, true
 	}
 	return out, nil
+}
+
+// rawJSON wraps an engine-assembled JSON value (an embedded relation's object or
+// array, already valid JSON text) so the encoder emits it verbatim instead of
+// quoting it as a string. A NULL to-one embed stays nil and renders as JSON null.
+func rawJSON(v any) any {
+	switch t := v.(type) {
+	case nil:
+		return nil
+	case string:
+		return json.RawMessage(t)
+	case []byte:
+		return json.RawMessage(t)
+	default:
+		return v
+	}
 }
 
 // csvCell formats one value for a CSV cell. Scalars become their text form; a

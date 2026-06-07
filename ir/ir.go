@@ -8,6 +8,8 @@
 // backend; its errors are the PGRST1xx family. See spec 05-query-ir-and-planning.
 package ir
 
+import "github.com/tamnd/dbrest/schema"
+
 // QueryKind is the operation a /<table> request performs.
 type QueryKind uint8
 
@@ -158,13 +160,21 @@ const (
 )
 
 // Embed is a nested Query plus the resolved relationship and cardinality.
+//
+// Target is the relation as the client wrote it; OutKey is the response key the
+// embedded value lands under (the alias when given, else the written name). Rel
+// is filled by the planner once the name is resolved against the schema model;
+// the compiler reads the cardinality and join columns from it. See spec 09.
 type Embed struct {
 	Cardinality Cardinality
 	Join        JoinKind
 	Spread      bool
 	Hint        string
+	Alias       string
+	OutKey      string
 	Target      Ref // the embedded relation as written; resolved at plan time
 	Query       Query
+	Rel         *schema.Relationship
 }
 
 // Cond is a node in the filter tree.

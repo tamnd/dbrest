@@ -101,7 +101,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	out, apiErr := renderFor(media, res)
+	out, apiErr := renderFor(media, res, embedKeys(q))
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
@@ -179,7 +179,7 @@ func (s *Server) writeWrite(w http.ResponseWriter, r *http.Request, q *ir.Query,
 		return
 	}
 
-	out, apiErr := renderFor(media, res)
+	out, apiErr := renderFor(media, res, embedKeys(q))
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
@@ -241,6 +241,21 @@ func locationHeader(rel *schema.Relation, relation string, res backend.Result) s
 		return ""
 	}
 	return "/" + relation + "?" + strings.Join(parts, "&")
+}
+
+// embedKeys is the set of top-level output keys carrying an engine-assembled
+// embedded resource. The renderer emits those columns as raw JSON rather than
+// quoting their text. Nested embeds are already inside their parent's JSON blob,
+// so only the top level matters here.
+func embedKeys(q *ir.Query) map[string]bool {
+	if len(q.Embeds) == 0 {
+		return nil
+	}
+	keys := make(map[string]bool, len(q.Embeds))
+	for i := range q.Embeds {
+		keys[q.Embeds[i].OutKey] = true
+	}
+	return keys
 }
 
 // writeRead sets the headers and status for a successful read and writes the

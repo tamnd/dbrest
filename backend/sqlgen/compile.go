@@ -19,16 +19,51 @@ type Statement struct {
 
 // builder accumulates SQL text and the matching argument list, handing out
 // placeholders through the dialect so a value is never interpolated.
+//
+// qual is the table qualifier prefixed onto bare column references; it is empty
+// for a plain query and set to a table alias while compiling an embedded
+// subquery, so the same column writers serve both. aliasN names the embed table
+// aliases (t1, t2, ...) deterministically.
 type builder struct {
-	d    Dialect
-	sb   strings.Builder
-	args []any
+	d      Dialect
+	sb     *strings.Builder
+	args   []any
+	qual   string
+	aliasN int
+}
+
+// newBuilder starts a builder with an empty output buffer.
+func newBuilder(d Dialect) *builder {
+	return &builder{d: d, sb: &strings.Builder{}}
+}
+
+// capture redirects output to a fresh buffer while f runs, returning what f
+// wrote as a string. Argument binding is unaffected: placeholders keep counting
+// up on the shared list, so a captured fragment can be spliced into the SQL text
+// later and its placeholders still line up. This is how an embedded subquery is
+// rendered to a string for nesting inside a JSON object. See spec 09.
+func (b *builder) capture(f func() *pgerr.APIError) (string, *pgerr.APIError) {
+	saved := b.sb
+	b.sb = &strings.Builder{}
+	err := f()
+	out := b.sb.String()
+	b.sb = saved
+	return out, err
 }
 
 // bind appends a value to the argument list and returns its placeholder.
 func (b *builder) bind(v any) string {
 	b.args = append(b.args, v)
 	return b.d.Placeholder(len(b.args))
+}
+
+// colRef renders a column reference, qualified by the current table alias when
+// one is set (inside an embed subquery) and bare otherwise.
+func (b *builder) colRef(name string) string {
+	if b.qual == "" {
+		return b.d.QuoteIdent(name)
+	}
+	return b.qual + "." + b.d.QuoteIdent(name)
 }
 
 // CompileRead lowers a resolved read query to a row-returning SELECT. The result
@@ -40,7 +75,10 @@ func (b *builder) bind(v any) string {
 // embedding are separate subsystems and report a clear error here until they
 // land, rather than silently emitting wrong SQL.
 func CompileRead(d Dialect, q *ir.Query) (*Statement, *pgerr.APIError) {
-	b := &builder{d: d}
+	if len(q.Embeds) > 0 {
+		return compileReadEmbedded(d, q)
+	}
+	b := newBuilder(d)
 	b.sb.WriteString("SELECT ")
 
 	if err := b.writeSelect(q.Select); err != nil {
@@ -77,7 +115,7 @@ func CompileRead(d Dialect, q *ir.Query) (*Statement, *pgerr.APIError) {
 // exact-count statement the backend runs alongside the windowed read to fill the
 // total field of Content-Range (spec 10).
 func CompileCount(d Dialect, q *ir.Query) (*Statement, *pgerr.APIError) {
-	b := &builder{d: d}
+	b := newBuilder(d)
 	b.sb.WriteString("SELECT count(*) FROM ")
 	b.sb.WriteString(b.qualify(q.Relation))
 	if q.Where != nil {
@@ -100,7 +138,7 @@ func CompileInsert(d Dialect, q *ir.Query, returning []string) (*Statement, *pge
 	if w == nil || len(w.Rows) == 0 {
 		return nil, pgerr.ErrParse("insert payload is empty")
 	}
-	b := &builder{d: d}
+	b := newBuilder(d)
 	b.sb.WriteString("INSERT INTO ")
 	b.sb.WriteString(b.qualify(q.Relation))
 
@@ -156,7 +194,7 @@ func CompileUpdate(d Dialect, q *ir.Query, returning []string) (*Statement, *pge
 	if w == nil || len(w.Set) == 0 {
 		return nil, pgerr.ErrParse("update payload is empty")
 	}
-	b := &builder{d: d}
+	b := newBuilder(d)
 	b.sb.WriteString("UPDATE ")
 	b.sb.WriteString(b.qualify(q.Relation))
 	b.sb.WriteString(" SET ")
@@ -184,7 +222,7 @@ func CompileUpdate(d Dialect, q *ir.Query, returning []string) (*Statement, *pge
 // CompileDelete lowers a delete to a parameterized DELETE ... WHERE. As with
 // update, a delete without a filter removes every row.
 func CompileDelete(d Dialect, q *ir.Query, returning []string) (*Statement, *pgerr.APIError) {
-	b := &builder{d: d}
+	b := newBuilder(d)
 	b.sb.WriteString("DELETE FROM ")
 	b.sb.WriteString(b.qualify(q.Relation))
 	if q.Where != nil {
@@ -318,10 +356,16 @@ func (b *builder) writeSelect(items []ir.SelectItem) *pgerr.APIError {
 // columnExpr renders a base column with an optional cast. JSON sub-paths are a
 // later subsystem; a column carrying one is rejected explicitly.
 func (b *builder) columnExpr(c ir.Column) (string, *pgerr.APIError) {
+	if len(c.Path) == 1 && c.Path[0] == "*" && c.Last == ir.JSONNone && c.Cast == "" {
+		if b.qual == "" {
+			return "*", nil
+		}
+		return b.qual + ".*", nil
+	}
 	if len(c.Path) != 1 || c.Last != ir.JSONNone {
 		return "", pgerr.ErrUnsupported("JSON path projection", "sql")
 	}
-	expr := b.d.QuoteIdent(c.Path[0])
+	expr := b.colRef(c.Path[0])
 	if c.Cast != "" {
 		expr = b.d.Cast(expr, c.Cast)
 	}
@@ -379,7 +423,7 @@ func (b *builder) writeCompare(c ir.Compare) *pgerr.APIError {
 	if len(c.Path) != 1 {
 		return pgerr.ErrUnsupported("JSON path filters", "sql")
 	}
-	col := b.d.QuoteIdent(c.Path[0])
+	col := b.colRef(c.Path[0])
 
 	var frag string
 	var err *pgerr.APIError
@@ -445,7 +489,7 @@ func (b *builder) writeOrder(terms []ir.OrderTerm) *pgerr.APIError {
 		if len(t.Path) != 1 {
 			return pgerr.ErrUnsupported("JSON path ordering", "sql")
 		}
-		col := b.d.QuoteIdent(t.Path[0])
+		col := b.colRef(t.Path[0])
 		dir := "ASC"
 		if t.Desc {
 			dir = "DESC"

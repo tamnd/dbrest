@@ -50,33 +50,81 @@ func parseQueryString(q *Query, vals url.Values) *pgerr.APIError {
 		}
 		q.Select, q.Embeds = items, embeds
 	}
-	if ord := vals.Get("order"); ord != "" {
+	return applyParams(q, vals)
+}
+
+// applyParams fills a query's order, window, and filter tree from the query
+// string, after partitioning the params by embed prefix. A key of the form
+// rel.<rest> whose first segment names one of this level's embeds is routed to
+// that embed's nested query (so actors.order=name.asc orders the embedded
+// actors, not the parent); everything else applies at this level. The split
+// recurses, so a deeper rel.sub.<rest> reaches a nested embed. See spec 09.
+func applyParams(q *Query, vals url.Values) *pgerr.APIError {
+	self := url.Values{}
+	scoped := map[string]url.Values{}
+	for key, vs := range vals {
+		if key == "select" {
+			continue // consumed by the caller / by the embed parens
+		}
+		if i := strings.IndexByte(key, '.'); i >= 0 {
+			if idx := findEmbed(q.Embeds, key[:i]); idx >= 0 {
+				prefix := key[:i]
+				ev := scoped[prefix]
+				if ev == nil {
+					ev = url.Values{}
+					scoped[prefix] = ev
+				}
+				ev[key[i+1:]] = vs
+				continue
+			}
+		}
+		self[key] = vs
+	}
+
+	if ord := self.Get("order"); ord != "" {
 		terms, perr := parseOrder(ord)
 		if perr != nil {
 			return perr
 		}
 		q.Order = terms
 	}
-	if lim := vals.Get("limit"); lim != "" {
+	if lim := self.Get("limit"); lim != "" {
 		n, e := strconv.Atoi(lim)
 		if e != nil || n < 0 {
 			return pgerr.ErrParse("limit must be a non-negative integer")
 		}
 		q.Limit = &n
 	}
-	if off := vals.Get("offset"); off != "" {
+	if off := self.Get("offset"); off != "" {
 		n, e := strconv.Atoi(off)
 		if e != nil || n < 0 {
 			return pgerr.ErrParse("offset must be a non-negative integer")
 		}
 		q.Offset = &n
 	}
-	cond, perr := parseFilters(vals)
+	cond, perr := parseFilters(self)
 	if perr != nil {
 		return perr
 	}
 	q.Where = cond
+
+	for prefix, ev := range scoped {
+		idx := findEmbed(q.Embeds, prefix)
+		if perr := applyParams(&q.Embeds[idx].Query, ev); perr != nil {
+			return perr
+		}
+	}
 	return nil
+}
+
+// findEmbed returns the index of the embed whose response key is name, or -1.
+func findEmbed(embeds []Embed, name string) int {
+	for i := range embeds {
+		if embeds[i].OutKey == name {
+			return i
+		}
+	}
+	return -1
 }
 
 // ParseWrite parses a POST/PATCH/PUT/DELETE request into a write Query. kind is
@@ -380,9 +428,9 @@ func parseEmbed(raw string, lparen int) (Embed, *pgerr.APIError) {
 	inner := raw[lparen+1 : len(raw)-1]
 
 	emb := Embed{Join: JoinLeft}
-	// alias:rel!hint
+	// alias:rel!hint, the alias naming the response key.
 	if c := strings.IndexByte(head, ':'); c >= 0 {
-		emb.Query.Relation.Name = "" // alias handled by renderer via Target
+		emb.Alias = head[:c]
 		head = head[c+1:]
 	}
 	if b := strings.IndexByte(head, '!'); b >= 0 {
@@ -404,6 +452,12 @@ func parseEmbed(raw string, lparen int) (Embed, *pgerr.APIError) {
 	emb.Target = Ref{Name: head}
 	emb.Query.Relation = Ref{Name: head}
 	emb.Query.Kind = Read
+	// The response key is the alias when given, else the relation name; it is also
+	// the prefix that routes embed-scoped query params (films?actors.order=...).
+	emb.OutKey = head
+	if emb.Alias != "" {
+		emb.OutKey = emb.Alias
+	}
 	if inner != "" {
 		items, nested, perr := parseSelect(inner)
 		if perr != nil {

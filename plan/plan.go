@@ -36,8 +36,80 @@ func Read(model *schema.Model, q *ir.Query, searchPath []string) (*ir.Plan, *pge
 	if err := validateOrder(rel, q.Order); err != nil {
 		return nil, err
 	}
+	if err := resolveEmbeds(model, rel, q, searchPath); err != nil {
+		return nil, err
+	}
 
 	return &ir.Plan{Query: q, Rel: rel, ReadOnly: true}, nil
+}
+
+// resolveEmbeds binds every embed of a query against the model: it finds the
+// relationship from the parent to the embedded resource, applies a disambiguation
+// hint, and recurses into nested embeds. A missing relationship is PGRST200; an
+// ambiguous one (more than one surviving edge) is PGRST201. The embed's nested
+// select, filters, and ordering are validated against the embedded relation.
+func resolveEmbeds(model *schema.Model, parent *schema.Relation, q *ir.Query, searchPath []string) *pgerr.APIError {
+	for i := range q.Embeds {
+		emb := &q.Embeds[i]
+		rel, err := resolveOne(model, parent, emb, searchPath)
+		if err != nil {
+			return err
+		}
+		emb.Rel = rel
+		emb.Cardinality = toCardinality(rel.Card)
+		// Bind the embedded relation so the compiler emits a model-validated ref.
+		emb.Query.Relation = ir.Ref{Schema: rel.Target.Schema, Name: rel.Target.Name}
+
+		if err := validateSelect(rel.Target, emb.Query.Select); err != nil {
+			return err
+		}
+		if err := validateCond(rel.Target, emb.Query.Where); err != nil {
+			return err
+		}
+		if err := validateOrder(rel.Target, emb.Query.Order); err != nil {
+			return err
+		}
+		if err := resolveEmbeds(model, rel.Target, &emb.Query, searchPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// resolveOne picks the single relationship an embed refers to, applying the
+// hint after the `!` when present. The parent name in an error is the embed's
+// own parent, matching the PostgREST message.
+func resolveOne(model *schema.Model, parent *schema.Relation, emb *ir.Embed, searchPath []string) (*schema.Relationship, *pgerr.APIError) {
+	cands, found := model.Relationships(parent, emb.Target.Name, searchPath)
+	if !found || len(cands) == 0 {
+		return nil, pgerr.ErrNoRelationship(parent.Name, emb.Target.Name)
+	}
+	if emb.Hint != "" {
+		filtered := cands[:0:0]
+		for _, c := range cands {
+			if c.MatchesHint(emb.Hint) {
+				filtered = append(filtered, c)
+			}
+		}
+		cands = filtered
+	}
+	switch len(cands) {
+	case 0:
+		return nil, pgerr.ErrNoRelationship(parent.Name, emb.Target.Name)
+	case 1:
+		c := cands[0]
+		return &c, nil
+	default:
+		return nil, pgerr.ErrAmbiguousEmbed(parent.Name, emb.Target.Name)
+	}
+}
+
+// toCardinality maps the schema cardinality to the IR's.
+func toCardinality(c schema.Card) ir.Cardinality {
+	if c == schema.CardToMany {
+		return ir.CardToMany
+	}
+	return ir.CardToOne
 }
 
 // Write resolves a parsed write query (insert/update/upsert/delete) against the
