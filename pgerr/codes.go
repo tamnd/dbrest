@@ -79,6 +79,22 @@ func ErrUnknownColumn(col string) *APIError {
 		fmt.Sprintf("Could not find the '%s' column in the schema cache", col))
 }
 
+// ErrNoRelationship is raised when an embed names a resource the schema model
+// has no relationship to (no foreign key connects them, and none is declared).
+// It is PostgREST's PGRST200 with a 400.
+func ErrNoRelationship(parent, target string) *APIError {
+	return New(http.StatusBadRequest, CodeNoRelationship,
+		fmt.Sprintf("Could not find a relationship between '%s' and '%s' in the schema cache", parent, target))
+}
+
+// ErrAmbiguousEmbed is raised when more than one relationship connects the
+// parent and the embedded resource and no hint disambiguates. It is PostgREST's
+// PGRST201 with a 300 Multiple Choices.
+func ErrAmbiguousEmbed(parent, target string) *APIError {
+	return New(http.StatusMultipleChoices, CodeAmbiguousEmbed,
+		fmt.Sprintf("Could not embed because more than one relationship was found for '%s' and '%s'", parent, target))
+}
+
 // ErrNoFunction is raised when no function matches the name and argument set.
 func ErrNoFunction(name string) *APIError {
 	return New(http.StatusNotFound, CodeNoFunction,

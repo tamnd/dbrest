@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"sort"
+	"strings"
 
 	"github.com/tamnd/dbrest/schema"
 )
@@ -23,11 +24,16 @@ func (b *Backend) Introspect(ctx context.Context) (*schema.Model, error) {
 		if err != nil {
 			return nil, err
 		}
+		fks, err := b.foreignKeys(ctx, r.name)
+		if err != nil {
+			return nil, err
+		}
 		out = append(out, &schema.Relation{
-			Name:       r.name,
-			Kind:       r.kind,
-			Columns:    cols,
-			PrimaryKey: pk,
+			Name:        r.name,
+			Kind:        r.kind,
+			Columns:     cols,
+			PrimaryKey:  pk,
+			ForeignKeys: fks,
 		})
 	}
 	return schema.NewModel(out), nil
@@ -114,4 +120,106 @@ func (b *Backend) columns(ctx context.Context, table string) ([]*schema.Column, 
 		pkNames[i] = p.name
 	}
 	return cols, pkNames, nil
+}
+
+// foreignKeys reads PRAGMA foreign_key_list for one relation and groups it into
+// composite foreign keys. SQLite reports one row per referencing column, keyed by
+// an id that ties a composite key together and a seq that orders its columns; a
+// NULL "to" means the key references the parent's primary key, which is resolved
+// here. SQLite keys carry no name, so a stable one is synthesized as
+// {child}_{from-columns}_fkey, matching the introspection contract (spec 08).
+func (b *Backend) foreignKeys(ctx context.Context, table string) ([]*schema.ForeignKey, error) {
+	rows, err := b.db.QueryContext(ctx, `PRAGMA foreign_key_list(`+dialect{}.QuoteIdent(table)+`)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	type fkRow struct {
+		seq      int
+		from, to string
+		toNull   bool
+	}
+	groups := make(map[int]*struct {
+		refTable string
+		cols     []fkRow
+	})
+	var order []int
+	for rows.Next() {
+		var (
+			id, seq           int
+			refTable, from    string
+			to                any
+			onUpd, onDel, mat string
+		)
+		if err := rows.Scan(&id, &seq, &refTable, &from, &to, &onUpd, &onDel, &mat); err != nil {
+			return nil, err
+		}
+		g, ok := groups[id]
+		if !ok {
+			g = &struct {
+				refTable string
+				cols     []fkRow
+			}{refTable: refTable}
+			groups[id] = g
+			order = append(order, id)
+		}
+		fr := fkRow{seq: seq}
+		fr.from = from
+		if s, ok := toString(to); ok {
+			fr.to = s
+		} else {
+			fr.toNull = true
+		}
+		g.cols = append(g.cols, fr)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	sort.Ints(order)
+	var out []*schema.ForeignKey
+	for _, id := range order {
+		g := groups[id]
+		sort.Slice(g.cols, func(i, j int) bool { return g.cols[i].seq < g.cols[j].seq })
+
+		fromCols := make([]string, len(g.cols))
+		toCols := make([]string, 0, len(g.cols))
+		needPK := false
+		for i, c := range g.cols {
+			fromCols[i] = c.from
+			if c.toNull {
+				needPK = true
+			} else {
+				toCols = append(toCols, c.to)
+			}
+		}
+		// A key with NULL targets references the parent's primary key.
+		if needPK {
+			_, refPK, err := b.columns(ctx, g.refTable)
+			if err != nil {
+				return nil, err
+			}
+			toCols = refPK
+		}
+		out = append(out, &schema.ForeignKey{
+			Name:        table + "_" + strings.Join(fromCols, "_") + "_fkey",
+			Columns:     fromCols,
+			RefRelation: g.refTable,
+			RefColumns:  toCols,
+		})
+	}
+	return out, nil
+}
+
+// toString coerces a scalar from PRAGMA into a string, reporting false for NULL.
+func toString(v any) (string, bool) {
+	switch s := v.(type) {
+	case string:
+		return s, true
+	case []byte:
+		return string(s), true
+	default:
+		return "", false
+	}
 }

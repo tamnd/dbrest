@@ -34,6 +34,9 @@ type Relation struct {
 	Kind       Kind
 	Columns    []*Column
 	PrimaryKey []string // column names forming the PK, in order; may be empty
+	// ForeignKeys are the relation's outgoing foreign keys, the raw material the
+	// planner resolves embeds from (spec 09). Empty on an engine without them.
+	ForeignKeys []*ForeignKey
 
 	byName map[string]*Column
 }
