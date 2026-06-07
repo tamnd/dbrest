@@ -34,10 +34,11 @@ Early, and built subsystem by subsystem against a complete design spec. What wor
 - **JWT authentication**: stateless bearer-token verification (HMAC, RSA, ECDSA), pinned algorithms with the `none` swap refused, `exp`/`nbf`/`iat`/`aud` with clock skew, the role claim with nested-path support and the anon fallback, `PGRST301`/`PGRST302`/`403` outcomes, and a bounded SIEVE verification cache that never extends a token's lifetime.
 - **Authorization and RLS emulation**: on the emulated backend, table and column privileges gate every read and write (`42501` as `403`, or `401` for an unauthenticated request), a `*` projection is narrowed to the granted columns, and Row Level Security policies are injected as a bound predicate AND-ed above the whole client filter tree, so a client cannot OR its way past a policy, with `WITH CHECK` validated before any row is written.
 - **Request context**: the verified claims, the request headers and cookies, the method, the path, and the role are carried on a backend-neutral context (with the GUC JSON serializers a native backend writes verbatim); on the emulated backend the values a policy needs are bound as parameters, and response controls (a status override and added headers a function or policy sets) are applied uniformly across reads, writes, and RPC.
+- **Types and casts**: a single canonical PostgreSQL type surface, with the aliases a client may write (`integer`, `boolean`, `double precision`) folded onto it; a query-string operand is coerced against the column's canonical type in the frontend, so a non-integer on an integer column is a clean `22P02` `400` before the query reaches the engine, identical on every backend, while a pattern, an `is` keyword, and a text column are left alone. The value codecs render a driver-native `bool`, timestamp, and uuid to one canonical JSON form regardless of the engine's physical storage.
 - A shared **IR-to-SQL compiler** parameterized by a per-engine `Dialect`, with every value bound and every identifier quoted.
 - **Introspection** into the unified schema model and a planner that validates names and binds them.
 
-The capability model, the backend SPI, and the error envelope are in place. OpenAPI, the type and cast layer, and the PostgreSQL/MySQL/SQL Server/MongoDB backends are on the roadmap and land against the same SPI.
+The capability model, the backend SPI, and the error envelope are in place. OpenAPI and the PostgreSQL/MySQL/SQL Server/MongoDB backends are on the roadmap and land against the same SPI.
 
 ## Quick start
 
@@ -74,6 +75,7 @@ Flat packages, no `internal/`, no `/vN` suffixes.
 | `pgerr` | The unified error envelope and the PGRST code table; one serializer for byte-identical bodies across engines. |
 | `ir` | The engine-agnostic query IR and the URL/`Prefer` parser (pure syntax; PGRST1xx errors). |
 | `schema` | The unified schema model every backend's introspection produces. |
+| `pgtypes` | The canonical PostgreSQL type surface, alias folding, and the value codecs (operand parsing and JSON rendering). |
 | `plan` | Name resolution: binds the IR to the model, raising the PGRST2xx resolution errors. |
 | `backend` | The backend SPI and the four-tier `Capabilities` model. |
 | `backend/sqlgen` | The single IR-to-SQL compiler, parameterized by a `Dialect`. |

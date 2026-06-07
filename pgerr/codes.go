@@ -157,6 +157,20 @@ func ErrCheckViolation(detail string) *APIError {
 		"new row violates check constraint").WithDetails(detail)
 }
 
+// CodeInvalidText is PostgreSQL's invalid_text_representation: an operand or
+// payload value that cannot be coerced to the column's type. dbrest raises it in
+// the frontend, before the query reaches the engine, so a bad filter value is the
+// same 400 on every backend (spec 16).
+const CodeInvalidText = "22P02"
+
+// ErrInvalidInput is raised when a query-string operand or a payload value cannot
+// be coerced to its canonical type. It mirrors PostgreSQL's "invalid input syntax
+// for type T" message and surfaces the 22P02 SQLSTATE as a 400.
+func ErrInvalidInput(canonicalType, input string) *APIError {
+	return New(http.StatusBadRequest, CodeInvalidText,
+		fmt.Sprintf("invalid input syntax for type %s: %q", canonicalType, input))
+}
+
 // ErrJWTExpired is raised when a JWT is past its exp (with skew applied).
 func ErrJWTExpired() *APIError {
 	return New(http.StatusUnauthorized, CodeJWTExpired, "JWT expired")
