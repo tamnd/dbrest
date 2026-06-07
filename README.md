@@ -31,10 +31,11 @@ Early, and built subsystem by subsystem against a complete design spec. What wor
 - **Resource embedding**: `select=title,director(name)` nests related resources, resolved against introspected foreign keys and assembled as JSON in the engine, with `PGRST200`/`PGRST201` for missing and ambiguous relationships.
 - **Content negotiation** beyond JSON: the singular object type, `text/csv`, and the scalar `application/octet-stream`/`text/plain` types.
 - **RPC** at `/rpc/<fn>` over a portable function registry: scalar, setof, and table returns, `GET`/`POST` by volatility (a `GET` to a volatile function is `405`), the read-only versus read-write transaction, post-filtering a table return, and `PGRST202` when no function matches.
+- **JWT authentication**: stateless bearer-token verification (HMAC, RSA, ECDSA), pinned algorithms with the `none` swap refused, `exp`/`nbf`/`iat`/`aud` with clock skew, the role claim with nested-path support and the anon fallback, `PGRST301`/`PGRST302`/`403` outcomes, and a bounded SIEVE verification cache that never extends a token's lifetime.
 - A shared **IR-to-SQL compiler** parameterized by a per-engine `Dialect`, with every value bound and every identifier quoted.
 - **Introspection** into the unified schema model and a planner that validates names and binds them.
 
-The capability model, the backend SPI, and the error envelope are in place. Auth/RLS, request context and GUCs, OpenAPI, and the PostgreSQL/MySQL/SQL Server/MongoDB backends are on the roadmap and land against the same SPI.
+The capability model, the backend SPI, and the error envelope are in place. RLS emulation, request context and GUCs, OpenAPI, and the PostgreSQL/MySQL/SQL Server/MongoDB backends are on the roadmap and land against the same SPI.
 
 ## Quick start
 
