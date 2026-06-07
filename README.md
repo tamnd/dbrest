@@ -2,7 +2,7 @@
 
 A REST server that speaks the [PostgREST](https://postgrest.org) API on top of any database.
 
-PostgREST turns a PostgreSQL database into a RESTful API by reading the database's own catalogs and serving every table, view, and function as an HTTP resource. dbrest keeps that exact HTTP contract — the same URL grammar, operators, resource embedding, `Prefer` headers, error envelopes, and OpenAPI root — and makes the database underneath pluggable. Point it at PostgreSQL, SQLite, MySQL, SQL Server, or MongoDB and a client written against PostgREST should not be able to tell the difference.
+PostgREST turns a PostgreSQL database into a RESTful API by reading the database's own catalogs and serving every table, view, and function as an HTTP resource. dbrest keeps that exact HTTP contract (the same URL grammar, operators, resource embedding, `Prefer` headers, error envelopes, and OpenAPI root) and makes the database underneath pluggable. Point it at PostgreSQL, SQLite, MySQL, SQL Server, or MongoDB and a client written against PostgREST should not be able to tell the difference.
 
 dbrest is a compatible reimplementation of PostgREST, and saying so is the point. The compatibility target is the PostgREST v14 line.
 
@@ -27,10 +27,11 @@ HTTP ─▶ parse ─▶ plan ─▶ authorize ─▶ Backend.Execute ─▶ ren
 Early, and built subsystem by subsystem against a complete design spec. What works end to end today:
 
 - **Reads** (`GET`/`HEAD`) over the **SQLite** reference backend: column projection and aliases, the horizontal-filter operators, `and`/`or`/`not` trees, `order` with PostgreSQL NULLS placement, `limit`/`offset` pagination with `Content-Range` and `206`/`200`, the singular-object media type with the `PGRST116` rule, and empty-result and unknown-name errors in the unified envelope.
+- **Writes** (`POST`/`PATCH`/`PUT`/`DELETE`): insert, update, upsert, and delete with the `201`/`200`/`204` status rule, a `Location` header for a single inserted row, `return=representation`, and SQLite constraint failures mapped to PostgREST SQLSTATEs (a unique violation is a clean `409`).
 - A shared **IR-to-SQL compiler** parameterized by a per-engine `Dialect`, with every value bound and every identifier quoted.
 - **Introspection** into the unified schema model and a planner that validates names and binds them.
 
-The capability model, the backend SPI, and the error envelope are in place. Writes, RPC, auth/RLS, resource embedding, content negotiation beyond JSON, OpenAPI, and the PostgreSQL/MySQL/SQL Server/MongoDB backends are on the roadmap and land against the same SPI.
+The capability model, the backend SPI, and the error envelope are in place. RPC, auth/RLS, resource embedding, content negotiation beyond JSON, OpenAPI, and the PostgreSQL/MySQL/SQL Server/MongoDB backends are on the roadmap and land against the same SPI.
 
 ## Quick start
 
@@ -72,7 +73,7 @@ Flat packages, no `internal/`, no `/vN` suffixes.
 | `backend/sqlgen` | The single IR-to-SQL compiler, parameterized by a `Dialect`. |
 | `backend/sqlite` | The SQLite reference backend (pure-Go [modernc.org/sqlite](https://modernc.org/sqlite), cgo-free). |
 | `reqctx` | The per-request context handed to a backend (role, claims, response controls). |
-| `httpapi` | The HTTP frontend: router, read pipeline, PostgREST-shaped renderer. |
+| `httpapi` | The HTTP frontend: router, read and write pipelines, PostgREST-shaped renderer. |
 | `cmd/dbrest` | The server entry point. |
 
 ## Development
@@ -80,7 +81,7 @@ Flat packages, no `internal/`, no `/vN` suffixes.
 ```sh
 go test ./...                  # unit + end-to-end tests
 go test ./... -race            # with the race detector
-go test ./httpapi/ -bench .    # read-path benchmark
+go test ./httpapi/ -bench .    # request benchmarks
 go vet ./...
 ```
 
