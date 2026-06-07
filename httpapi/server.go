@@ -78,6 +78,55 @@ type identity struct {
 	anonymous bool
 }
 
+// buildContext assembles the per-request context the backend receives: the
+// resolved identity plus the request metadata that crosses the HTTP/query
+// boundary (method, path, headers, cookies, and the selected schema). The
+// frontend builds it once after authentication; on the emulated backend the
+// values a policy references are later bound as parameters (spec 15).
+func buildContext(r *http.Request, id identity) *reqctx.Context {
+	cookies := r.Cookies()
+	jar := make(map[string]string, len(cookies))
+	for _, c := range cookies {
+		jar[c.Name] = c.Value
+	}
+	return &reqctx.Context{
+		Role:      id.role,
+		Anonymous: id.anonymous,
+		Claims:    id.claims,
+		Method:    r.Method,
+		Path:      r.URL.Path,
+		Headers:   r.Header,
+		Cookies:   jar,
+		Schema:    requestSchema(r),
+	}
+}
+
+// requestSchema reads the schema the client selected with the Accept-Profile
+// header (reads) or the Content-Profile header (writes). It carries the choice
+// onto the context; cross-schema identifier routing is the introspection
+// subsystem's job (spec 08), so an unset header is the default schema.
+func requestSchema(r *http.Request) string {
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		return r.Header.Get("Accept-Profile")
+	}
+	return r.Header.Get("Content-Profile")
+}
+
+// applyControls applies a backend's response controls and returns the status to
+// write: each control header is set on the response, and a non-zero control
+// status overrides the computed default. It runs on every path (read, write,
+// RPC) so a function or policy that shapes the response does so identically
+// regardless of backend (spec 15).
+func applyControls(w http.ResponseWriter, rc *reqctx.ResponseControls, def int) int {
+	for k, v := range rc.Headers {
+		w.Header().Set(k, v)
+	}
+	if rc.Status != 0 {
+		return rc.Status
+	}
+	return def
+}
+
 // authenticate resolves the request identity from the Authorization header. With
 // no verifier it is the static default role; otherwise the verifier maps the
 // bearer token to a role (or anon), or returns the 401/403 the token earns.
@@ -179,7 +228,7 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 		return
 	}
 
-	rc := &reqctx.Context{Role: id.role, Anonymous: id.anonymous, Claims: id.claims, Method: r.Method, Path: r.URL.Path, Headers: r.Header}
+	rc := buildContext(r, id)
 	res, err := s.backend.Execute(r.Context(), planned, rc)
 	if err != nil {
 		writeError(w, asAPIError(s.backend, err))
@@ -192,13 +241,13 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 		return
 	}
 
-	s.writeCall(w, r, call, out)
+	s.writeCall(w, r, call, out, res.ResponseControls())
 }
 
 // writeCall writes a successful RPC response. The status is 200, or 206 when a
 // bounded window over a table return did not cover the full count. A requested
 // count sets Content-Range, matching a read.
-func (s *Server) writeCall(w http.ResponseWriter, r *http.Request, call *ir.Call, out *rendered) {
+func (s *Server) writeCall(w http.ResponseWriter, r *http.Request, call *ir.Call, out *rendered, ctrl *reqctx.ResponseControls) {
 	if applied := call.Prefer.AppliedHeader(); applied != "" {
 		w.Header().Set("Preference-Applied", applied)
 	}
@@ -217,7 +266,7 @@ func (s *Server) writeCall(w http.ResponseWriter, r *http.Request, call *ir.Call
 	if hasWindow && out.hasTotl && int64(out.nRows) < out.total {
 		status = http.StatusPartialContent
 	}
-	w.WriteHeader(status)
+	w.WriteHeader(applyControls(w, ctrl, status))
 	if r.Method != http.MethodHead {
 		w.Write(out.body)
 	}
@@ -249,14 +298,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity)
 		return
 	}
 
-	rc := &reqctx.Context{
-		Role:      id.role,
-		Anonymous: id.anonymous,
-		Claims:    id.claims,
-		Method:    r.Method,
-		Path:      r.URL.Path,
-		Headers:   r.Header,
-	}
+	rc := buildContext(r, id)
 
 	if apiErr := s.authorize(rc, planned); apiErr != nil {
 		writeError(w, apiErr)
@@ -275,7 +317,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity)
 		return
 	}
 
-	s.writeRead(w, r, q, out)
+	s.writeRead(w, r, q, out, res.ResponseControls())
 }
 
 func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.QueryKind, id identity) {
@@ -314,7 +356,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.Que
 		return
 	}
 
-	rc := &reqctx.Context{Role: id.role, Anonymous: id.anonymous, Claims: id.claims, Method: r.Method, Path: r.URL.Path, Headers: r.Header}
+	rc := buildContext(r, id)
 	if apiErr := s.authorize(rc, planned); apiErr != nil {
 		writeError(w, apiErr)
 		return
@@ -333,9 +375,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.Que
 // otherwise the body is empty. An insert or upsert of a single row carries a
 // Location header pointing at the new resource by primary key.
 func (s *Server) writeWrite(w http.ResponseWriter, r *http.Request, q *ir.Query, media string, rel *schema.Relation, res backend.Result) {
-	for k, v := range res.ResponseControls().Headers {
-		w.Header().Set(k, v)
-	}
+	ctrl := res.ResponseControls()
 	if applied := q.Prefer.AppliedHeader(); applied != "" {
 		w.Header().Set("Preference-Applied", applied)
 	}
@@ -347,7 +387,7 @@ func (s *Server) writeWrite(w http.ResponseWriter, r *http.Request, q *ir.Query,
 
 	representation := q.Write.Return == ir.ReturnRepresentation
 	if !representation {
-		w.WriteHeader(writeStatus(r.Method, false))
+		w.WriteHeader(applyControls(w, ctrl, writeStatus(r.Method, false)))
 		return
 	}
 
@@ -360,7 +400,7 @@ func (s *Server) writeWrite(w http.ResponseWriter, r *http.Request, q *ir.Query,
 	if !q.Singular {
 		w.Header().Set("Content-Range", contentRange(0, out.nRows, 0, false))
 	}
-	w.WriteHeader(writeStatus(r.Method, true))
+	w.WriteHeader(applyControls(w, ctrl, writeStatus(r.Method, true)))
 	if r.Method != http.MethodHead {
 		w.Write(out.body)
 	}
@@ -431,8 +471,10 @@ func embedKeys(q *ir.Query) map[string]bool {
 }
 
 // writeRead sets the headers and status for a successful read and writes the
-// body (omitted for HEAD).
-func (s *Server) writeRead(w http.ResponseWriter, r *http.Request, q *ir.Query, out *rendered) {
+// body (omitted for HEAD). A function or policy can shape the response through
+// the controls: a control header is added and a non-zero control status wins
+// over the computed 200/206 default.
+func (s *Server) writeRead(w http.ResponseWriter, r *http.Request, q *ir.Query, out *rendered, ctrl *reqctx.ResponseControls) {
 	w.Header().Set("Content-Type", out.contentType)
 
 	offset := 0
@@ -454,7 +496,7 @@ func (s *Server) writeRead(w http.ResponseWriter, r *http.Request, q *ir.Query, 
 		return
 	}
 
-	w.WriteHeader(readStatus(q, out, offset))
+	w.WriteHeader(applyControls(w, ctrl, readStatus(q, out, offset)))
 	if r.Method != http.MethodHead {
 		w.Write(out.body)
 	}

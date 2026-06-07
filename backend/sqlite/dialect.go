@@ -134,17 +134,17 @@ func (dialect) Regex(expr, _ string, ci bool) (string, bool) {
 	return "regexp(" + sqlgen.PatternMark + ", " + expr + ")", true
 }
 
-// SessionRead reads an emulated request-context value via the registered
-// current_setting() function (spec 15).
-func (dialect) SessionRead(key string) string {
-	return "current_setting('" + strings.ReplaceAll(key, "'", "''") + "', true)"
-}
+// SessionRead and SessionWrite report no engine-side setting store. SQLite has
+// no value a query can read mid-statement the way current_setting (PostgreSQL)
+// or SESSION_CONTEXT (SQL Server) can, so the request context is not pushed to
+// the engine at all: the specific values a policy references are bound as
+// parameters when the predicate is injected into the IR (spec 14/15). The empty
+// forms tell the compiler there is nothing to read or write, so it emits no
+// setting statement. See spec 15, "MySQL, SQLite, MongoDB: emulated".
+func (dialect) SessionRead(string) string { return "" }
 
-// SessionWrite writes an emulated request-context value via the registered
-// set_config() function.
-func (dialect) SessionWrite(key string) (string, bool) {
-	return "set_config('" + strings.ReplaceAll(key, "'", "''") + "', ?, true)", true
-}
+// SessionWrite reports ok=false: there is no engine setting to write.
+func (dialect) SessionWrite(string) (string, bool) { return "", false }
 
 // BoolValue renders a boolean as 1/0; SQLite has no native boolean.
 func (dialect) BoolValue(v bool) string {

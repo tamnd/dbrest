@@ -2,10 +2,23 @@
 // to a backend: the resolved role, JWT claims, request metadata, and the
 // response controls a backend can write back (status and header overrides).
 //
-// The frontend always builds the context regardless of backend; on PostgreSQL
-// the role and claims are later pushed to the engine as GUCs, on the emulated
-// backends they drive the authz layer. See spec 13/15.
+// The frontend always builds the context regardless of backend. On PostgreSQL
+// the role, claims, headers, cookies, method, and path are pushed to the engine
+// as GUCs (request.jwt.claims, request.headers, ...) with set_config, so SQL and
+// RLS predicates can read them with current_setting; on SQL Server the analog is
+// SESSION_CONTEXT. On the emulated backends (SQLite here) there is no setting a
+// query can read mid-statement, so the values are kept in this struct and the
+// specific ones a policy references are bound as parameters when the predicate is
+// injected into the IR (spec 14). Either way the frontend's view is the same:
+// build the context, call Execute, then apply the response controls at render
+// time. See spec 13/15.
 package reqctx
+
+import (
+	"encoding/json"
+	"sort"
+	"strings"
+)
 
 // Context is the request context passed to Backend.Execute.
 type Context struct {
@@ -21,14 +34,84 @@ type Context struct {
 	Method string
 	// Path is the request path.
 	Path string
-	// Headers is a read-only view of request headers the backend may consult.
+	// Headers is a read-only view of request headers the backend may consult. It
+	// is the raw multi-valued form; HeadersJSON flattens it to the GUC shape.
 	Headers map[string][]string
+	// Cookies are the request cookies by name, the source of request.cookies.
+	Cookies map[string]string
+	// Schema is the selected schema for the request (the Accept-Profile or
+	// Content-Profile choice), or "" for the default. Cross-schema routing is the
+	// introspection subsystem's job (spec 08); this field carries the choice.
+	Schema string
 
 	controls ResponseControls
 }
 
+// ClaimsJSON marshals the verified claims into the object request.jwt.claims
+// carries. It is "{}" when there are no claims, never null, so a backend that
+// writes the GUC verbatim and a policy that reads it both see a valid object.
+func (c *Context) ClaimsJSON() []byte {
+	if len(c.Claims) == 0 {
+		return []byte("{}")
+	}
+	// encoding/json sorts map keys, so the output is deterministic.
+	b, err := json.Marshal(c.Claims)
+	if err != nil {
+		return []byte("{}")
+	}
+	return b
+}
+
+// HeadersJSON marshals the request headers into the object request.headers
+// carries: a JSON object of lower-cased header name to value, with a multi-valued
+// header joined by ", " as HTTP defines. Keys are sorted for a deterministic
+// document.
+func (c *Context) HeadersJSON() []byte {
+	flat := make(map[string]string, len(c.Headers))
+	for k, vs := range c.Headers {
+		flat[strings.ToLower(k)] = strings.Join(vs, ", ")
+	}
+	return marshalSortedObject(flat)
+}
+
+// CookiesJSON marshals the request cookies into the object request.cookies
+// carries: a JSON object of cookie name to value, keys sorted.
+func (c *Context) CookiesJSON() []byte {
+	return marshalSortedObject(c.Cookies)
+}
+
+// marshalSortedObject renders a string map as a JSON object with sorted keys, so
+// the GUC documents are byte-stable across requests and backends.
+func marshalSortedObject(m map[string]string) []byte {
+	if len(m) == 0 {
+		return []byte("{}")
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	b.WriteByte('{')
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		kb, _ := json.Marshal(k)
+		vb, _ := json.Marshal(m[k])
+		b.Write(kb)
+		b.WriteByte(':')
+		b.Write(vb)
+	}
+	b.WriteByte('}')
+	return []byte(b.String())
+}
+
 // ResponseControls are status and header overrides a backend reads back after
-// Execute, for features like Location on insert or a function-set status.
+// Execute, for features like Location on insert or a function-set status. A
+// function or policy writes them (a set_config('response.status', ...) round
+// trip on PostgreSQL, a direct write on the emulated backends) and the renderer
+// applies them: a non-zero Status overrides the default, and each header is set.
 type ResponseControls struct {
 	// Status, when non-zero, overrides the default response status.
 	Status int
@@ -38,6 +121,9 @@ type ResponseControls struct {
 
 // Controls returns a pointer to the mutable response controls.
 func (c *Context) Controls() *ResponseControls { return &c.controls }
+
+// SetStatus records a response status override.
+func (rc *ResponseControls) SetStatus(status int) { rc.Status = status }
 
 // SetHeader records a response header override.
 func (rc *ResponseControls) SetHeader(k, v string) {
