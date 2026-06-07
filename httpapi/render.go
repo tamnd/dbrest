@@ -9,6 +9,7 @@ import (
 
 	"github.com/tamnd/dbrest/backend"
 	"github.com/tamnd/dbrest/pgerr"
+	"github.com/tamnd/dbrest/rpc"
 )
 
 // rendered is a fully assembled response: the body, the negotiated Content-Type,
@@ -49,6 +50,100 @@ func renderFor(media string, res backend.Result, rawCols map[string]bool) (*rend
 	default:
 		return nil, pgerr.ErrInternal("no renderer for media type " + media)
 	}
+}
+
+// renderCall shapes an RPC result by the function's declared return kind. A
+// table return renders exactly like a read (objects in the JSON family, or CSV /
+// scalar media). A scalar return is the bare value; a setof-scalar return is a
+// JSON array of bare values. The object media type asks for a single value and
+// enforces the zero-or-many rule, so a setof function with one row can satisfy a
+// singular request.
+func renderCall(media string, res backend.Result, fn *rpc.Function) (*rendered, *pgerr.APIError) {
+	if fn.Returns.Kind == rpc.ReturnTable {
+		return renderFor(media, res, nil)
+	}
+	switch media {
+	case mediaCSV:
+		return renderCSV(res)
+	case mediaOctet:
+		return renderScalar(res, false)
+	case mediaText:
+		return renderScalar(res, true)
+	}
+
+	rs := res.Rows()
+	defer rs.Close()
+	cols := rs.Columns()
+
+	var vals []any
+	for rs.Next() {
+		row, err := rs.Values()
+		if err != nil {
+			return nil, pgerr.ErrInternal(err.Error())
+		}
+		if len(cols) == 0 {
+			vals = append(vals, nil)
+			continue
+		}
+		// A scalar function projects one column; if a registry declares scalar
+		// over a wider statement, the first column is the value.
+		vals = append(vals, row[0])
+	}
+	if err := rs.Err(); err != nil {
+		return nil, pgerr.ErrInternal(err.Error())
+	}
+
+	out := &rendered{nRows: len(vals)}
+	if total, ok := res.Count(); ok {
+		out.total, out.hasTotl = total, true
+	}
+
+	if media == mediaObject {
+		if len(vals) != 1 {
+			return nil, pgerr.ErrSingularZeroMany()
+		}
+		body, aerr := marshalCall(vals[0])
+		if aerr != nil {
+			return nil, aerr
+		}
+		out.body, out.contentType = body, singularMediaType+"; charset=utf-8"
+		return out, nil
+	}
+
+	out.contentType = "application/json; charset=utf-8"
+	if fn.Returns.Kind == rpc.ReturnSetOf {
+		body, aerr := marshalCall(vals)
+		if aerr != nil {
+			return nil, aerr
+		}
+		out.body = body
+		return out, nil
+	}
+
+	// A plain scalar is the single value, or JSON null when the function produced
+	// no row.
+	var single any
+	if len(vals) > 0 {
+		single = vals[0]
+	}
+	body, aerr := marshalCall(single)
+	if aerr != nil {
+		return nil, aerr
+	}
+	out.body = body
+	return out, nil
+}
+
+// marshalCall encodes one RPC value (a scalar or an array of scalars) to JSON
+// without HTML escaping and without the trailing newline the encoder appends.
+func marshalCall(v any) ([]byte, *pgerr.APIError) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, pgerr.ErrInternal(err.Error())
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
 // renderRows shapes a backend row stream into a PostgREST-shaped JSON array,

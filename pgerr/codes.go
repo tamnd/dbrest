@@ -16,6 +16,7 @@ import (
 // status. Callers add details/hint with WithDetails / WithHint.
 const (
 	CodeParse            = "PGRST100" // 400 query-string parse error
+	CodeMethodNotAllowed = "PGRST101" // 405 method not allowed (GET on a volatile fn)
 	CodeRangeUnsatisfied = "PGRST103" // 416 requested range not satisfiable
 	CodeMediaType        = "PGRST107" // 406/415 media type not negotiable
 	CodeSingularZeroMany = "PGRST116" // 406 singular requested, zero or many rows
@@ -99,6 +100,15 @@ func ErrAmbiguousEmbed(parent, target string) *APIError {
 func ErrNoFunction(name string) *APIError {
 	return New(http.StatusNotFound, CodeNoFunction,
 		fmt.Sprintf("Could not find the function '%s' in the schema cache", name))
+}
+
+// ErrMethodNotAllowed is raised when a read method calls a volatile function: a
+// GET to a function with side effects, which PostgREST rejects with 405.
+func ErrMethodNotAllowed(msg string) *APIError {
+	if msg == "" {
+		msg = "Method not allowed"
+	}
+	return New(http.StatusMethodNotAllowed, CodeMethodNotAllowed, msg)
 }
 
 // ErrUnsupported is the dbrest-specific PGRST127. The details string always
