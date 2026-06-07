@@ -1,0 +1,48 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - misspell
+    - revive
+    - unconvert
+    - gocritic
+  settings:
+    revive:
+      rules:
+        - name: exported
+          arguments:
+            # iota enum members are documented by their type-level comment; a
+            # per-constant comment on each member is redundant noise.
+            - disableStutteringCheck
+            - disableChecksOnConstants
+    errcheck:
+      # These return an error only on an already-broken stream or socket, where
+      # the caller has nothing useful to do with it; checking each one buys no
+      # safety and only adds noise.
+      exclude-functions:
+        - (*database/sql.DB).Close
+        - (*database/sql.Rows).Close
+        - (github.com/tamnd/dbrest/backend.RowStream).Close
+        - (net/http.ResponseWriter).Write
+    misspell:
+      # SQLite type-affinity matching keys on the substring "DOUB" (DOUBLE).
+      ignore-rules:
+        - DOUB
+  exclusions:
+    rules:
+      # Table-driven tests and fixtures may keep unused helpers as they grow.
+      - path: _test\.go
+        linters:
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt

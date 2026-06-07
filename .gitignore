@@ -1,0 +1,20 @@
+# Binaries
+/dbrest
+/cmd/dbrest/dbrest
+
+# Local databases
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+
+# Test and coverage output
+*.out
+coverage.txt
+coverage.html
+
+# Editor and OS cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp
