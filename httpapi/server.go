@@ -69,12 +69,18 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	media, ok := negotiate(r.Header.Values("Accept"))
+	if !ok {
+		writeError(w, pgerr.ErrNotAcceptable(strings.Join(r.Header.Values("Accept"), ", ")))
+		return
+	}
+
 	q, apiErr := ir.ParseRead(relation, r.URL.RawQuery, r.Header.Values("Prefer"))
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
 	}
-	q.Singular = wantsSingular(r)
+	q.Singular = media == mediaObject
 
 	planned, apiErr := plan.Read(s.model, q, s.searchPath)
 	if apiErr != nil {
@@ -95,7 +101,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	out, apiErr := renderRows(res, q.Singular)
+	out, apiErr := renderFor(media, res)
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
@@ -111,6 +117,12 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.Que
 		return
 	}
 
+	media, ok := negotiate(r.Header.Values("Accept"))
+	if !ok {
+		writeError(w, pgerr.ErrNotAcceptable(strings.Join(r.Header.Values("Accept"), ", ")))
+		return
+	}
+
 	var body []byte
 	if kind != ir.Delete {
 		b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
@@ -121,12 +133,12 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.Que
 		body = b
 	}
 
-	q, apiErr := ir.ParseWrite(kind, relation, r.URL.RawQuery, r.Header.Values("Prefer"), body)
+	q, apiErr := ir.ParseWrite(kind, relation, r.URL.RawQuery, r.Header.Values("Prefer"), r.Header.Get("Content-Type"), body)
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
 	}
-	q.Singular = wantsSingular(r)
+	q.Singular = media == mediaObject
 
 	planned, apiErr := plan.Write(s.model, q, s.searchPath)
 	if apiErr != nil {
@@ -141,14 +153,14 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.Que
 		return
 	}
 
-	s.writeWrite(w, r, q, planned.Rel, res)
+	s.writeWrite(w, r, q, media, planned.Rel, res)
 }
 
 // writeWrite sets headers, status, and body for a successful write. A
 // representation returns the affected rows (and Content-Range for a collection);
 // otherwise the body is empty. An insert or upsert of a single row carries a
 // Location header pointing at the new resource by primary key.
-func (s *Server) writeWrite(w http.ResponseWriter, r *http.Request, q *ir.Query, rel *schema.Relation, res backend.Result) {
+func (s *Server) writeWrite(w http.ResponseWriter, r *http.Request, q *ir.Query, media string, rel *schema.Relation, res backend.Result) {
 	for k, v := range res.ResponseControls().Headers {
 		w.Header().Set(k, v)
 	}
@@ -167,15 +179,13 @@ func (s *Server) writeWrite(w http.ResponseWriter, r *http.Request, q *ir.Query,
 		return
 	}
 
-	out, apiErr := renderRows(res, q.Singular)
+	out, apiErr := renderFor(media, res)
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
 	}
-	if q.Singular {
-		w.Header().Set("Content-Type", singularMediaType+"; charset=utf-8")
-	} else {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Type", out.contentType)
+	if !q.Singular {
 		w.Header().Set("Content-Range", contentRange(0, out.nRows, 0, false))
 	}
 	w.WriteHeader(writeStatus(r.Method, true))
@@ -236,11 +246,7 @@ func locationHeader(rel *schema.Relation, relation string, res backend.Result) s
 // writeRead sets the headers and status for a successful read and writes the
 // body (omitted for HEAD).
 func (s *Server) writeRead(w http.ResponseWriter, r *http.Request, q *ir.Query, out *rendered) {
-	if q.Singular {
-		w.Header().Set("Content-Type", singularMediaType+"; charset=utf-8")
-	} else {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	}
+	w.Header().Set("Content-Type", out.contentType)
 
 	offset := 0
 	if q.Offset != nil {
@@ -280,15 +286,6 @@ func readStatus(q *ir.Query, out *rendered, _ int) int {
 		return http.StatusOK
 	}
 	return http.StatusPartialContent
-}
-
-func wantsSingular(r *http.Request) bool {
-	for _, a := range r.Header.Values("Accept") {
-		if strings.Contains(a, singularMediaType) {
-			return true
-		}
-	}
-	return false
 }
 
 // asAPIError normalizes a backend execution error to the API envelope, asking

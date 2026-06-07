@@ -17,6 +17,7 @@ import (
 const (
 	CodeParse            = "PGRST100" // 400 query-string parse error
 	CodeRangeUnsatisfied = "PGRST103" // 416 requested range not satisfiable
+	CodeMediaType        = "PGRST107" // 406/415 media type not negotiable
 	CodeSingularZeroMany = "PGRST116" // 406 singular requested, zero or many rows
 	CodeNoRelationship   = "PGRST200" // 400 relationship not found
 	CodeAmbiguousEmbed   = "PGRST201" // 300 embedding ambiguous
@@ -46,6 +47,22 @@ func ErrSingularZeroMany() *APIError {
 func ErrRangeNotSatisfiable() *APIError {
 	return New(http.StatusRequestedRangeNotSatisfiable, CodeRangeUnsatisfied,
 		"Requested range not satisfiable")
+}
+
+// ErrNotAcceptable is raised when the Accept header names no media type the
+// renderer can produce. It carries the list of types that were offered, matching
+// PostgREST's PGRST107 with a 406.
+func ErrNotAcceptable(offered string) *APIError {
+	return New(http.StatusNotAcceptable, CodeMediaType,
+		"None of these media types are available: "+offered)
+}
+
+// ErrUnsupportedMediaType is raised when a write or RPC body arrives with a
+// Content-Type no parser handles. It is PGRST107 with a 415, the request-side
+// twin of ErrNotAcceptable.
+func ErrUnsupportedMediaType(contentType string) *APIError {
+	return New(http.StatusUnsupportedMediaType, CodeMediaType,
+		fmt.Sprintf("Content-Type not supported: '%s'", contentType))
 }
 
 // ErrUnknownTable is raised when a table or view is not in the schema model

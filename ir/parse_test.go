@@ -197,7 +197,7 @@ func TestParsePreferCount(t *testing.T) {
 }
 
 func TestParseWriteInsertSingle(t *testing.T) {
-	q, err := ParseWrite(Insert, "films", "", nil, []byte(`{"title":"Dune","year":2021}`))
+	q, err := ParseWrite(Insert, "films", "", nil, "", []byte(`{"title":"Dune","year":2021}`))
 	if err != nil {
 		t.Fatalf("ParseWrite: %v", err)
 	}
@@ -218,7 +218,7 @@ func TestParseWriteInsertSingle(t *testing.T) {
 }
 
 func TestParseWriteInsertArray(t *testing.T) {
-	q, err := ParseWrite(Insert, "films", "", nil, []byte(`[{"title":"A"},{"title":"B"}]`))
+	q, err := ParseWrite(Insert, "films", "", nil, "", []byte(`[{"title":"A"},{"title":"B"}]`))
 	if err != nil {
 		t.Fatalf("ParseWrite: %v", err)
 	}
@@ -229,7 +229,7 @@ func TestParseWriteInsertArray(t *testing.T) {
 
 func TestParseWriteColumnsParam(t *testing.T) {
 	// The explicit columns= parameter overrides the inferred set.
-	q, err := ParseWrite(Insert, "films", "columns=title", nil, []byte(`{"title":"Dune","year":2021}`))
+	q, err := ParseWrite(Insert, "films", "columns=title", nil, "", []byte(`{"title":"Dune","year":2021}`))
 	if err != nil {
 		t.Fatalf("ParseWrite: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestParseWriteColumnsParam(t *testing.T) {
 }
 
 func TestParseWriteUpdate(t *testing.T) {
-	q, err := ParseWrite(Update, "films", "id=eq.2", nil, []byte(`{"rating":"PG"}`))
+	q, err := ParseWrite(Update, "films", "id=eq.2", nil, "", []byte(`{"rating":"PG"}`))
 	if err != nil {
 		t.Fatalf("ParseWrite: %v", err)
 	}
@@ -255,7 +255,7 @@ func TestParseWriteUpdate(t *testing.T) {
 }
 
 func TestParseWriteUpsertViaResolution(t *testing.T) {
-	q, err := ParseWrite(Insert, "films", "", []string{"resolution=merge-duplicates"}, []byte(`{"id":1,"title":"X"}`))
+	q, err := ParseWrite(Insert, "films", "", []string{"resolution=merge-duplicates"}, "", []byte(`{"id":1,"title":"X"}`))
 	if err != nil {
 		t.Fatalf("ParseWrite: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestParseWriteUpsertViaResolution(t *testing.T) {
 }
 
 func TestParseWriteOnConflictTarget(t *testing.T) {
-	q, err := ParseWrite(Insert, "films", "on_conflict=id", nil, []byte(`{"id":1}`))
+	q, err := ParseWrite(Insert, "films", "on_conflict=id", nil, "", []byte(`{"id":1}`))
 	if err != nil {
 		t.Fatalf("ParseWrite: %v", err)
 	}
@@ -281,7 +281,7 @@ func TestParseWriteOnConflictTarget(t *testing.T) {
 }
 
 func TestParseWriteReturnAndMissing(t *testing.T) {
-	q, err := ParseWrite(Insert, "films", "", []string{"return=representation", "missing=null"}, []byte(`{"title":"X"}`))
+	q, err := ParseWrite(Insert, "films", "", []string{"return=representation", "missing=null"}, "", []byte(`{"title":"X"}`))
 	if err != nil {
 		t.Fatalf("ParseWrite: %v", err)
 	}
@@ -294,13 +294,13 @@ func TestParseWriteReturnAndMissing(t *testing.T) {
 }
 
 func TestParseWriteBadJSON(t *testing.T) {
-	if _, err := ParseWrite(Insert, "films", "", nil, []byte(`{not json`)); err == nil {
+	if _, err := ParseWrite(Insert, "films", "", nil, "", []byte(`{not json`)); err == nil {
 		t.Error("malformed JSON body should error PGRST100")
 	}
 }
 
 func TestParseWriteDeleteNoBody(t *testing.T) {
-	q, err := ParseWrite(Delete, "films", "id=eq.1", nil, nil)
+	q, err := ParseWrite(Delete, "films", "id=eq.1", nil, "", nil)
 	if err != nil {
 		t.Fatalf("ParseWrite: %v", err)
 	}
