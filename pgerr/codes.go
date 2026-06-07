@@ -184,6 +184,26 @@ func ErrRoleNotAllowed(role string) *APIError {
 		fmt.Sprintf("permission denied to set role \"%s\"", role))
 }
 
+// ErrPermissionDenied is a table or column privilege denial: PostgreSQL's 42501
+// surfaced as 403 for an authenticated role, or 401 when the request carried no
+// JWT and was denied to anon (spec 14).
+func ErrPermissionDenied(relation string, anonymous bool) *APIError {
+	status := http.StatusForbidden
+	if anonymous {
+		status = http.StatusUnauthorized
+	}
+	return New(status, CodeInsufficientPrivilege,
+		fmt.Sprintf("permission denied for table %s", relation))
+}
+
+// ErrRLSViolation is a row that fails a WITH CHECK policy on a write, mirroring
+// PostgreSQL's "new row violates row-level security policy" mapped to 403. The
+// transaction is aborted so nothing is committed (spec 14).
+func ErrRLSViolation(relation string) *APIError {
+	return New(http.StatusForbidden, CodeInsufficientPrivilege,
+		fmt.Sprintf("new row violates row-level security policy for table %q", relation))
+}
+
 // ErrInternal renders an unexpected internal failure as a 500. The XX family in
 // upstream covers internal errors; dbrest renders them as 500.
 func ErrInternal(msg string) *APIError {
