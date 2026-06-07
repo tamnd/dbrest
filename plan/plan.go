@@ -6,8 +6,11 @@
 package plan
 
 import (
+	"errors"
+
 	"github.com/tamnd/dbrest/ir"
 	"github.com/tamnd/dbrest/pgerr"
+	"github.com/tamnd/dbrest/pgtypes"
 	"github.com/tamnd/dbrest/rpc"
 	"github.com/tamnd/dbrest/schema"
 )
@@ -302,7 +305,52 @@ func validateCond(rel *schema.Relation, c *ir.Cond) *pgerr.APIError {
 	case ir.Not:
 		return validateCond(rel, &n.Kid)
 	case ir.Compare:
-		return checkColumn(rel, n.Path)
+		if err := checkColumn(rel, n.Path); err != nil {
+			return err
+		}
+		return checkOperand(rel, n)
+	}
+	return nil
+}
+
+// checkOperand coerces a comparison's operand against the column's canonical type
+// so a value the type cannot hold (a word where an int4 is wanted) is a clean 400
+// in the frontend, identical on every backend, instead of an engine-specific
+// error or, worse, a silent affinity coercion. Only the value-bearing operators
+// are coerced: pattern operators (like/match/fts) take a pattern, is takes a
+// null/boolean keyword, and a base column with a JSON sub-path is opaque to the
+// model, so all of those are left alone. See spec 16.
+func checkOperand(rel *schema.Relation, c ir.Compare) *pgerr.APIError {
+	if len(c.Path) != 1 {
+		return nil
+	}
+	col, ok := rel.Column(c.Path[0])
+	if !ok {
+		return nil
+	}
+	switch c.Op {
+	case ir.OpEq, ir.OpNeq, ir.OpGt, ir.OpGte, ir.OpLt, ir.OpLte:
+		return coerce(col.Type, c.Value.Text)
+	case ir.OpIn:
+		for _, v := range c.Value.List {
+			if err := coerce(col.Type, v); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return nil
+	}
+}
+
+// coerce runs the operand through the type's parser, turning a coercion failure
+// into the PostgREST 22P02 envelope with the canonical type named.
+func coerce(canonicalType, text string) *pgerr.APIError {
+	if _, err := pgtypes.ParseScalar(canonicalType, text); err != nil {
+		if ce, ok := errors.AsType[*pgtypes.CoerceError](err); ok {
+			return pgerr.ErrInvalidInput(ce.Canonical, ce.Input)
+		}
+		return pgerr.ErrInvalidInput(canonicalType, text)
 	}
 	return nil
 }
