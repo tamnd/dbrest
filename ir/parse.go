@@ -2,6 +2,7 @@ package ir
 
 import (
 	"bytes"
+	"encoding/csv"
 	"encoding/json"
 	"net/url"
 	"slices"
@@ -79,12 +80,13 @@ func parseQueryString(q *Query, vals url.Values) *pgerr.APIError {
 }
 
 // ParseWrite parses a POST/PATCH/PUT/DELETE request into a write Query. kind is
-// the mutation the router chose from the method; body is the raw request body
-// (JSON for now). The filter tree from the query string becomes the WHERE for
+// the mutation the router chose from the method; contentType selects the body
+// parser (JSON, CSV, or form-urlencoded; see spec 17) and body is the raw
+// request body. The filter tree from the query string becomes the WHERE for
 // update and delete; the select list is the returning projection. A resolution
 // preference or an on_conflict target promotes an insert to an upsert. All
-// errors are PGRST1xx (*pgerr.APIError). See spec 11-writes.
-func ParseWrite(kind QueryKind, relation, rawQuery string, preferHeaders []string, body []byte) (*Query, *pgerr.APIError) {
+// errors are PGRST1xx (*pgerr.APIError). See spec 11-writes and 17-content-negotiation.
+func ParseWrite(kind QueryKind, relation, rawQuery string, preferHeaders []string, contentType string, body []byte) (*Query, *pgerr.APIError) {
 	vals, err := url.ParseQuery(rawQuery)
 	if err != nil {
 		return nil, pgerr.ErrParse("could not parse query string")
@@ -127,15 +129,19 @@ func ParseWrite(kind QueryKind, relation, rawQuery string, preferHeaders []strin
 
 	switch q.Kind {
 	case Insert, Upsert:
-		rows, cols, perr := parseInsertBody(body, vals.Get("columns"))
+		objs, header, perr := decodeBodyObjects(contentType, body)
 		if perr != nil {
 			return nil, perr
 		}
-		w.Rows, w.Columns = rows, cols
+		w.Rows, w.Columns = buildInsert(objs, vals.Get("columns"), header)
 	case Update:
-		set, perr := parseUpdateBody(body)
+		obj, perr := decodeBodyObject(contentType, body)
 		if perr != nil {
 			return nil, perr
+		}
+		set := make(map[string]Value, len(obj))
+		for k, v := range obj {
+			set[k] = Value{JSON: v}
 		}
 		w.Set = set
 	case Delete:
@@ -146,35 +152,153 @@ func ParseWrite(kind QueryKind, relation, rawQuery string, preferHeaders []strin
 	return q, nil
 }
 
-// parseInsertBody decodes a JSON insert payload into rows and the column set.
-// The body is either a single object or an array of objects. The column list is
-// the explicit columns= parameter when present, else the sorted keys of the
-// first row (matching PostgREST: later rows' extra keys are ignored, missing
-// keys take the missing= behavior).
-func parseInsertBody(body []byte, columnsParam string) ([]map[string]Value, []string, *pgerr.APIError) {
+// writeFormat is the request body encoding selected by Content-Type (spec 17).
+type writeFormat int
+
+const (
+	fmtJSON writeFormat = iota
+	fmtCSV
+	fmtForm
+	fmtUnknown
+)
+
+// bodyFormat classifies a Content-Type into a write body parser. An empty
+// Content-Type defaults to JSON, matching PostgREST.
+func bodyFormat(contentType string) writeFormat {
+	ct := strings.ToLower(strings.TrimSpace(contentType))
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = strings.TrimSpace(ct[:i])
+	}
+	switch ct {
+	case "", "application/json":
+		return fmtJSON
+	case "text/csv":
+		return fmtCSV
+	case "application/x-www-form-urlencoded":
+		return fmtForm
+	default:
+		return fmtUnknown
+	}
+}
+
+// decodeBodyObjects decodes an insert/upsert body into a list of row objects.
+// For CSV it also returns the header columns in their declared order, which
+// fixes the write column order; JSON and form bodies return a nil header and the
+// column order is derived in buildInsert.
+func decodeBodyObjects(contentType string, body []byte) ([]map[string]any, []string, *pgerr.APIError) {
+	switch bodyFormat(contentType) {
+	case fmtJSON:
+		objs, perr := decodeJSONObjects(body)
+		return objs, nil, perr
+	case fmtCSV:
+		return decodeCSVObjects(body)
+	case fmtForm:
+		obj, perr := decodeFormObject(body)
+		if perr != nil {
+			return nil, nil, perr
+		}
+		return []map[string]any{obj}, nil, nil
+	default:
+		return nil, nil, pgerr.ErrUnsupportedMediaType(contentType)
+	}
+}
+
+// decodeBodyObject decodes an update body into a single object of column
+// assignments. CSV is not a meaningful patch format and is rejected.
+func decodeBodyObject(contentType string, body []byte) (map[string]any, *pgerr.APIError) {
+	switch bodyFormat(contentType) {
+	case fmtJSON:
+		dec := json.NewDecoder(bytes.NewReader(body))
+		dec.UseNumber()
+		var obj map[string]any
+		if err := dec.Decode(&obj); err != nil {
+			return nil, pgerr.ErrParse("update body must be a JSON object")
+		}
+		return obj, nil
+	case fmtForm:
+		return decodeFormObject(body)
+	default:
+		return nil, pgerr.ErrUnsupportedMediaType(contentType)
+	}
+}
+
+// decodeJSONObjects decodes a single object or an array of objects, with numbers
+// kept as json.Number so integer keys round-trip without float widening.
+func decodeJSONObjects(body []byte) ([]map[string]any, *pgerr.APIError) {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
 	var raw any
 	if err := dec.Decode(&raw); err != nil {
-		return nil, nil, pgerr.ErrParse("request body is not valid JSON")
+		return nil, pgerr.ErrParse("request body is not valid JSON")
 	}
-
-	var objs []map[string]any
 	switch v := raw.(type) {
 	case map[string]any:
-		objs = []map[string]any{v}
+		return []map[string]any{v}, nil
 	case []any:
+		objs := make([]map[string]any, 0, len(v))
 		for _, e := range v {
 			obj, ok := e.(map[string]any)
 			if !ok {
-				return nil, nil, pgerr.ErrParse("insert array must contain objects")
+				return nil, pgerr.ErrParse("insert array must contain objects")
 			}
 			objs = append(objs, obj)
 		}
+		return objs, nil
 	default:
-		return nil, nil, pgerr.ErrParse("insert body must be an object or an array of objects")
+		return nil, pgerr.ErrParse("insert body must be an object or an array of objects")
 	}
+}
 
+// decodeCSVObjects parses an RFC 4180 body into row objects keyed by the header
+// row. An empty field decodes to SQL NULL, matching PostgREST's default CSV null
+// handling (Go's csv reader does not distinguish a quoted empty string from an
+// unquoted empty field, so both map to null).
+func decodeCSVObjects(body []byte) ([]map[string]any, []string, *pgerr.APIError) {
+	r := csv.NewReader(bytes.NewReader(body))
+	recs, err := r.ReadAll()
+	if err != nil {
+		return nil, nil, pgerr.ErrParse("malformed CSV body")
+	}
+	if len(recs) == 0 {
+		return nil, nil, pgerr.ErrParse("CSV body has no header row")
+	}
+	header := recs[0]
+	objs := make([]map[string]any, 0, len(recs)-1)
+	for _, rec := range recs[1:] {
+		obj := make(map[string]any, len(header))
+		for i, h := range header {
+			if i < len(rec) && rec[i] != "" {
+				obj[h] = rec[i]
+			} else {
+				obj[h] = nil
+			}
+		}
+		objs = append(objs, obj)
+	}
+	return objs, header, nil
+}
+
+// decodeFormObject parses an application/x-www-form-urlencoded body into one row
+// object; each field's first value becomes a string column.
+func decodeFormObject(body []byte) (map[string]any, *pgerr.APIError) {
+	vals, err := url.ParseQuery(string(body))
+	if err != nil {
+		return nil, pgerr.ErrParse("malformed form body")
+	}
+	obj := make(map[string]any, len(vals))
+	for k, v := range vals {
+		if len(v) > 0 {
+			obj[k] = v[0]
+		}
+	}
+	return obj, nil
+}
+
+// buildInsert turns decoded objects into write rows and resolves the column set.
+// The column order is the explicit columns= parameter when present, else the CSV
+// header order, else the sorted keys of the first row (matching PostgREST: later
+// rows' extra keys are ignored and missing keys take the missing= behavior).
+func buildInsert(objs []map[string]any, columnsParam string, header []string) ([]map[string]Value, []string) {
 	rows := make([]map[string]Value, len(objs))
 	for i, obj := range objs {
 		row := make(map[string]Value, len(obj))
@@ -188,29 +312,15 @@ func parseInsertBody(body []byte, columnsParam string) ([]map[string]Value, []st
 	switch {
 	case columnsParam != "":
 		cols = splitComma(columnsParam)
+	case header != nil:
+		cols = header
 	case len(objs) > 0:
 		for k := range objs[0] {
 			cols = append(cols, k)
 		}
 		sort.Strings(cols)
 	}
-	return rows, cols, nil
-}
-
-// parseUpdateBody decodes a JSON patch payload, a single object of column
-// assignments.
-func parseUpdateBody(body []byte) (map[string]Value, *pgerr.APIError) {
-	dec := json.NewDecoder(bytes.NewReader(body))
-	dec.UseNumber()
-	var obj map[string]any
-	if err := dec.Decode(&obj); err != nil {
-		return nil, pgerr.ErrParse("update body must be a JSON object")
-	}
-	set := make(map[string]Value, len(obj))
-	for k, v := range obj {
-		set[k] = Value{JSON: v}
-	}
-	return set, nil
+	return rows, cols
 }
 
 // splitComma splits a comma-separated parameter, trimming each element and
