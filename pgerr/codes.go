@@ -77,6 +77,43 @@ func ErrUnsupported(feature, backend string) *APIError {
 	return e.WithHint("see the capability matrix for supported features on this backend")
 }
 
+// The class-23 SQLSTATEs are PostgreSQL's integrity-constraint violations. Every
+// backend maps its native constraint error to one of these so a client sees the
+// same code regardless of engine; PostgREST reports the SQLSTATE as the error
+// code. The HTTP status follows PostgREST: 409 for a key that conflicts with an
+// existing row, 400 for a payload that violates the column's own rules.
+const (
+	CodeUniqueViolation     = "23505" // 409 duplicate key
+	CodeNotNullViolation    = "23502" // 400 null in a NOT NULL column
+	CodeForeignKeyViolation = "23503" // 409 references a missing row
+	CodeCheckViolation      = "23514" // 400 fails a CHECK constraint
+)
+
+// ErrUniqueViolation is a duplicate-key conflict (PostgreSQL 23505).
+func ErrUniqueViolation(detail string) *APIError {
+	return New(http.StatusConflict, CodeUniqueViolation,
+		"duplicate key value violates unique constraint").WithDetails(detail)
+}
+
+// ErrNotNullViolation is a NULL written to a NOT NULL column (23502).
+func ErrNotNullViolation(detail string) *APIError {
+	return New(http.StatusBadRequest, CodeNotNullViolation,
+		"null value violates not-null constraint").WithDetails(detail)
+}
+
+// ErrForeignKeyViolation is a reference to a row that does not exist (23503).
+func ErrForeignKeyViolation(detail string) *APIError {
+	return New(http.StatusConflict, CodeForeignKeyViolation,
+		"insert or update violates foreign key constraint").WithDetails(detail)
+}
+
+// ErrCheckViolation is a row that fails a CHECK constraint (23514). It is also
+// the fallback for any other integrity violation the backend cannot classify.
+func ErrCheckViolation(detail string) *APIError {
+	return New(http.StatusBadRequest, CodeCheckViolation,
+		"new row violates check constraint").WithDetails(detail)
+}
+
 // ErrJWTExpired is raised when a JWT is past its exp (with skew applied).
 func ErrJWTExpired() *APIError {
 	return New(http.StatusUnauthorized, CodeJWTExpired, "JWT expired")

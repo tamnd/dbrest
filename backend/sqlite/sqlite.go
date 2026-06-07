@@ -4,16 +4,19 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"regexp"
 
 	sqlitedrv "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 
 	"github.com/tamnd/dbrest/backend"
 	"github.com/tamnd/dbrest/backend/sqlgen"
 	"github.com/tamnd/dbrest/ir"
 	"github.com/tamnd/dbrest/pgerr"
 	"github.com/tamnd/dbrest/reqctx"
+	"github.com/tamnd/dbrest/schema"
 )
 
 func init() {
@@ -101,19 +104,36 @@ func (b *Backend) Capabilities() backend.Capabilities {
 // Close releases the pool.
 func (b *Backend) Close() error { return b.db.Close() }
 
-// MapError turns a driver error into the unified envelope. The read path raises
-// no integrity-constraint violations; the constraint-to-SQLSTATE mapping arrives
-// with the writes subsystem, so for now any driver error is surfaced as internal.
+// MapError turns a driver error into the unified envelope. A SQLite constraint
+// violation maps to the PostgreSQL SQLSTATE PostgREST would report (so clients
+// see the same code on every backend) with the matching HTTP status; anything
+// else is surfaced as internal.
 func (b *Backend) MapError(err error) *pgerr.APIError {
 	if err == nil {
 		return nil
+	}
+	if se, ok := errors.AsType[*sqlitedrv.Error](err); ok {
+		// The primary result code is the low byte; the rest is the extended code.
+		switch se.Code() {
+		case sqlite3.SQLITE_CONSTRAINT_UNIQUE, sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY:
+			return pgerr.ErrUniqueViolation(se.Error())
+		case sqlite3.SQLITE_CONSTRAINT_NOTNULL:
+			return pgerr.ErrNotNullViolation(se.Error())
+		case sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY:
+			return pgerr.ErrForeignKeyViolation(se.Error())
+		case sqlite3.SQLITE_CONSTRAINT_CHECK:
+			return pgerr.ErrCheckViolation(se.Error())
+		}
+		if se.Code()&0xff == sqlite3.SQLITE_CONSTRAINT {
+			return pgerr.ErrCheckViolation(se.Error())
+		}
 	}
 	return pgerr.ErrInternal(err.Error())
 }
 
 // Execute lowers a resolved plan to SQLite operations and returns a streamable
-// result. Reads stream from an open cursor; writes and RPC arrive with their
-// subsystems.
+// result. Reads stream from an open cursor; writes run in a short transaction
+// and buffer their returned rows. RPC arrives with its subsystem.
 func (b *Backend) Execute(ctx context.Context, plan *ir.Plan, rc *reqctx.Context) (backend.Result, error) {
 	if plan.Query == nil {
 		return nil, pgerr.ErrUnsupported("this operation", "sqlite")
@@ -121,6 +141,8 @@ func (b *Backend) Execute(ctx context.Context, plan *ir.Plan, rc *reqctx.Context
 	switch plan.Query.Kind {
 	case ir.Read:
 		return b.executeRead(ctx, plan, rc)
+	case ir.Insert, ir.Upsert, ir.Update, ir.Delete:
+		return b.executeWrite(ctx, plan, rc)
 	default:
 		return nil, pgerr.ErrUnsupported("this operation", "sqlite")
 	}
@@ -159,4 +181,114 @@ func (b *Backend) executeRead(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 	}
 	res.rows, res.cols = rows, cols
 	return res, nil
+}
+
+// executeWrite compiles the mutation, runs it in a transaction, and buffers any
+// returned rows. The transaction commits unless the client asked for a
+// rollback (Prefer: tx=rollback), in which case the representation still
+// reflects the would-be result but nothing is persisted.
+func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Context) (backend.Result, error) {
+	q := plan.Query
+	returning := returningCols(q, plan.Rel)
+
+	st, apiErr := compileWrite(q, returning)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+
+	tx, err := b.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, b.MapError(err)
+	}
+	// A single deferred rollback covers every early return; it is a no-op once
+	// the transaction has committed below, so the happy path is unaffected.
+	defer func() { _ = tx.Rollback() }()
+
+	res := &writeResult{controls: rc.Controls()}
+	if len(returning) > 0 {
+		rows, err := tx.QueryContext(ctx, st.SQL, st.Args...)
+		if err != nil {
+			return nil, b.MapError(err)
+		}
+		cols, err := rows.Columns()
+		if err != nil {
+			rows.Close()
+			return nil, b.MapError(err)
+		}
+		buf, err := drain(rows, len(cols))
+		rows.Close()
+		if err != nil {
+			return nil, b.MapError(err)
+		}
+		res.cols, res.rows = cols, buf
+		res.affected, res.hasAff = int64(len(buf)), true
+	} else {
+		out, err := tx.ExecContext(ctx, st.SQL, st.Args...)
+		if err != nil {
+			return nil, b.MapError(err)
+		}
+		n, _ := out.RowsAffected()
+		res.affected, res.hasAff = n, true
+	}
+
+	// Prefer: tx=rollback returns the computed representation but discards the
+	// work; leaving the transaction for the deferred rollback does exactly that.
+	if q.Write != nil && q.Write.Tx == ir.TxRollback {
+		return res, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, b.MapError(err)
+	}
+	return res, nil
+}
+
+// compileWrite dispatches to the right compiler for the mutation kind.
+func compileWrite(q *ir.Query, returning []string) (*sqlgen.Statement, *pgerr.APIError) {
+	switch q.Kind {
+	case ir.Insert, ir.Upsert:
+		return sqlgen.CompileInsert(dialect{}, q, returning)
+	case ir.Update:
+		return sqlgen.CompileUpdate(dialect{}, q, returning)
+	case ir.Delete:
+		return sqlgen.CompileDelete(dialect{}, q, returning)
+	default:
+		return nil, pgerr.ErrUnsupported("this operation", "sqlite")
+	}
+}
+
+// returningCols decides which columns a write reads back. The representation
+// returns the whole row; a minimal insert/upsert still returns the primary key
+// so the handler can build the Location header; a minimal update/delete returns
+// nothing and runs as a plain affected-rows statement.
+func returningCols(q *ir.Query, rel *schema.Relation) []string {
+	if q.Write != nil && q.Write.Return == ir.ReturnRepresentation {
+		return rel.ColumnNames()
+	}
+	if q.Kind == ir.Insert || q.Kind == ir.Upsert {
+		return rel.PrimaryKey
+	}
+	return nil
+}
+
+// drain reads every row of a returning cursor into memory, normalizing []byte to
+// string so text columns render as JSON strings.
+func drain(rows *sql.Rows, ncols int) ([][]any, error) {
+	var out [][]any
+	for rows.Next() {
+		holders := make([]any, ncols)
+		ptrs := make([]any, ncols)
+		for i := range holders {
+			ptrs[i] = &holders[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, err
+		}
+		for i, v := range holders {
+			if bs, ok := v.([]byte); ok {
+				holders[i] = string(bs)
+			}
+		}
+		out = append(out, holders)
+	}
+	return out, rows.Err()
 }

@@ -1,6 +1,7 @@
 package sqlgen
 
 import (
+	"encoding/json"
 	"strconv"
 	"strings"
 	"testing"
@@ -223,6 +224,180 @@ func TestCompileCountWithFilter(t *testing.T) {
 	}
 	if len(st.Args) != 1 || st.Args[0] != "2000" {
 		t.Errorf("Args = %v", st.Args)
+	}
+}
+
+// jnum and jstr build payload values the way the parser does: a JSON number is
+// carried as json.Number, a string as a plain string.
+func jnum(n string) ir.Value { return ir.Value{JSON: json.Number(n)} }
+func jstr(s string) ir.Value { return ir.Value{JSON: s} }
+
+func TestCompileInsertSingleRow(t *testing.T) {
+	st, err := CompileInsert(stub{}, &ir.Query{
+		Relation: ir.Ref{Name: "films"},
+		Write: &ir.WriteSpec{
+			Columns: []string{"title", "year"},
+			Rows:    []map[string]ir.Value{{"title": jstr("Dune"), "year": jnum("2021")}},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("CompileInsert: %v", err)
+	}
+	want := `INSERT INTO "films" ("title", "year") VALUES ($1, $2)`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+	if len(st.Args) != 2 || st.Args[0] != "Dune" || st.Args[1] != int64(2021) {
+		t.Errorf("Args = %#v", st.Args)
+	}
+}
+
+func TestCompileInsertMultiRow(t *testing.T) {
+	st, err := CompileInsert(stub{}, &ir.Query{
+		Relation: ir.Ref{Name: "films"},
+		Write: &ir.WriteSpec{
+			Columns: []string{"title"},
+			Rows: []map[string]ir.Value{
+				{"title": jstr("A")},
+				{"title": jstr("B")},
+			},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("CompileInsert: %v", err)
+	}
+	want := `INSERT INTO "films" ("title") VALUES ($1), ($2)`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+}
+
+func TestCompileInsertMissingDefaultAndNull(t *testing.T) {
+	// A row missing a column takes DEFAULT under missing=default ...
+	st, _ := CompileInsert(stub{}, &ir.Query{
+		Relation: ir.Ref{Name: "t"},
+		Write: &ir.WriteSpec{
+			Columns: []string{"a", "b"},
+			Rows:    []map[string]ir.Value{{"a": jstr("x")}},
+		},
+	}, nil)
+	if st.SQL != `INSERT INTO "t" ("a", "b") VALUES ($1, DEFAULT)` {
+		t.Errorf("default: SQL = %q", st.SQL)
+	}
+	// ... and a bound NULL under missing=null.
+	st, _ = CompileInsert(stub{}, &ir.Query{
+		Relation: ir.Ref{Name: "t"},
+		Write: &ir.WriteSpec{
+			Columns: []string{"a", "b"},
+			Missing: ir.MissingNull,
+			Rows:    []map[string]ir.Value{{"a": jstr("x")}},
+		},
+	}, nil)
+	if st.SQL != `INSERT INTO "t" ("a", "b") VALUES ($1, $2)` {
+		t.Errorf("null: SQL = %q", st.SQL)
+	}
+	if len(st.Args) != 2 || st.Args[1] != nil {
+		t.Errorf("null: Args = %#v", st.Args)
+	}
+}
+
+func TestCompileInsertReturning(t *testing.T) {
+	st, err := CompileInsert(stub{}, &ir.Query{
+		Relation: ir.Ref{Name: "films"},
+		Write: &ir.WriteSpec{
+			Columns: []string{"title"},
+			Rows:    []map[string]ir.Value{{"title": jstr("Dune")}},
+		},
+	}, []string{"id", "title"})
+	if err != nil {
+		t.Fatalf("CompileInsert: %v", err)
+	}
+	want := `INSERT INTO "films" ("title") VALUES ($1) RETURNING "id", "title"`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+}
+
+func TestCompileUpsertMerge(t *testing.T) {
+	st, err := CompileInsert(stub{}, &ir.Query{
+		Relation: ir.Ref{Name: "films"},
+		Write: &ir.WriteSpec{
+			Columns:  []string{"id", "title"},
+			Rows:     []map[string]ir.Value{{"id": jnum("1"), "title": jstr("Dune")}},
+			Conflict: &ir.Conflict{Target: []string{"id"}, Resolution: ir.ConflictMerge},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("CompileInsert: %v", err)
+	}
+	want := `INSERT INTO "films" ("id", "title") VALUES ($1, $2) ` +
+		`ON CONFLICT ("id") DO UPDATE SET "id" = excluded."id", "title" = excluded."title"`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+}
+
+func TestCompileUpsertIgnore(t *testing.T) {
+	st, _ := CompileInsert(stub{}, &ir.Query{
+		Relation: ir.Ref{Name: "films"},
+		Write: &ir.WriteSpec{
+			Columns:  []string{"id"},
+			Rows:     []map[string]ir.Value{{"id": jnum("1")}},
+			Conflict: &ir.Conflict{Target: []string{"id"}, Resolution: ir.ConflictIgnore},
+		},
+	}, nil)
+	want := `INSERT INTO "films" ("id") VALUES ($1) ON CONFLICT ("id") DO NOTHING`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+}
+
+func TestCompileUpdate(t *testing.T) {
+	where := ir.Cond(ir.Compare{Path: []string{"id"}, Op: ir.OpEq, Value: ir.Value{Text: "1"}})
+	st, err := CompileUpdate(stub{}, &ir.Query{
+		Relation: ir.Ref{Name: "films"},
+		Where:    &where,
+		Write:    &ir.WriteSpec{Set: map[string]ir.Value{"title": jstr("Dune"), "year": jnum("2021")}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("CompileUpdate: %v", err)
+	}
+	// SET columns are written in sorted order, so title then year, then WHERE.
+	want := `UPDATE "films" SET "title" = $1, "year" = $2 WHERE "id" = $3`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+	if len(st.Args) != 3 || st.Args[0] != "Dune" || st.Args[1] != int64(2021) || st.Args[2] != "1" {
+		t.Errorf("Args = %#v", st.Args)
+	}
+}
+
+func TestCompileUpdateNoFilterTouchesAll(t *testing.T) {
+	st, _ := CompileUpdate(stub{}, &ir.Query{
+		Relation: ir.Ref{Name: "t"},
+		Write:    &ir.WriteSpec{Set: map[string]ir.Value{"a": jstr("x")}},
+	}, nil)
+	if st.SQL != `UPDATE "t" SET "a" = $1` {
+		t.Errorf("SQL = %q", st.SQL)
+	}
+}
+
+func TestCompileDelete(t *testing.T) {
+	where := ir.Cond(ir.Compare{Path: []string{"id"}, Op: ir.OpEq, Value: ir.Value{Text: "9"}})
+	st, err := CompileDelete(stub{}, &ir.Query{Relation: ir.Ref{Name: "films"}, Where: &where}, []string{"id"})
+	if err != nil {
+		t.Fatalf("CompileDelete: %v", err)
+	}
+	want := `DELETE FROM "films" WHERE "id" = $1 RETURNING "id"`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+}
+
+func TestCompileInsertEmptyPayloadRejected(t *testing.T) {
+	_, err := CompileInsert(stub{}, &ir.Query{Relation: ir.Ref{Name: "t"}, Write: &ir.WriteSpec{}}, nil)
+	if err == nil {
+		t.Fatal("want an error for an empty insert payload")
 	}
 }
 

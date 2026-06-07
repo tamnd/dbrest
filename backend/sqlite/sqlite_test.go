@@ -2,12 +2,15 @@ package sqlite
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/tamnd/dbrest/backend"
 	"github.com/tamnd/dbrest/ir"
+	"github.com/tamnd/dbrest/pgerr"
 	"github.com/tamnd/dbrest/reqctx"
+	"github.com/tamnd/dbrest/schema"
 )
 
 // openSeeded returns an in-memory SQLite backend with a films table populated
@@ -221,6 +224,196 @@ func TestExecuteNoCountByDefault(t *testing.T) {
 	}
 	if _, ok := res.Count(); ok {
 		t.Error("Count() should report no total when no count was requested")
+	}
+}
+
+// execWrite runs a write plan and returns the result for inspection.
+func execWrite(t *testing.T, b *Backend, q *ir.Query) backend.Result {
+	t.Helper()
+	rel, ok := mustModel(t, b).Lookup("films", nil)
+	if !ok {
+		t.Fatal("films not in model")
+	}
+	// Resolve the relation reference the way the planner does.
+	q.Relation = ir.Ref{Name: rel.Name}
+	pl := &ir.Plan{Query: q, Rel: rel}
+	if q.Write != nil && q.Write.Conflict != nil && len(q.Write.Conflict.Target) == 0 {
+		q.Write.Conflict.Target = rel.PrimaryKey
+	}
+	res, err := b.Execute(context.Background(), pl, &reqctx.Context{Role: "anon"})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	return res
+}
+
+func mustModel(t *testing.T, b *Backend) *schema.Model {
+	t.Helper()
+	m, err := b.Introspect(context.Background())
+	if err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+	return m
+}
+
+func TestExecuteInsertRepresentation(t *testing.T) {
+	b := openSeeded(t)
+	res := execWrite(t, b, &ir.Query{
+		Kind:     ir.Insert,
+		Relation: ir.Ref{Name: "films"},
+		Write: &ir.WriteSpec{
+			Return:  ir.ReturnRepresentation,
+			Columns: []string{"id", "title", "year"},
+			Rows:    []map[string]ir.Value{{"id": ir.Value{JSON: json.Number("5")}, "title": ir.Value{JSON: "Dune"}, "year": ir.Value{JSON: json.Number("2021")}}},
+		},
+	})
+	rows := readAll(t, res)
+	if len(rows) != 1 || rows[0]["title"] != "Dune" || rows[0]["id"].(int64) != 5 {
+		t.Fatalf("insert representation = %v", rows)
+	}
+	if n, ok := res.Affected(); !ok || n != 1 {
+		t.Errorf("Affected = %d,%v want 1,true", n, ok)
+	}
+	// The row is committed: a follow-up read sees it.
+	all := execRead(t, b, &ir.Query{Relation: ir.Ref{Name: "films"}})
+	if len(all) != 5 {
+		t.Errorf("after insert, films count = %d, want 5", len(all))
+	}
+}
+
+func TestExecuteInsertMinimalReturnsPK(t *testing.T) {
+	b := openSeeded(t)
+	res := execWrite(t, b, &ir.Query{
+		Kind:     ir.Insert,
+		Relation: ir.Ref{Name: "films"},
+		Write: &ir.WriteSpec{
+			Return:  ir.ReturnMinimal,
+			Columns: []string{"id", "title"},
+			Rows:    []map[string]ir.Value{{"id": ir.Value{JSON: json.Number("7")}, "title": ir.Value{JSON: "Tenet"}}},
+		},
+	})
+	// Minimal still returns the primary key so the handler can build Location.
+	rows := readAll(t, res)
+	if len(rows) != 1 || rows[0]["id"].(int64) != 7 {
+		t.Fatalf("minimal insert pk = %v", rows)
+	}
+}
+
+func TestExecuteUpdate(t *testing.T) {
+	b := openSeeded(t)
+	where := ir.Cond(ir.Compare{Path: []string{"id"}, Op: ir.OpEq, Value: ir.Value{Text: "2"}})
+	res := execWrite(t, b, &ir.Query{
+		Kind:     ir.Update,
+		Relation: ir.Ref{Name: "films"},
+		Where:    &where,
+		Write: &ir.WriteSpec{
+			Return: ir.ReturnRepresentation,
+			Set:    map[string]ir.Value{"rating": {JSON: "PG"}},
+		},
+	})
+	rows := readAll(t, res)
+	if len(rows) != 1 || rows[0]["rating"] != "PG" {
+		t.Fatalf("update representation = %v", rows)
+	}
+}
+
+func TestExecuteUpdateMinimalAffected(t *testing.T) {
+	b := openSeeded(t)
+	res := execWrite(t, b, &ir.Query{
+		Kind:     ir.Update,
+		Relation: ir.Ref{Name: "films"},
+		Write:    &ir.WriteSpec{Return: ir.ReturnMinimal, Set: map[string]ir.Value{"rating": {JSON: "X"}}},
+	})
+	// No filter updates every row; minimal reports the affected count.
+	if n, ok := res.Affected(); !ok || n != 4 {
+		t.Errorf("Affected = %d,%v want 4,true", n, ok)
+	}
+	if rows := readAll(t, res); len(rows) != 0 {
+		t.Errorf("minimal update should buffer no rows, got %v", rows)
+	}
+}
+
+func TestExecuteDelete(t *testing.T) {
+	b := openSeeded(t)
+	where := ir.Cond(ir.Compare{Path: []string{"id"}, Op: ir.OpEq, Value: ir.Value{Text: "1"}})
+	res := execWrite(t, b, &ir.Query{
+		Kind:     ir.Delete,
+		Relation: ir.Ref{Name: "films"},
+		Where:    &where,
+		Write:    &ir.WriteSpec{Return: ir.ReturnMinimal},
+	})
+	if n, _ := res.Affected(); n != 1 {
+		t.Errorf("deleted = %d, want 1", n)
+	}
+	if all := execRead(t, b, &ir.Query{Relation: ir.Ref{Name: "films"}}); len(all) != 3 {
+		t.Errorf("after delete, count = %d, want 3", len(all))
+	}
+}
+
+func TestExecuteUpsertMergeUpdatesExisting(t *testing.T) {
+	b := openSeeded(t)
+	res := execWrite(t, b, &ir.Query{
+		Kind:     ir.Upsert,
+		Relation: ir.Ref{Name: "films"},
+		Write: &ir.WriteSpec{
+			Return:   ir.ReturnRepresentation,
+			Columns:  []string{"id", "title"},
+			Rows:     []map[string]ir.Value{{"id": ir.Value{JSON: json.Number("1")}, "title": ir.Value{JSON: "Metropolis (restored)"}}},
+			Conflict: &ir.Conflict{Resolution: ir.ConflictMerge}, // target defaults to PK
+		},
+	})
+	rows := readAll(t, res)
+	if len(rows) != 1 || rows[0]["title"] != "Metropolis (restored)" {
+		t.Fatalf("upsert merge = %v", rows)
+	}
+	if all := execRead(t, b, &ir.Query{Relation: ir.Ref{Name: "films"}}); len(all) != 4 {
+		t.Errorf("upsert of existing id should not add a row, count = %d", len(all))
+	}
+}
+
+func TestExecuteTxRollbackDoesNotPersist(t *testing.T) {
+	b := openSeeded(t)
+	res := execWrite(t, b, &ir.Query{
+		Kind:     ir.Insert,
+		Relation: ir.Ref{Name: "films"},
+		Write: &ir.WriteSpec{
+			Return:  ir.ReturnRepresentation,
+			Tx:      ir.TxRollback,
+			Columns: []string{"id", "title"},
+			Rows:    []map[string]ir.Value{{"id": ir.Value{JSON: json.Number("9")}, "title": ir.Value{JSON: "Ghost"}}},
+		},
+	})
+	// The representation reflects the would-be row ...
+	if rows := readAll(t, res); len(rows) != 1 {
+		t.Fatalf("rollback representation = %v", rows)
+	}
+	// ... but nothing is persisted.
+	if all := execRead(t, b, &ir.Query{Relation: ir.Ref{Name: "films"}}); len(all) != 4 {
+		t.Errorf("after rollback, count = %d, want 4", len(all))
+	}
+}
+
+func TestMapErrorUniqueViolation(t *testing.T) {
+	b := openSeeded(t)
+	// Inserting a duplicate primary key trips a constraint mapped to 23505/409.
+	pl := &ir.Plan{Query: &ir.Query{
+		Kind:     ir.Insert,
+		Relation: ir.Ref{Name: "films"},
+		Write: &ir.WriteSpec{
+			Return:  ir.ReturnMinimal,
+			Columns: []string{"id", "title"},
+			Rows:    []map[string]ir.Value{{"id": ir.Value{JSON: json.Number("1")}, "title": ir.Value{JSON: "Dup"}}},
+		},
+	}}
+	rel, _ := mustModel(t, b).Lookup("films", nil)
+	pl.Rel = rel
+	_, err := b.Execute(context.Background(), pl, &reqctx.Context{Role: "anon"})
+	if err == nil {
+		t.Fatal("want a constraint error")
+	}
+	api := pgerr.As(err)
+	if api == nil || api.Code != pgerr.CodeUniqueViolation || api.HTTPStatus != 409 {
+		t.Fatalf("err = %#v, want 23505/409", api)
 	}
 }
 
