@@ -11,6 +11,10 @@ package reqctx
 type Context struct {
 	// Role is the resolved request role (web_user, anon, ...).
 	Role string
+	// Anonymous reports that the request carried no usable JWT and runs as the
+	// anon role. It selects 401 over 403 when authorization denies the request:
+	// an unauthenticated caller gets 401, an authenticated one 403 (spec 14).
+	Anonymous bool
 	// Claims are the verified JWT claims, or nil for an anonymous request.
 	Claims map[string]any
 	// Method is the HTTP method.

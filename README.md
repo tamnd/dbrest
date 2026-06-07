@@ -32,10 +32,11 @@ Early, and built subsystem by subsystem against a complete design spec. What wor
 - **Content negotiation** beyond JSON: the singular object type, `text/csv`, and the scalar `application/octet-stream`/`text/plain` types.
 - **RPC** at `/rpc/<fn>` over a portable function registry: scalar, setof, and table returns, `GET`/`POST` by volatility (a `GET` to a volatile function is `405`), the read-only versus read-write transaction, post-filtering a table return, and `PGRST202` when no function matches.
 - **JWT authentication**: stateless bearer-token verification (HMAC, RSA, ECDSA), pinned algorithms with the `none` swap refused, `exp`/`nbf`/`iat`/`aud` with clock skew, the role claim with nested-path support and the anon fallback, `PGRST301`/`PGRST302`/`403` outcomes, and a bounded SIEVE verification cache that never extends a token's lifetime.
+- **Authorization and RLS emulation**: on the emulated backend, table and column privileges gate every read and write (`42501` as `403`, or `401` for an unauthenticated request), a `*` projection is narrowed to the granted columns, and Row Level Security policies are injected as a bound predicate AND-ed above the whole client filter tree, so a client cannot OR its way past a policy, with `WITH CHECK` validated before any row is written.
 - A shared **IR-to-SQL compiler** parameterized by a per-engine `Dialect`, with every value bound and every identifier quoted.
 - **Introspection** into the unified schema model and a planner that validates names and binds them.
 
-The capability model, the backend SPI, and the error envelope are in place. RLS emulation, request context and GUCs, OpenAPI, and the PostgreSQL/MySQL/SQL Server/MongoDB backends are on the roadmap and land against the same SPI.
+The capability model, the backend SPI, and the error envelope are in place. Request context and GUCs, OpenAPI, and the PostgreSQL/MySQL/SQL Server/MongoDB backends are on the roadmap and land against the same SPI.
 
 ## Quick start
 
@@ -76,6 +77,8 @@ Flat packages, no `internal/`, no `/vN` suffixes.
 | `backend` | The backend SPI and the four-tier `Capabilities` model. |
 | `backend/sqlgen` | The single IR-to-SQL compiler, parameterized by a `Dialect`. |
 | `backend/sqlite` | The SQLite reference backend (pure-Go [modernc.org/sqlite](https://modernc.org/sqlite), cgo-free). |
+| `auth` | Stateless JWT verification, role resolution, and the bounded SIEVE verification cache. |
+| `authz` | The privilege and RLS registry: the column gate and the unbypassable policy injection. |
 | `reqctx` | The per-request context handed to a backend (role, claims, response controls). |
 | `httpapi` | The HTTP frontend: router, read and write pipelines, PostgREST-shaped renderer. |
 | `cmd/dbrest` | The server entry point. |

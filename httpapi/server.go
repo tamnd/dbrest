@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/tamnd/dbrest/auth"
+	"github.com/tamnd/dbrest/authz"
 	"github.com/tamnd/dbrest/backend"
 	"github.com/tamnd/dbrest/ir"
 	"github.com/tamnd/dbrest/pgerr"
@@ -35,6 +36,7 @@ type Server struct {
 	searchPath []string
 	role       string
 	verifier   *auth.Verifier
+	authz      *authz.Registry
 }
 
 // NewServer builds a Server over a backend, its introspected model, and the
@@ -49,12 +51,31 @@ func NewServer(b backend.Backend, model *schema.Model, searchPath []string) *Ser
 // before any query runs. With no verifier the server keeps the static role.
 func (s *Server) SetVerifier(v *auth.Verifier) { s.verifier = v }
 
+// SetAuthz attaches an authorization registry. Once set, every read and write is
+// gated by the registry's table and column privileges and has any Row Level
+// Security policy injected before execution (spec 14). On a backend whose engine
+// enforces its own row security this stays nil and the engine decides; on the
+// emulated backends the registry is the security boundary.
+func (s *Server) SetAuthz(r *authz.Registry) { s.authz = r }
+
+// authorize runs the authorization gate on a planned query when a registry is
+// attached. It mutates the plan in place (narrowing a projection, injecting a
+// policy predicate) and returns the denial error otherwise. The anonymous flag
+// selects 401 over 403 for an unauthenticated request.
+func (s *Server) authorize(rc *reqctx.Context, planned *ir.Plan) *pgerr.APIError {
+	if s.authz == nil {
+		return nil
+	}
+	return s.authz.Authorize(rc, planned)
+}
+
 // identity is the resolved per-request principal: the role the request runs as
 // and the verified JWT claims, if any. It is built fresh per request and never
 // stored on the Server, which is shared across goroutines.
 type identity struct {
-	role   string
-	claims map[string]any
+	role      string
+	claims    map[string]any
+	anonymous bool
 }
 
 // authenticate resolves the request identity from the Authorization header. With
@@ -62,13 +83,13 @@ type identity struct {
 // bearer token to a role (or anon), or returns the 401/403 the token earns.
 func (s *Server) authenticate(r *http.Request) (identity, *pgerr.APIError) {
 	if s.verifier == nil {
-		return identity{role: s.role}, nil
+		return identity{role: s.role, anonymous: true}, nil
 	}
 	res, apiErr := s.verifier.Authenticate(r.Header.Get("Authorization"))
 	if apiErr != nil {
 		return identity{}, apiErr
 	}
-	return identity{role: res.Role, claims: res.Claims}, nil
+	return identity{role: res.Role, claims: res.Claims, anonymous: res.Anonymous}, nil
 }
 
 // ServeHTTP routes the request by method onto a /<table> resource. GET/HEAD
@@ -158,7 +179,7 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 		return
 	}
 
-	rc := &reqctx.Context{Role: id.role, Claims: id.claims, Method: r.Method, Path: r.URL.Path, Headers: r.Header}
+	rc := &reqctx.Context{Role: id.role, Anonymous: id.anonymous, Claims: id.claims, Method: r.Method, Path: r.URL.Path, Headers: r.Header}
 	res, err := s.backend.Execute(r.Context(), planned, rc)
 	if err != nil {
 		writeError(w, asAPIError(s.backend, err))
@@ -229,11 +250,17 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity)
 	}
 
 	rc := &reqctx.Context{
-		Role:    id.role,
-		Claims:  id.claims,
-		Method:  r.Method,
-		Path:    r.URL.Path,
-		Headers: r.Header,
+		Role:      id.role,
+		Anonymous: id.anonymous,
+		Claims:    id.claims,
+		Method:    r.Method,
+		Path:      r.URL.Path,
+		Headers:   r.Header,
+	}
+
+	if apiErr := s.authorize(rc, planned); apiErr != nil {
+		writeError(w, apiErr)
+		return
 	}
 
 	res, err := s.backend.Execute(r.Context(), planned, rc)
@@ -287,7 +314,11 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.Que
 		return
 	}
 
-	rc := &reqctx.Context{Role: id.role, Claims: id.claims, Method: r.Method, Path: r.URL.Path, Headers: r.Header}
+	rc := &reqctx.Context{Role: id.role, Anonymous: id.anonymous, Claims: id.claims, Method: r.Method, Path: r.URL.Path, Headers: r.Header}
+	if apiErr := s.authorize(rc, planned); apiErr != nil {
+		writeError(w, apiErr)
+		return
+	}
 	res, err := s.backend.Execute(r.Context(), planned, rc)
 	if err != nil {
 		writeError(w, asAPIError(s.backend, err))
