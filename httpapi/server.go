@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/tamnd/dbrest/auth"
 	"github.com/tamnd/dbrest/backend"
 	"github.com/tamnd/dbrest/ir"
 	"github.com/tamnd/dbrest/pgerr"
@@ -25,20 +26,49 @@ const singularMediaType = "application/vnd.pgrst.object+json"
 // maxBodyBytes caps a request body, so a runaway payload cannot exhaust memory.
 const maxBodyBytes = 16 << 20 // 16 MiB
 
-// Server holds the resolved schema model and the backend, and serves the read
-// API. Writes, RPC, and auth are added with their subsystems; the router rejects
-// what it does not yet handle with an honest error rather than a wrong answer.
+// Server holds the resolved schema model and the backend, and serves the API. A
+// verifier, when set, resolves the request role from the JWT; with none, every
+// request runs as the static default role.
 type Server struct {
 	backend    backend.Backend
 	model      *schema.Model
 	searchPath []string
 	role       string
+	verifier   *auth.Verifier
 }
 
 // NewServer builds a Server over a backend, its introspected model, and the
-// schema search path (the exposed schemas, in resolution order).
+// schema search path (the exposed schemas, in resolution order). It runs every
+// request as the anon role until a verifier is attached with SetVerifier.
 func NewServer(b backend.Backend, model *schema.Model, searchPath []string) *Server {
 	return &Server{backend: b, model: model, searchPath: searchPath, role: "anon"}
+}
+
+// SetVerifier attaches a JWT verifier. Once set, the role and claims of each
+// request come from its bearer token (spec 13), and a bad token is rejected
+// before any query runs. With no verifier the server keeps the static role.
+func (s *Server) SetVerifier(v *auth.Verifier) { s.verifier = v }
+
+// identity is the resolved per-request principal: the role the request runs as
+// and the verified JWT claims, if any. It is built fresh per request and never
+// stored on the Server, which is shared across goroutines.
+type identity struct {
+	role   string
+	claims map[string]any
+}
+
+// authenticate resolves the request identity from the Authorization header. With
+// no verifier it is the static default role; otherwise the verifier maps the
+// bearer token to a role (or anon), or returns the 401/403 the token earns.
+func (s *Server) authenticate(r *http.Request) (identity, *pgerr.APIError) {
+	if s.verifier == nil {
+		return identity{role: s.role}, nil
+	}
+	res, apiErr := s.verifier.Authenticate(r.Header.Get("Authorization"))
+	if apiErr != nil {
+		return identity{}, apiErr
+	}
+	return identity{role: res.Role, claims: res.Claims}, nil
 }
 
 // ServeHTTP routes the request by method onto a /<table> resource. GET/HEAD
@@ -46,21 +76,26 @@ func NewServer(b backend.Backend, model *schema.Model, searchPath []string) *Ser
 // PATCH updates; PUT upserts; DELETE deletes. RPC and OpenAPI arrive with their
 // subsystems; an unhandled method gets an honest error.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	id, apiErr := s.authenticate(r)
+	if apiErr != nil {
+		writeError(w, apiErr)
+		return
+	}
 	if fn, ok := rpcName(r.URL.Path); ok {
-		s.handleRPC(w, r, fn)
+		s.handleRPC(w, r, fn, id)
 		return
 	}
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
-		s.handleRead(w, r)
+		s.handleRead(w, r, id)
 	case http.MethodPost:
-		s.handleWrite(w, r, ir.Insert)
+		s.handleWrite(w, r, ir.Insert, id)
 	case http.MethodPatch:
-		s.handleWrite(w, r, ir.Update)
+		s.handleWrite(w, r, ir.Update, id)
 	case http.MethodPut:
-		s.handleWrite(w, r, ir.Upsert)
+		s.handleWrite(w, r, ir.Upsert, id)
 	case http.MethodDelete:
-		s.handleWrite(w, r, ir.Delete)
+		s.handleWrite(w, r, ir.Delete, id)
 	default:
 		writeError(w, pgerr.ErrUnsupported(r.Method+" requests", "dbrest"))
 	}
@@ -81,7 +116,7 @@ func rpcName(path string) (string, bool) {
 // string); POST reads or writes (arguments from the JSON body). A read method may
 // only reach a read-only function; the plan raises 405 otherwise. Any other
 // method is not allowed on a function. See spec 12-rpc.
-func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string) {
+func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id identity) {
 	if fn == "" || strings.Contains(fn, "/") {
 		writeError(w, pgerr.ErrNoFunction(fn))
 		return
@@ -123,7 +158,7 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string) {
 		return
 	}
 
-	rc := &reqctx.Context{Role: s.role, Method: r.Method, Path: r.URL.Path, Headers: r.Header}
+	rc := &reqctx.Context{Role: id.role, Claims: id.claims, Method: r.Method, Path: r.URL.Path, Headers: r.Header}
 	res, err := s.backend.Execute(r.Context(), planned, rc)
 	if err != nil {
 		writeError(w, asAPIError(s.backend, err))
@@ -167,7 +202,7 @@ func (s *Server) writeCall(w http.ResponseWriter, r *http.Request, call *ir.Call
 	}
 }
 
-func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity) {
 	relation := strings.Trim(r.URL.Path, "/")
 	if relation == "" || strings.Contains(relation, "/") {
 		writeError(w, pgerr.ErrUnknownTable(relation))
@@ -194,7 +229,8 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rc := &reqctx.Context{
-		Role:    s.role,
+		Role:    id.role,
+		Claims:  id.claims,
 		Method:  r.Method,
 		Path:    r.URL.Path,
 		Headers: r.Header,
@@ -215,7 +251,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
 	s.writeRead(w, r, q, out)
 }
 
-func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.QueryKind) {
+func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.QueryKind, id identity) {
 	relation := strings.Trim(r.URL.Path, "/")
 	if relation == "" || strings.Contains(relation, "/") {
 		writeError(w, pgerr.ErrUnknownTable(relation))
@@ -251,7 +287,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.Que
 		return
 	}
 
-	rc := &reqctx.Context{Role: s.role, Method: r.Method, Path: r.URL.Path, Headers: r.Header}
+	rc := &reqctx.Context{Role: id.role, Claims: id.claims, Method: r.Method, Path: r.URL.Path, Headers: r.Header}
 	res, err := s.backend.Execute(r.Context(), planned, rc)
 	if err != nil {
 		writeError(w, asAPIError(s.backend, err))

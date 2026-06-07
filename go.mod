@@ -2,7 +2,10 @@ module github.com/tamnd/dbrest
 
 go 1.26
 
-require modernc.org/sqlite v1.52.0
+require (
+	github.com/golang-jwt/jwt/v5 v5.2.1
+	modernc.org/sqlite v1.52.0
+)
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect

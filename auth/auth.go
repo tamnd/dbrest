@@ -1,0 +1,381 @@
+// Package auth verifies JSON Web Tokens and resolves the request role, the
+// single piece of PostgREST's stateless auth model that lives in the frontend
+// (spec 13). It is backend-agnostic: the signature and algorithm checks, the
+// exp/nbf/iat/aud validation, the role resolution, and the PGRST301/PGRST302
+// codes are produced here and are byte-identical on every engine. Only the
+// unobservable role switch differs per backend, which this package never touches.
+//
+// This is a leaf package over a standard audited JWT library; nothing in the
+// rest of dbrest is imported except the shared error envelope.
+package auth
+
+import (
+	"crypto/ecdsa"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"strings"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/tamnd/dbrest/pgerr"
+)
+
+// defaultSkew is the clock-skew tolerance PostgREST applies to the time claims.
+const defaultSkew = 30 * time.Second
+
+// minHMACSecret is the shortest HMAC secret accepted, matching PostgREST v13.0
+// onward: a shorter secret is a configuration error caught at startup, never a
+// runtime 401.
+const minHMACSecret = 32
+
+// Config declares how tokens are verified and how the role is read. The values
+// come from the configuration layer (spec 20); this package applies only the
+// defaults whose zero value is unambiguous (the skew and the role-claim key).
+type Config struct {
+	// AllowedAlgs pins the accepted alg header values (HS256, RS256, ES384, ...).
+	// Empty derives the set from the configured keys. "none" is never accepted and
+	// is rejected if listed explicitly.
+	AllowedAlgs []string
+	// Secret is the shared HMAC secret. When set it must be at least 32 bytes.
+	Secret []byte
+	// PublicKeyPEM is a PEM-encoded RSA or ECDSA public key (the static key source
+	// for the asymmetric families).
+	PublicKeyPEM string
+	// Audience, when set, must appear in the token's aud claim.
+	Audience string
+	// RoleClaimKey names the claim the request role is read from; default "role".
+	// A leading-dot dotted path (".app_metadata.role") reads a nested claim.
+	RoleClaimKey string
+	// AnonRole is the role an unauthenticated or role-less request runs as. Empty
+	// means such requests are refused rather than run as the connection identity.
+	AnonRole string
+	// PermittedRoles, when non-empty, is the set of roles the authenticator may
+	// assume; a valid token naming a role outside it gets a 403. Empty defers the
+	// check to the authorization layer (spec 14). The anon role is always allowed.
+	PermittedRoles []string
+	// Skew is the clock-skew tolerance for exp/nbf/iat; default 30s.
+	Skew time.Duration
+	// CacheMaxEntries bounds the verified-token cache: a value greater than zero
+	// enables a SIEVE-evicted cache of that size, zero disables it (spec 13). The
+	// default of 1000 is applied by the configuration layer, not here.
+	CacheMaxEntries int
+}
+
+// Result is the resolved identity of a request: the role it runs as, the
+// verified claims (nil when no token was presented), and whether it is anonymous.
+type Result struct {
+	Role      string
+	Claims    map[string]any
+	Anonymous bool
+}
+
+// Verifier verifies tokens against a fixed configuration. It is safe for
+// concurrent use: the verification is stateless and the optional cache guards
+// itself.
+type Verifier struct {
+	validMethods []string
+	hmac         []byte
+	rsa          *rsa.PublicKey
+	ecdsa        *ecdsa.PublicKey
+	hasKeys      bool
+
+	audience    string
+	roleKeyPath []string
+	anonRole    string
+	permitted   map[string]bool
+	skew        time.Duration
+
+	cache *jwtCache
+	now   func() time.Time
+}
+
+// NewVerifier builds a Verifier from a Config, applying the unambiguous defaults
+// and validating the key material. It fails fast on a configuration error: an
+// HMAC secret shorter than 32 bytes, a "none" in the allowed algorithms, or an
+// unparseable public key. The secret itself is never echoed in any error.
+func NewVerifier(cfg Config) (*Verifier, error) {
+	v := &Verifier{
+		audience:  cfg.Audience,
+		anonRole:  cfg.AnonRole,
+		skew:      cfg.Skew,
+		now:       time.Now,
+		permitted: map[string]bool{},
+	}
+	if v.skew == 0 {
+		v.skew = defaultSkew
+	}
+	for _, r := range cfg.PermittedRoles {
+		v.permitted[r] = true
+	}
+	v.roleKeyPath = parseRoleKey(cfg.RoleClaimKey)
+
+	if len(cfg.Secret) > 0 {
+		if len(cfg.Secret) < minHMACSecret {
+			return nil, errors.New("jwt-secret must be at least 32 characters")
+		}
+		v.hmac = cfg.Secret
+		v.hasKeys = true
+	}
+	if cfg.PublicKeyPEM != "" {
+		if err := v.loadPublicKey(cfg.PublicKeyPEM); err != nil {
+			return nil, err
+		}
+		v.hasKeys = true
+	}
+
+	methods, err := v.resolveMethods(cfg.AllowedAlgs)
+	if err != nil {
+		return nil, err
+	}
+	v.validMethods = methods
+
+	if cfg.CacheMaxEntries > 0 {
+		v.cache = newJWTCache(cfg.CacheMaxEntries)
+	}
+	return v, nil
+}
+
+// Authenticate resolves the identity of a request from its Authorization header
+// value. No bearer token runs as anon; an expired token is PGRST301; any other
+// verification failure is PGRST302; a valid token naming a forbidden role is 403.
+// When no key material is configured, verification is disabled and every request
+// runs as anon, matching PostgREST with no jwt-secret.
+func (v *Verifier) Authenticate(authHeader string) (*Result, *pgerr.APIError) {
+	raw, ok := bearer(authHeader)
+	if !ok || !v.hasKeys {
+		return v.anon()
+	}
+
+	if v.cache != nil {
+		if claims, hit := v.cache.get(raw); hit {
+			// A cached entry never extends a token's life: the time claims are
+			// re-checked against the live clock on every request (spec 13).
+			if apiErr := v.checkTime(claims); apiErr != nil {
+				return nil, apiErr
+			}
+			return v.resolve(claims)
+		}
+	}
+
+	claims, apiErr := v.verify(raw)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+	if v.cache != nil {
+		v.cache.put(raw, claims)
+	}
+	return v.resolve(claims)
+}
+
+// verify checks the signature, the pinned algorithm, and the time and audience
+// claims with skew, returning the claim set or a JWT error. The error message is
+// fixed text: the token and the secret are never reflected back to the client.
+func (v *Verifier) verify(raw string) (map[string]any, *pgerr.APIError) {
+	claims := jwt.MapClaims{}
+	opts := []jwt.ParserOption{
+		jwt.WithValidMethods(v.validMethods),
+		jwt.WithLeeway(v.skew),
+		jwt.WithTimeFunc(v.now),
+	}
+	if v.audience != "" {
+		opts = append(opts, jwt.WithAudience(v.audience))
+	}
+	if _, err := jwt.NewParser(opts...).ParseWithClaims(raw, claims, v.keyfunc); err != nil {
+		if errors.Is(err, jwt.ErrTokenExpired) {
+			return nil, pgerr.ErrJWTExpired()
+		}
+		return nil, pgerr.ErrJWTInvalid("JWT invalid")
+	}
+	return map[string]any(claims), nil
+}
+
+// keyfunc returns the verification key for the token's algorithm family. The
+// allowed-methods parser option already blocks a disallowed alg before this runs,
+// so the algorithm-confusion swap (an RS token verified against an HMAC secret)
+// cannot reach a key of the wrong family.
+func (v *Verifier) keyfunc(t *jwt.Token) (any, error) {
+	switch t.Method.(type) {
+	case *jwt.SigningMethodHMAC:
+		if v.hmac == nil {
+			return nil, errors.New("no HMAC key configured")
+		}
+		return v.hmac, nil
+	case *jwt.SigningMethodRSA:
+		if v.rsa == nil {
+			return nil, errors.New("no RSA key configured")
+		}
+		return v.rsa, nil
+	case *jwt.SigningMethodECDSA:
+		if v.ecdsa == nil {
+			return nil, errors.New("no ECDSA key configured")
+		}
+		return v.ecdsa, nil
+	default:
+		return nil, errors.New("unsupported signing method")
+	}
+}
+
+// checkTime re-validates the exp and nbf claims against the live clock with the
+// configured skew. It runs on a cache hit so a cached verification can never
+// resurrect an expired token.
+func (v *Verifier) checkTime(claims map[string]any) *pgerr.APIError {
+	now := v.now()
+	if exp, ok := numClaim(claims, "exp"); ok {
+		if now.After(time.Unix(exp, 0).Add(v.skew)) {
+			return pgerr.ErrJWTExpired()
+		}
+	}
+	if nbf, ok := numClaim(claims, "nbf"); ok {
+		if now.Before(time.Unix(nbf, 0).Add(-v.skew)) {
+			return pgerr.ErrJWTInvalid("JWT invalid")
+		}
+	}
+	return nil
+}
+
+// resolve reads the role from the claims and applies the anon fallback and the
+// permitted-role check. A valid token that resolves to no role and has no anon
+// fallback is refused; a role outside the permitted set is a 403.
+func (v *Verifier) resolve(claims map[string]any) (*Result, *pgerr.APIError) {
+	role := roleFromClaims(claims, v.roleKeyPath)
+	if role == "" {
+		role = v.anonRole
+	}
+	if role == "" {
+		return nil, errAnonDisabled()
+	}
+	if apiErr := v.checkPermitted(role); apiErr != nil {
+		return nil, apiErr
+	}
+	return &Result{Role: role, Claims: claims, Anonymous: false}, nil
+}
+
+// checkPermitted enforces the optional permitted-role set. The anon role is
+// always allowed; an empty set defers the decision to the authorization layer.
+func (v *Verifier) checkPermitted(role string) *pgerr.APIError {
+	if role == v.anonRole || len(v.permitted) == 0 || v.permitted[role] {
+		return nil
+	}
+	return pgerr.ErrRoleNotAllowed(role)
+}
+
+// anon resolves an unauthenticated request to the anon role, or refuses it when
+// no anon role is configured.
+func (v *Verifier) anon() (*Result, *pgerr.APIError) {
+	if v.anonRole == "" {
+		return nil, errAnonDisabled()
+	}
+	return &Result{Role: v.anonRole, Anonymous: true}, nil
+}
+
+// errAnonDisabled is the 401 a request gets when it presents no usable identity
+// and no anon role is configured, so it cannot be run as anyone.
+func errAnonDisabled() *pgerr.APIError {
+	return pgerr.ErrJWTInvalid("anonymous access is disabled").
+		WithMessage("no JWT was sent and no anonymous role is configured")
+}
+
+// loadPublicKey parses a PEM-encoded RSA or ECDSA public key into the verifier.
+func (v *Verifier) loadPublicKey(pemText string) error {
+	block, _ := pem.Decode([]byte(pemText))
+	if block == nil {
+		return errors.New("jwt public key is not valid PEM")
+	}
+	key, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return errors.New("jwt public key is not a valid PKIX key")
+	}
+	switch k := key.(type) {
+	case *rsa.PublicKey:
+		v.rsa = k
+	case *ecdsa.PublicKey:
+		v.ecdsa = k
+	default:
+		return errors.New("jwt public key is neither RSA nor ECDSA")
+	}
+	return nil
+}
+
+// resolveMethods returns the pinned alg set. A configured list wins (with "none"
+// rejected); otherwise the families of the configured keys are allowed.
+func (v *Verifier) resolveMethods(allowed []string) ([]string, error) {
+	if len(allowed) > 0 {
+		for _, a := range allowed {
+			if strings.EqualFold(a, "none") {
+				return nil, errors.New("the none algorithm is not accepted")
+			}
+		}
+		return allowed, nil
+	}
+	var methods []string
+	if v.hmac != nil {
+		methods = append(methods, "HS256", "HS384", "HS512")
+	}
+	if v.rsa != nil {
+		methods = append(methods, "RS256", "RS384", "RS512")
+	}
+	if v.ecdsa != nil {
+		methods = append(methods, "ES256", "ES384", "ES512")
+	}
+	return methods, nil
+}
+
+// bearer extracts the token from an Authorization header value, accepting the
+// "Bearer" scheme case-insensitively. It reports false for any other header.
+func bearer(header string) (string, bool) {
+	const scheme = "bearer "
+	if len(header) < len(scheme) || !strings.EqualFold(header[:len(scheme)], scheme) {
+		return "", false
+	}
+	tok := strings.TrimSpace(header[len(scheme):])
+	return tok, tok != ""
+}
+
+// parseRoleKey splits a role-claim key into a path of map keys. A leading dot is
+// optional; an empty key defaults to the single segment "role".
+func parseRoleKey(key string) []string {
+	key = strings.TrimPrefix(strings.TrimSpace(key), ".")
+	if key == "" {
+		return []string{"role"}
+	}
+	return strings.Split(key, ".")
+}
+
+// roleFromClaims walks the claim path and returns the string value at its end,
+// or "" if any segment is missing or the value is not a string.
+func roleFromClaims(claims map[string]any, path []string) string {
+	var cur any = claims
+	for _, seg := range path {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return ""
+		}
+		cur, ok = m[seg]
+		if !ok {
+			return ""
+		}
+	}
+	if s, ok := cur.(string); ok {
+		return s
+	}
+	return ""
+}
+
+// numClaim reads a numeric claim as a Unix-seconds int64, handling the float64
+// and json.Number forms a decoded claim set can carry.
+func numClaim(claims map[string]any, name string) (int64, bool) {
+	switch t := claims[name].(type) {
+	case float64:
+		return int64(t), true
+	case int64:
+		return t, true
+	case json.Number:
+		if n, err := t.Int64(); err == nil {
+			return n, true
+		}
+	}
+	return 0, false
+}

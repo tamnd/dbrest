@@ -171,6 +171,19 @@ func ErrJWTInvalid(msg string) *APIError {
 	return New(http.StatusUnauthorized, CodeJWTInvalid, msg)
 }
 
+// CodeInsufficientPrivilege is PostgreSQL's class-42 SQLSTATE for a denied role
+// switch. A cryptographically valid token that names a role the authenticator
+// may not assume maps to this, a 403, distinct from the 401 a bad token gets.
+const CodeInsufficientPrivilege = "42501"
+
+// ErrRoleNotAllowed is raised when a valid JWT names a role the authenticator is
+// not permitted to become. It mirrors PostgreSQL's "permission denied to set
+// role" mapped to 403, the same status PostgREST surfaces (spec 13).
+func ErrRoleNotAllowed(role string) *APIError {
+	return New(http.StatusForbidden, CodeInsufficientPrivilege,
+		fmt.Sprintf("permission denied to set role \"%s\"", role))
+}
+
 // ErrInternal renders an unexpected internal failure as a 500. The XX family in
 // upstream covers internal errors; dbrest renders them as 500.
 func ErrInternal(msg string) *APIError {
