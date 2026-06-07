@@ -101,7 +101,7 @@ func (f *Function) Required() []string {
 	return req
 }
 
-// param returns the named parameter and whether it exists.
+// Param returns the named parameter and whether it exists.
 func (f *Function) Param(name string) (Param, bool) {
 	for _, p := range f.Params {
 		if p.Name == name {
@@ -223,5 +223,8 @@ func exactMatch(f *Function, args ArgSet) bool {
 // clean PGRST202 rather than dereferencing nil.
 type EmptyRegistry struct{}
 
+// Lookup always misses: an empty registry has no functions.
 func (EmptyRegistry) Lookup(string, ArgSet) (*Function, bool) { return nil, false }
-func (EmptyRegistry) List() []*Function                       { return nil }
+
+// List returns no functions.
+func (EmptyRegistry) List() []*Function { return nil }
