@@ -8,6 +8,7 @@ package plan
 import (
 	"github.com/tamnd/dbrest/ir"
 	"github.com/tamnd/dbrest/pgerr"
+	"github.com/tamnd/dbrest/rpc"
 	"github.com/tamnd/dbrest/schema"
 )
 
@@ -139,6 +140,108 @@ func Write(model *schema.Model, q *ir.Query, searchPath []string) (*ir.Plan, *pg
 	}
 
 	return &ir.Plan{Query: q, Rel: rel, ReadOnly: false}, nil
+}
+
+// Call resolves a parsed RPC call against the function registry and returns an
+// executable plan. It selects the overload the argument set satisfies (PGRST202
+// when none does), enforces the volatility-versus-method rule (a GET to a
+// volatile function is 405), and validates a post-filter select/where/order
+// against a table return's declared columns. The resolved function and the
+// read-only decision travel on the plan for the backend to lower. See spec 12.
+func Call(reg rpc.Registry, c *ir.Call, isGet bool, searchPath []string) (*ir.Plan, *pgerr.APIError) {
+	args := make(rpc.ArgSet, len(c.Args))
+	for name := range c.Args {
+		args[name] = true
+	}
+	fn, ok := reg.Lookup(c.Function.Name, args)
+	if !ok {
+		return nil, pgerr.ErrNoFunction(c.Function.Name)
+	}
+
+	// A read method may only call a read-only function; a write-capable function
+	// requires POST so it runs in a read-write transaction.
+	if isGet && !fn.Volatility.ReadOnly() {
+		return nil, pgerr.ErrMethodNotAllowed(
+			"Cannot call a volatile function with GET; use POST")
+	}
+
+	// Post-filters apply to a table return; validate their columns against the
+	// declared shape when one is given. A scalar or setof-scalar return carries no
+	// columns to filter on, and a table return with no declared columns is
+	// validated against the engine result at run time (best effort).
+	if err := validateCallFilters(fn, c); err != nil {
+		return nil, err
+	}
+
+	c.ReadOnly = fn.Volatility.ReadOnly()
+	return &ir.Plan{Call: c, Func: fn, ReadOnly: c.ReadOnly}, nil
+}
+
+// validateCallFilters checks an RPC call's post-filter columns against a table
+// return's declared columns. It is a no-op for scalar and setof-scalar returns
+// and for a table return whose columns are not declared.
+func validateCallFilters(fn *rpc.Function, c *ir.Call) *pgerr.APIError {
+	if fn.Returns.Kind != rpc.ReturnTable || len(fn.Returns.Columns) == 0 {
+		return nil
+	}
+	cols := make(map[string]bool, len(fn.Returns.Columns))
+	for _, col := range fn.Returns.Columns {
+		cols[col.Name] = true
+	}
+	has := func(path []string) bool { return len(path) == 0 || cols[path[0]] }
+	for _, it := range c.Select {
+		col, ok := it.(ir.Column)
+		if !ok {
+			continue
+		}
+		if isStarPath(col.Path) {
+			continue
+		}
+		if !has(col.Path) {
+			return pgerr.ErrUnknownColumn(col.Path[0])
+		}
+	}
+	if err := validateCallCond(cols, c.Where); err != nil {
+		return err
+	}
+	for _, t := range c.Order {
+		if !has(t.Path) {
+			return pgerr.ErrUnknownColumn(t.Path[0])
+		}
+	}
+	return nil
+}
+
+// isStarPath reports whether a select path is the bare "*".
+func isStarPath(path []string) bool { return len(path) == 1 && path[0] == "*" }
+
+// validateCallCond validates the columns of an RPC post-filter tree against the
+// table return's column set.
+func validateCallCond(cols map[string]bool, c *ir.Cond) *pgerr.APIError {
+	if c == nil {
+		return nil
+	}
+	switch n := (*c).(type) {
+	case ir.And:
+		for i := range n.Kids {
+			if err := validateCallCond(cols, &n.Kids[i]); err != nil {
+				return err
+			}
+		}
+	case ir.Or:
+		for i := range n.Kids {
+			if err := validateCallCond(cols, &n.Kids[i]); err != nil {
+				return err
+			}
+		}
+	case ir.Not:
+		return validateCallCond(cols, &n.Kid)
+	case ir.Compare:
+		if len(n.Path) > 0 && !cols[n.Path[0]] {
+			return pgerr.ErrUnknownColumn(n.Path[0])
+		}
+	}
+	return nil
 }
 
 // validateWrite checks the payload columns against the model and resolves an

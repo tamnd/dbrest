@@ -16,6 +16,7 @@ import (
 	"github.com/tamnd/dbrest/ir"
 	"github.com/tamnd/dbrest/pgerr"
 	"github.com/tamnd/dbrest/reqctx"
+	"github.com/tamnd/dbrest/rpc"
 	"github.com/tamnd/dbrest/schema"
 )
 
@@ -56,7 +57,8 @@ func asString(v driver.Value) (string, bool) {
 
 // Backend is the SQLite implementation of the dbrest backend SPI.
 type Backend struct {
-	db *sql.DB
+	db    *sql.DB
+	funcs rpc.Registry
 }
 
 // Open connects to a SQLite database by DSN (a file path, or ":memory:" for an
@@ -75,6 +77,20 @@ func Open(dsn string) (*Backend, error) {
 
 // DB exposes the underlying pool, for tests that seed a database.
 func (b *Backend) DB() *sql.DB { return b.db }
+
+// Register installs the portable function registry exposed at /rpc/<fn>. SQLite
+// has no function catalog of its own (NativeRPC is false), so every callable
+// function is declared in config and supplied here. Passing nil clears it.
+func (b *Backend) Register(reg rpc.Registry) { b.funcs = reg }
+
+// Functions returns the registered function registry, or an empty one when none
+// has been installed, so the /rpc/<fn> endpoint always has a registry to query.
+func (b *Backend) Functions() rpc.Registry {
+	if b.funcs == nil {
+		return rpc.EmptyRegistry{}
+	}
+	return b.funcs
+}
 
 // Capabilities reports the SQLite feature tiers (spec 04/06). The security model
 // (roles, RLS, GUCs) is emulated; most SQL features are native.
@@ -135,6 +151,9 @@ func (b *Backend) MapError(err error) *pgerr.APIError {
 // result. Reads stream from an open cursor; writes run in a short transaction
 // and buffer their returned rows. RPC arrives with its subsystem.
 func (b *Backend) Execute(ctx context.Context, plan *ir.Plan, rc *reqctx.Context) (backend.Result, error) {
+	if plan.Call != nil {
+		return b.executeCall(ctx, plan, rc)
+	}
 	if plan.Query == nil {
 		return nil, pgerr.ErrUnsupported("this operation", "sqlite")
 	}
@@ -146,6 +165,74 @@ func (b *Backend) Execute(ctx context.Context, plan *ir.Plan, rc *reqctx.Context
 	default:
 		return nil, pgerr.ErrUnsupported("this operation", "sqlite")
 	}
+}
+
+// executeCall lowers and runs an RPC call. A read-only function (stable or
+// immutable) streams from an open cursor, like a read; a volatile function runs
+// inside a committing transaction, like a write, so its side effects persist
+// (or roll back under Prefer: tx=rollback). The returned rows carry the
+// function's output for the renderer to shape by return kind.
+func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Context) (backend.Result, error) {
+	st, apiErr := sqlgen.CompileCall(dialect{}, plan.Call, plan.Func)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+
+	if plan.ReadOnly {
+		res := &result{controls: rc.Controls()}
+		// A count over a read-only function runs as its own statement, like a read.
+		if plan.Call.Count != ir.CountNone {
+			cst, apiErr := sqlgen.CompileCallCount(dialect{}, plan.Call, plan.Func)
+			if apiErr != nil {
+				return nil, apiErr
+			}
+			if err := b.db.QueryRowContext(ctx, cst.SQL, cst.Args...).Scan(&res.count); err != nil {
+				return nil, b.MapError(err)
+			}
+			res.hasCount = true
+		}
+		rows, err := b.db.QueryContext(ctx, st.SQL, st.Args...)
+		if err != nil {
+			return nil, b.MapError(err)
+		}
+		cols, err := rows.Columns()
+		if err != nil {
+			rows.Close()
+			return nil, b.MapError(err)
+		}
+		res.rows, res.cols = rows, cols
+		return res, nil
+	}
+
+	tx, err := b.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, b.MapError(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx, st.SQL, st.Args...)
+	if err != nil {
+		return nil, b.MapError(err)
+	}
+	cols, err := rows.Columns()
+	if err != nil {
+		rows.Close()
+		return nil, b.MapError(err)
+	}
+	buf, err := drain(rows, len(cols))
+	rows.Close()
+	if err != nil {
+		return nil, b.MapError(err)
+	}
+
+	res := &writeResult{cols: cols, rows: buf, controls: rc.Controls()}
+	if plan.Call.Prefer.Tx != nil && *plan.Call.Prefer.Tx == ir.TxRollback {
+		return res, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, b.MapError(err)
+	}
+	return res, nil
 }
 
 // executeRead compiles and runs the windowed read, plus a separate COUNT(*) when

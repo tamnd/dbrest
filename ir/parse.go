@@ -200,6 +200,67 @@ func ParseWrite(kind QueryKind, relation, rawQuery string, preferHeaders []strin
 	return q, nil
 }
 
+// callReserved are the query-string keys that post-filter an RPC result rather
+// than name a function argument. On a GET call every other key is an argument.
+var callReserved = map[string]bool{
+	"select": true, "order": true, "limit": true, "offset": true,
+}
+
+// ParseCall parses a /rpc/<fn> request into a Call. On GET the arguments come
+// from the query string (each non-reserved key is one argument, as text) and the
+// reserved keys post-filter the result; on POST the JSON body carries the
+// arguments (with their JSON types) and the whole query string post-filters. The
+// planner resolves the function and checks volatility against the method. All
+// errors are PGRST1xx. See spec 12-rpc.
+func ParseCall(fn, rawQuery string, preferHeaders []string, isGet bool, contentType string, body []byte) (*Call, *pgerr.APIError) {
+	vals, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return nil, pgerr.ErrParse("could not parse query string")
+	}
+	c := &Call{Function: Ref{Name: fn}}
+	c.Prefer = ParsePrefer(preferHeaders)
+	if c.Prefer.Count != nil {
+		c.Count = *c.Prefer.Count
+	}
+
+	// Post-filters are parsed into a throwaway Query so the read-path parsers
+	// (select, order, window, filter tree) are reused verbatim.
+	pq := &Query{Kind: Read}
+	args := map[string]Value{}
+
+	if isGet {
+		post := url.Values{}
+		for k, vs := range vals {
+			if callReserved[k] {
+				post[k] = vs
+				continue
+			}
+			// A function argument; the last value wins, matching url.Values.Get.
+			args[k] = Value{Text: vs[len(vs)-1]}
+		}
+		if perr := parseQueryString(pq, post); perr != nil {
+			return nil, perr
+		}
+	} else {
+		if perr := parseQueryString(pq, vals); perr != nil {
+			return nil, perr
+		}
+		if len(body) > 0 {
+			obj, perr := decodeBodyObject(contentType, body)
+			if perr != nil {
+				return nil, perr
+			}
+			for k, v := range obj {
+				args[k] = Value{JSON: v}
+			}
+		}
+	}
+
+	c.Select, c.Where, c.Order, c.Limit, c.Offset = pq.Select, pq.Where, pq.Order, pq.Limit, pq.Offset
+	c.Args = args
+	return c, nil
+}
+
 // writeFormat is the request body encoding selected by Content-Type (spec 17).
 type writeFormat int
 

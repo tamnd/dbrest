@@ -46,6 +46,10 @@ func NewServer(b backend.Backend, model *schema.Model, searchPath []string) *Ser
 // PATCH updates; PUT upserts; DELETE deletes. RPC and OpenAPI arrive with their
 // subsystems; an unhandled method gets an honest error.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if fn, ok := rpcName(r.URL.Path); ok {
+		s.handleRPC(w, r, fn)
+		return
+	}
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
 		s.handleRead(w, r)
@@ -59,6 +63,107 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleWrite(w, r, ir.Delete)
 	default:
 		writeError(w, pgerr.ErrUnsupported(r.Method+" requests", "dbrest"))
+	}
+}
+
+// rpcName extracts the function name from an /rpc/<fn> path, reporting false for
+// any other path. A name with a further slash (a sub-path under the function) is
+// not a valid call target and is rejected by the caller as an unknown function.
+func rpcName(path string) (string, bool) {
+	const prefix = "/rpc/"
+	if !strings.HasPrefix(path, prefix) {
+		return "", false
+	}
+	return strings.TrimPrefix(path, prefix), true
+}
+
+// handleRPC serves a /rpc/<fn> call. GET and HEAD read (arguments from the query
+// string); POST reads or writes (arguments from the JSON body). A read method may
+// only reach a read-only function; the plan raises 405 otherwise. Any other
+// method is not allowed on a function. See spec 12-rpc.
+func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string) {
+	if fn == "" || strings.Contains(fn, "/") {
+		writeError(w, pgerr.ErrNoFunction(fn))
+		return
+	}
+
+	isGet := r.Method == http.MethodGet || r.Method == http.MethodHead
+	if !isGet && r.Method != http.MethodPost {
+		writeError(w, pgerr.ErrMethodNotAllowed(
+			"Method "+r.Method+" not allowed on a function; use GET or POST"))
+		return
+	}
+
+	media, ok := negotiate(r.Header.Values("Accept"))
+	if !ok {
+		writeError(w, pgerr.ErrNotAcceptable(strings.Join(r.Header.Values("Accept"), ", ")))
+		return
+	}
+
+	var body []byte
+	if r.Method == http.MethodPost {
+		b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+		if err != nil {
+			writeError(w, pgerr.ErrParse("could not read request body"))
+			return
+		}
+		body = b
+	}
+
+	call, apiErr := ir.ParseCall(fn, r.URL.RawQuery, r.Header.Values("Prefer"), isGet, r.Header.Get("Content-Type"), body)
+	if apiErr != nil {
+		writeError(w, apiErr)
+		return
+	}
+	call.Singular = media == mediaObject
+
+	planned, apiErr := plan.Call(s.backend.Functions(), call, isGet, s.searchPath)
+	if apiErr != nil {
+		writeError(w, apiErr)
+		return
+	}
+
+	rc := &reqctx.Context{Role: s.role, Method: r.Method, Path: r.URL.Path, Headers: r.Header}
+	res, err := s.backend.Execute(r.Context(), planned, rc)
+	if err != nil {
+		writeError(w, asAPIError(s.backend, err))
+		return
+	}
+
+	out, apiErr := renderCall(media, res, planned.Func)
+	if apiErr != nil {
+		writeError(w, apiErr)
+		return
+	}
+
+	s.writeCall(w, r, call, out)
+}
+
+// writeCall writes a successful RPC response. The status is 200, or 206 when a
+// bounded window over a table return did not cover the full count. A requested
+// count sets Content-Range, matching a read.
+func (s *Server) writeCall(w http.ResponseWriter, r *http.Request, call *ir.Call, out *rendered) {
+	if applied := call.Prefer.AppliedHeader(); applied != "" {
+		w.Header().Set("Preference-Applied", applied)
+	}
+	w.Header().Set("Content-Type", out.contentType)
+
+	offset := 0
+	if call.Offset != nil {
+		offset = *call.Offset
+	}
+	if out.hasTotl {
+		w.Header().Set("Content-Range", contentRange(offset, out.nRows, out.total, true))
+	}
+
+	status := http.StatusOK
+	hasWindow := call.Limit != nil || call.Offset != nil
+	if hasWindow && out.hasTotl && int64(out.nRows) < out.total {
+		status = http.StatusPartialContent
+	}
+	w.WriteHeader(status)
+	if r.Method != http.MethodHead {
+		w.Write(out.body)
 	}
 }
 

@@ -28,10 +28,13 @@ Early, and built subsystem by subsystem against a complete design spec. What wor
 
 - **Reads** (`GET`/`HEAD`) over the **SQLite** reference backend: column projection and aliases, the horizontal-filter operators, `and`/`or`/`not` trees, `order` with PostgreSQL NULLS placement, `limit`/`offset` pagination with `Content-Range` and `206`/`200`, the singular-object media type with the `PGRST116` rule, and empty-result and unknown-name errors in the unified envelope.
 - **Writes** (`POST`/`PATCH`/`PUT`/`DELETE`): insert, update, upsert, and delete with the `201`/`200`/`204` status rule, a `Location` header for a single inserted row, `return=representation`, and SQLite constraint failures mapped to PostgREST SQLSTATEs (a unique violation is a clean `409`).
+- **Resource embedding**: `select=title,director(name)` nests related resources, resolved against introspected foreign keys and assembled as JSON in the engine, with `PGRST200`/`PGRST201` for missing and ambiguous relationships.
+- **Content negotiation** beyond JSON: the singular object type, `text/csv`, and the scalar `application/octet-stream`/`text/plain` types.
+- **RPC** at `/rpc/<fn>` over a portable function registry: scalar, setof, and table returns, `GET`/`POST` by volatility (a `GET` to a volatile function is `405`), the read-only versus read-write transaction, post-filtering a table return, and `PGRST202` when no function matches.
 - A shared **IR-to-SQL compiler** parameterized by a per-engine `Dialect`, with every value bound and every identifier quoted.
 - **Introspection** into the unified schema model and a planner that validates names and binds them.
 
-The capability model, the backend SPI, and the error envelope are in place. RPC, auth/RLS, resource embedding, content negotiation beyond JSON, OpenAPI, and the PostgreSQL/MySQL/SQL Server/MongoDB backends are on the roadmap and land against the same SPI.
+The capability model, the backend SPI, and the error envelope are in place. Auth/RLS, request context and GUCs, OpenAPI, and the PostgreSQL/MySQL/SQL Server/MongoDB backends are on the roadmap and land against the same SPI.
 
 ## Quick start
 

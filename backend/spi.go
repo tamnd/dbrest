@@ -7,6 +7,7 @@ import (
 	"github.com/tamnd/dbrest/ir"
 	"github.com/tamnd/dbrest/pgerr"
 	"github.com/tamnd/dbrest/reqctx"
+	"github.com/tamnd/dbrest/rpc"
 	"github.com/tamnd/dbrest/schema"
 )
 
@@ -14,8 +15,8 @@ import (
 // this interface (spec 03).
 //
 // Note on scope: this interface grows as subsystems land. The read path needs
-// Capabilities/Introspect/Execute/MapError/Close; Functions() (the RPC
-// registry) is added with the RPC subsystem. See the implementation spec.
+// Capabilities/Introspect/Execute/MapError/Close; Functions() returns the RPC
+// registry for the /rpc/<fn> endpoint. See the implementation spec.
 type Backend interface {
 	// Capabilities describes what this backend can do, per feature class.
 	// Static for a given backend+engine version; computed once at Open.
@@ -24,6 +25,11 @@ type Backend interface {
 	// Introspect builds the unified schema model from the engine's catalogs
 	// (or, for a schemaless store, from declared config plus sampling).
 	Introspect(ctx context.Context) (*schema.Model, error)
+
+	// Functions returns the callable functions exposed at /rpc/<fn>: native
+	// discovery from the engine catalog, the portable registry, or both behind
+	// one interface. A backend with none returns an empty registry.
+	Functions() rpc.Registry
 
 	// Execute lowers the plan to concrete engine operations, runs them inside a
 	// per-request transaction whose mode is given by the plan, and returns a
