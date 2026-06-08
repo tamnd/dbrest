@@ -56,13 +56,13 @@ func applySession(ctx context.Context, tx pgx.Tx, b *Backend, rc *reqctx.Context
 	setGUC("request.cookies", string(rc.CookiesJSON()))
 
 	br := tx.SendBatch(ctx, batch)
-	defer br.Close()
 	for range batch.Len() {
 		if _, err := br.Exec(); err != nil {
+			_ = br.Close()
 			return err
 		}
 	}
-	return nil
+	return br.Close()
 }
 
 // readResponseControls reads back the response.status and response.headers GUCs a

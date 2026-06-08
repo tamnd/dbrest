@@ -373,4 +373,3 @@ func TestCompatSummary(t *testing.T) {
 		t.Errorf("%d case(s) diverge from PostgREST", failed)
 	}
 }
-
