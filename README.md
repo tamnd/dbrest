@@ -125,6 +125,13 @@ go run ./cmd/dbrest-conformance --backend sqlite   # replay the conformance corp
 
 The SQLite backend is cgo-free, so the whole suite runs anywhere Go runs, with no database to install.
 
+For the other engines, [`docker/`](docker/) has a Podman compose file per backend (PostgreSQL, MySQL, MariaDB, SQL Server, MongoDB) and a `docker/all/` that runs them together. These stand up real servers for the conformance harness and for the driver data planes as they land. MongoDB runs as a single-node replica set so its transaction capability resolves the way a production deployment would.
+
+```sh
+podman compose -f docker/postgres/compose.yaml up -d   # one engine
+podman compose -f docker/all/compose.yaml up -d        # all of them
+```
+
 ## Design
 
 The full design lives in the project specification (overview, the backend SPI, the capability matrix, the query IR, per-engine dialects, reads/writes/RPC, auth and RLS, content negotiation, OpenAPI, and the conformance plan). Implementation notes for what is built are written alongside the code.

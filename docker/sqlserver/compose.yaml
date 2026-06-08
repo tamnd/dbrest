@@ -1,0 +1,38 @@
+# SQL Server 2022 (Developer edition, free for non-production). 2022 is the
+# JSON-native floor the backend/sqlserver capability gate checks: at 2022,
+# JSON_OBJECT/JSON_ARRAYAGG and IS DISTINCT FROM are Native. REGEXP_LIKE arrived
+# only in SQL Server 2025, so on this image Regex stays Unsupported and a request
+# using it is rejected with PGRST127 before lowering; bump the image to a 2025
+# tag to exercise the REGEXP_LIKE path.
+#
+# A fresh server has no application database, so create one after it is healthy:
+#
+#   podman exec dbrest-sqlserver /opt/mssql-tools18/bin/sqlcmd \
+#     -S localhost -U sa -P 'Dbrest!Passw0rd' -C -Q 'CREATE DATABASE dbrest'
+#
+#   podman compose -f docker/sqlserver/compose.yaml up -d
+#
+#   db-backend = "sqlserver"
+#   db-uri     = "sqlserver://sa:Dbrest!Passw0rd@localhost:1433?database=dbrest"
+
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: dbrest-sqlserver
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Dbrest!Passw0rd"
+      MSSQL_PID: Developer
+    ports:
+      - "1433:1433"
+    volumes:
+      - sqlserver-data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  sqlserver-data:

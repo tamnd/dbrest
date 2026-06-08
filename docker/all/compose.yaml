@@ -1,0 +1,24 @@
+# Every engine at once, for working against all backends together. This pulls in
+# the per-engine files unchanged through compose include, so there is one source
+# of truth per engine. The host ports do not collide (Postgres 5432, MySQL 3306,
+# MariaDB 3307, SQL Server 1433, MongoDB 27017).
+#
+#   podman compose -f docker/all/compose.yaml up -d
+#
+# If your compose does not support include, bring them up with repeated -f flags
+# instead:
+#
+#   podman compose \
+#     -f docker/postgres/compose.yaml \
+#     -f docker/mysql/compose.yaml \
+#     -f docker/mariadb/compose.yaml \
+#     -f docker/sqlserver/compose.yaml \
+#     -f docker/mongodb/compose.yaml \
+#     up -d
+
+include:
+  - ../postgres/compose.yaml
+  - ../mysql/compose.yaml
+  - ../mariadb/compose.yaml
+  - ../sqlserver/compose.yaml
+  - ../mongodb/compose.yaml

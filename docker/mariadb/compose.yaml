@@ -1,0 +1,31 @@
+# MariaDB 11.4. The same backend/mysql dialect, but the capability profile
+# diverges: MariaDB 10.5+ has a native RETURNING, so the dialect grades it
+# Native here where stock MySQL is Emulated. The host port is 3307 so MariaDB
+# and MySQL can run side by side without colliding on 3306.
+#
+#   podman compose -f docker/mariadb/compose.yaml up -d
+#
+#   db-backend = "mysql"
+#   db-uri     = "dbrest:Dbrest!Passw0rd@tcp(localhost:3307)/dbrest"
+
+services:
+  mariadb:
+    image: docker.io/library/mariadb:11.4
+    container_name: dbrest-mariadb
+    environment:
+      MARIADB_ROOT_PASSWORD: "Dbrest!Passw0rd"
+      MARIADB_DATABASE: dbrest
+      MARIADB_USER: dbrest
+      MARIADB_PASSWORD: "Dbrest!Passw0rd"
+    ports:
+      - "3307:3306"
+    volumes:
+      - mariadb-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  mariadb-data:
