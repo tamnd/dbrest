@@ -1,0 +1,51 @@
+# PostgREST v14 + PostgreSQL 18: the reference oracle stack for conformance and
+# performance comparison. The compat test harness sends identical requests to
+# this stack and to docker/dbrest/compose.yaml, then diffs status codes, headers,
+# and response bodies.
+#
+#   podman compose -f docker/postgrest/compose.yaml up -d
+#
+# PostgREST listens on localhost:3000.
+# PostgreSQL listens on localhost:5433 (offset to avoid clashing with a local PG).
+#
+# The seed SQL in docker/seed/ is mounted into the PG container and executed
+# once on first start. It creates the authenticator/web_anon/web_user roles and
+# the api schema used by the compat tests.
+
+services:
+  db-postgrest:
+    image: docker.io/library/postgres:18-alpine
+    container_name: compat-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgrest-pg-data:/var/lib/postgresql/data
+      - ../../docker/seed:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  postgrest:
+    image: docker.io/postgrest/postgrest:v14.2.3
+    container_name: compat-postgrest
+    depends_on:
+      db-postgrest:
+        condition: service_healthy
+    environment:
+      PGRST_DB_URI: "postgres://authenticator:authenticator_pass@db-postgrest:5432/postgres"
+      PGRST_DB_SCHEMAS: "api"
+      PGRST_DB_ANON_ROLE: "web_anon"
+      PGRST_OPENAPI_SERVER_PROXY_URI: "http://localhost:3000"
+      PGRST_SERVER_PORT: "3000"
+      PGRST_LOG_LEVEL: "info"
+    ports:
+      - "3000:3000"
+
+volumes:
+  postgrest-pg-data:
