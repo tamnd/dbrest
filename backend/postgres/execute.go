@@ -36,45 +36,75 @@ func (b *Backend) Execute(ctx context.Context, plan *ir.Plan, rc *reqctx.Context
 	}
 }
 
-// executeRead compiles and runs the windowed read. A separate COUNT(*) runs first
-// when Content-Range requested an exact count. The transaction stays open while
-// rows stream; the streamRows.Close commits it.
+// executeRead compiles and runs the windowed read. The entire request is sent as
+// a single pgx.Batch: [BEGIN, session setup, count (if needed), query, ROLLBACK].
+// One network write to PostgreSQL covers all round trips, matching PostgREST's
+// hasql pipeline behaviour. Rows stream from within the open batch; Close drains
+// the trailing ROLLBACK item and releases the connection.
 func (b *Backend) executeRead(ctx context.Context, plan *ir.Plan, rc *reqctx.Context) (backend.Result, error) {
-	tx, err := b.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	conn, err := b.pool.Acquire(ctx)
 	if err != nil {
 		return nil, b.MapError(err)
 	}
-	rollback := func() { _ = tx.Rollback(ctx) }
+	release := func() { conn.Release() }
 
-	if err := applySession(ctx, tx, b, rc); err != nil {
-		rollback()
-		return nil, b.MapError(err)
-	}
+	// Build the single batch: BEGIN → session → [count] → query → ROLLBACK.
+	batch := &pgx.Batch{}
+	batch.Queue("BEGIN TRANSACTION READ ONLY")
+	sessionN := queueSessionItems(batch, b, rc)
 
-	res := &streamResult{ctx: ctx, tx: tx, controls: rc.Controls()}
-
-	if plan.Query.Count != ir.CountNone {
-		cst, apiErr := sqlgen.CompileCount(Dialect{}, plan.Query)
+	hasCount := plan.Query.Count != ir.CountNone
+	var cst *sqlgen.Statement
+	if hasCount {
+		var apiErr *pgerr.APIError
+		cst, apiErr = sqlgen.CompileCount(Dialect{}, plan.Query)
 		if apiErr != nil {
-			rollback()
+			release()
 			return nil, apiErr
 		}
-		if err := tx.QueryRow(ctx, cst.SQL, cst.Args...).Scan(&res.count); err != nil {
-			rollback()
-			return nil, b.MapError(err)
-		}
-		res.hasCount = true
+		batch.Queue(cst.SQL, cst.Args...)
 	}
 
 	st, apiErr := sqlgen.CompileRead(Dialect{}, plan.Query)
 	if apiErr != nil {
-		rollback()
+		release()
 		return nil, apiErr
 	}
-	rows, err := tx.Query(ctx, st.SQL, st.Args...)
+	batch.Queue(st.SQL, st.Args...)
+	batch.Queue("ROLLBACK")
+
+	br := conn.SendBatch(ctx, batch)
+
+	abort := func(e error) (backend.Result, error) {
+		br.Close()
+		release()
+		return nil, e
+	}
+
+	// Drain BEGIN.
+	if _, err := br.Exec(); err != nil {
+		return abort(b.MapError(err))
+	}
+	// Drain session setup items.
+	for range sessionN {
+		if _, err := br.Exec(); err != nil {
+			return abort(b.MapError(err))
+		}
+	}
+
+	res := &batchStreamResult{ctx: ctx, conn: conn, br: br, controls: rc.Controls()}
+
+	if hasCount {
+		_ = cst // already queued
+		if err := br.QueryRow().Scan(&res.count); err != nil {
+			return abort(b.MapError(err))
+		}
+		res.hasCount = true
+	}
+
+	rows, err := br.Query()
 	if err != nil {
-		rollback()
-		return nil, b.MapError(err)
+		return abort(b.MapError(err))
 	}
 	res.rows = rows
 	res.cols = fieldNames(rows)

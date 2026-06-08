@@ -11,33 +11,22 @@ import (
 	"github.com/tamnd/dbrest/reqctx"
 )
 
-// applySession reproduces the per-request setup PostgREST runs at the top of its
-// transaction. All steps run in a SINGLE SendBatch so they occupy one network
-// round-trip instead of three or more separate Exec calls:
+// queueSessionItems appends the per-request GUC setup items to batch and
+// returns the number of items added. The caller must send and drain the batch.
 //
 //  1. SET LOCAL ROLE <role> (quoted, not parameterizable)
 //  2. SET LOCAL search_path TO <schemas>
-//  3. SELECT set_config('request.jwt.claims', $1, true), ... (5 GUCs in one row)
-//
-// Using a single batch is the primary per-request latency win over PostgREST,
-// which issues these sequentially. On a 1 ms RTT link the saving is ~2 ms per
-// request, doubling sustained throughput at modest concurrency.
-func applySession(ctx context.Context, tx pgx.Tx, b *Backend, rc *reqctx.Context) error {
-	batch := &pgx.Batch{}
-
-	// SET LOCAL ROLE must be a literal identifier, not a bind parameter, so it
-	// is quoted and inlined into the SQL text.
+//  3. SELECT set_config(...) x5 GUCs in one SQL row
+func queueSessionItems(batch *pgx.Batch, b *Backend, rc *reqctx.Context) int {
+	n := 0
 	if rc.Role != "" {
 		batch.Queue("SET LOCAL ROLE " + (Dialect{}).QuoteIdent(rc.Role))
+		n++
 	}
-
-	// SET LOCAL search_path is stable per Backend (only changes on config reload).
-	// Use the pre-computed string from b.searchPathSQL when available.
 	if b.searchPathSQL != "" {
 		batch.Queue(b.searchPathSQL)
+		n++
 	}
-
-	// Five GUCs in a single query: one parse, one network message, one result row.
 	batch.Queue(
 		"SELECT set_config($1,$2,true),set_config($3,$4,true),"+
 			"set_config($5,$6,true),set_config($7,$8,true),set_config($9,$10,true)",
@@ -47,9 +36,16 @@ func applySession(ctx context.Context, tx pgx.Tx, b *Backend, rc *reqctx.Context
 		"request.headers", string(rc.HeadersJSON()),
 		"request.cookies", string(rc.CookiesJSON()),
 	)
+	return n + 1
+}
 
+// applySession sends the per-request GUC setup as a SINGLE batch within tx,
+// occupying one network round-trip.
+func applySession(ctx context.Context, tx pgx.Tx, b *Backend, rc *reqctx.Context) error {
+	batch := &pgx.Batch{}
+	n := queueSessionItems(batch, b, rc)
 	br := tx.SendBatch(ctx, batch)
-	for range batch.Len() {
+	for range n {
 		if _, err := br.Exec(); err != nil {
 			_ = br.Close()
 			return err
