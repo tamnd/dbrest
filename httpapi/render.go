@@ -59,7 +59,7 @@ func renderFor(media string, res backend.Result, rawCols map[string]bool) (*rend
 // enforces the zero-or-many rule, so a setof function with one row can satisfy a
 // singular request.
 func renderCall(media string, res backend.Result, fn *rpc.Function) (*rendered, *pgerr.APIError) {
-	if fn.Returns.Kind == rpc.ReturnTable {
+	if fn == nil || fn.Returns.Kind == rpc.ReturnTable {
 		return renderFor(media, res, nil)
 	}
 	switch media {

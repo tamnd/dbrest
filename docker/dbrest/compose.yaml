@@ -25,7 +25,7 @@ services:
     ports:
       - "5434:5432"
     volumes:
-      - dbrest-pg-data:/var/lib/postgresql/data
+      - dbrest-pg-data:/var/lib/postgresql
       - ../../docker/seed:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]

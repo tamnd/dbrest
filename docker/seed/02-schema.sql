@@ -28,9 +28,13 @@ CREATE TABLE api.assignments (
     UNIQUE (person_id, todo_id)
 );
 
--- web_anon can read everything in api.
+-- web_anon can read and write everything in api for the compat test suite.
+-- (A production deployment would keep web_anon read-only and add JWT auth for
+-- writes, but the compat tests run without a JWT secret so we open writes here
+-- to allow both servers to return identical 201/204 on the write test cases.)
 GRANT USAGE  ON SCHEMA api          TO web_anon;
-GRANT SELECT ON ALL TABLES IN SCHEMA api TO web_anon;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA api TO web_anon;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA api TO web_anon;
 
 -- web_user can read and write.
 GRANT USAGE  ON SCHEMA api          TO web_user;

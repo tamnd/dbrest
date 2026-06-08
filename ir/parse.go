@@ -449,6 +449,12 @@ func splitComma(s string) []string {
 // containing a parenthesis is an embed (rel(...)); plain items are columns,
 // optionally alias:col::cast. "*" selects all columns.
 func parseSelect(s string) ([]SelectItem, []Embed, *pgerr.APIError) {
+	// PostgREST treats a bare "*" as "all columns" — equivalent to omitting
+	// the select parameter entirely. We normalise it to an empty list here so
+	// the planner and compiler see no explicit projection.
+	if strings.TrimSpace(s) == "*" {
+		return nil, nil, nil
+	}
 	parts, err := splitTopLevel(s, ',')
 	if err != nil {
 		return nil, nil, pgerr.ErrParse("malformed select list")
@@ -652,6 +658,16 @@ func parseFilters(vals url.Values) (*Cond, *pgerr.APIError) {
 				kids = append(kids, node)
 			}
 			continue
+		case "not.and", "not.or":
+			subOp := strings.TrimPrefix(key, "not.")
+			for _, v := range vals[key] {
+				node, perr := parseLogical(subOp, v)
+				if perr != nil {
+					return nil, perr
+				}
+				kids = append(kids, Not{Kid: node})
+			}
+			continue
 		}
 		if reservedKeys[key] {
 			continue
@@ -805,6 +821,9 @@ func parseCompare(path []string, raw string) (Compare, *pgerr.APIError) {
 		default:
 			return Compare{}, pgerr.ErrParse("is. expects null|true|false|unknown|not_null")
 		}
+	case OpLike, OpILike:
+		// PostgREST maps * to % in LIKE/ILIKE patterns so URL-friendly wildcards work.
+		c.Value = Value{Text: strings.ReplaceAll(operand, "*", "%")}
 	default:
 		c.Value = Value{Text: operand}
 	}

@@ -23,7 +23,7 @@ services:
     ports:
       - "5433:5432"
     volumes:
-      - postgrest-pg-data:/var/lib/postgresql/data
+      - postgrest-pg-data:/var/lib/postgresql
       - ../../docker/seed:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -32,7 +32,7 @@ services:
       retries: 15
 
   postgrest:
-    image: docker.io/postgrest/postgrest:v14.2.3
+    image: docker.io/postgrest/postgrest:v14.13
     container_name: compat-postgrest
     depends_on:
       db-postgrest:

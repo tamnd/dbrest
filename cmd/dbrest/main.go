@@ -52,6 +52,7 @@ func run() error {
 	}
 
 	srv := httpapi.NewServer(be, model, cfg.Schemas)
+	srv.SetDefaultRole(cfg.AnonRole)
 	srv.SetOpenAPI(cfg.OpenAPIMode, cfg.OpenAPIServerProxyURI)
 	if err := attachAuth(srv, cfg); err != nil {
 		return err

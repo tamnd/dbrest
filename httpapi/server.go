@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/tamnd/dbrest/auth"
@@ -57,6 +58,16 @@ func NewServer(b backend.Backend, model *schema.Model, searchPath []string) *Ser
 func (s *Server) SetOpenAPI(mode, proxyURI string) {
 	s.openapiMode = mode
 	s.openapiProxy = proxyURI
+}
+
+// SetDefaultRole overrides the static role used for unauthenticated requests
+// when no verifier is configured. It should be called with the db-anon-role
+// option value so the server uses the configured anon role instead of the
+// hardcoded "anon" placeholder.
+func (s *Server) SetDefaultRole(role string) {
+	if role != "" {
+		s.role = role
+	}
 }
 
 // SetVerifier attaches a JWT verifier. Once set, the role and claims of each
@@ -239,16 +250,27 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 	}
 	call.Singular = media == mediaObject
 
-	planned, apiErr := plan.Call(s.backend.Functions(), call, isGet, s.searchPath)
-	if apiErr != nil {
-		writeError(w, apiErr)
-		return
+	var planned *ir.Plan
+	if s.backend.Capabilities().NativeRPC {
+		// PostgreSQL (and any other NativeRPC backend) discovers and executes
+		// the function from its own catalog. We skip the portable-registry lookup
+		// and build a minimal plan: ReadOnly follows the HTTP method (GET/HEAD
+		// means read-only; POST means the function may write). The engine enforces
+		// the volatility constraint — if a GET reaches a volatile function the
+		// read-only transaction fails with SQLSTATE 25006, which maps to 405.
+		planned = &ir.Plan{Call: call, ReadOnly: isGet}
+	} else {
+		planned, apiErr = plan.Call(s.backend.Functions(), call, isGet, s.searchPath)
+		if apiErr != nil {
+			writeError(w, apiErr)
+			return
+		}
 	}
 
 	rc := buildContext(r, id)
 	res, err := s.backend.Execute(r.Context(), planned, rc)
 	if err != nil {
-		writeError(w, asAPIError(s.backend, err))
+		writeError(w, mapExecError(s.backend, err, id.anonymous))
 		return
 	}
 
@@ -309,6 +331,23 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity)
 	}
 	q.Singular = media == mediaObject
 
+	// Range: header overrides ?limit=&offset= and marks the request as a
+	// Range request so the server can return 206 Partial Content, matching
+	// PostgREST's behaviour: 206 only comes from a Range header (or from
+	// count=exact showing the window is partial).
+	if rangeUnit := r.Header.Get("Range-Unit"); rangeUnit == "items" {
+		if rangeHdr := r.Header.Get("Range"); rangeHdr != "" {
+			if off, lim, ok := parseRangeHeader(rangeHdr); ok {
+				q.Offset = &off
+				if lim >= 0 {
+					l := lim
+					q.Limit = &l
+					q.FromRange = true // bounded Range → eligible for 206
+				}
+			}
+		}
+	}
+
 	planned, apiErr := plan.Read(s.model, q, s.searchPath)
 	if apiErr != nil {
 		writeError(w, apiErr)
@@ -324,7 +363,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity)
 
 	res, err := s.backend.Execute(r.Context(), planned, rc)
 	if err != nil {
-		writeError(w, asAPIError(s.backend, err))
+		writeError(w, mapExecError(s.backend, err, id.anonymous))
 		return
 	}
 
@@ -380,7 +419,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.Que
 	}
 	res, err := s.backend.Execute(r.Context(), planned, rc)
 	if err != nil {
-		writeError(w, asAPIError(s.backend, err))
+		writeError(w, mapExecError(s.backend, err, id.anonymous))
 		return
 	}
 
@@ -396,7 +435,9 @@ func (s *Server) writeWrite(w http.ResponseWriter, r *http.Request, q *ir.Query,
 	if applied := q.Prefer.AppliedHeader(); applied != "" {
 		w.Header().Set("Preference-Applied", applied)
 	}
-	if q.Kind == ir.Insert || q.Kind == ir.Upsert {
+	// PostgREST v14 returns a Location header only for return=headers-only inserts/upserts.
+	// For return=representation or minimal, Location is omitted.
+	if (q.Kind == ir.Insert || q.Kind == ir.Upsert) && q.Write != nil && q.Write.Return == ir.ReturnHeadersOnly {
 		if loc := locationHeader(rel, q.Relation.Name, res); loc != "" {
 			w.Header().Set("Location", loc)
 		}
@@ -404,7 +445,7 @@ func (s *Server) writeWrite(w http.ResponseWriter, r *http.Request, q *ir.Query,
 
 	representation := q.Write.Return == ir.ReturnRepresentation
 	if !representation {
-		w.WriteHeader(applyControls(w, ctrl, writeStatus(r.Method, false)))
+		w.WriteHeader(applyControls(w, ctrl, writeStatus(r.Method, q.Kind, false, ctrl)))
 		return
 	}
 
@@ -417,17 +458,25 @@ func (s *Server) writeWrite(w http.ResponseWriter, r *http.Request, q *ir.Query,
 	if !q.Singular {
 		w.Header().Set("Content-Range", contentRange(0, out.nRows, 0, false))
 	}
-	w.WriteHeader(applyControls(w, ctrl, writeStatus(r.Method, true)))
+	w.WriteHeader(applyControls(w, ctrl, writeStatus(r.Method, q.Kind, true, ctrl)))
 	if r.Method != http.MethodHead {
 		w.Write(out.body)
 	}
 }
 
-// writeStatus is the status for a successful write: POST is always 201 Created;
-// the other methods are 200 when they return a representation and 204 No Content
-// when they do not.
-func writeStatus(method string, representation bool) int {
+// writeStatus is the status for a successful write.
+//   - POST insert: 201 Created.
+//   - POST upsert where ALL rows were new inserts: 201 Created.
+//   - POST upsert where at least one row was an ON CONFLICT update: 200 OK.
+//   - PATCH/DELETE with representation: 200 OK.
+//   - PATCH/DELETE without representation: 204 No Content.
+func writeStatus(method string, kind ir.QueryKind, representation bool, ctrl *reqctx.ResponseControls) int {
 	if method == http.MethodPost {
+		// When the backend has determined that the upsert hit at least one existing
+		// row (ON CONFLICT UPDATE fired), return 200. Otherwise return 201.
+		if kind == ir.Upsert && ctrl != nil && ctrl.UpsertStatusKnown && !ctrl.UpsertInsert {
+			return http.StatusOK
+		}
 		return http.StatusCreated
 	}
 	if representation {
@@ -492,6 +541,9 @@ func embedKeys(q *ir.Query) map[string]bool {
 // the controls: a control header is added and a non-zero control status wins
 // over the computed 200/206 default.
 func (s *Server) writeRead(w http.ResponseWriter, r *http.Request, q *ir.Query, out *rendered, ctrl *reqctx.ResponseControls) {
+	if applied := q.Prefer.AppliedHeader(); applied != "" {
+		w.Header().Set("Preference-Applied", applied)
+	}
 	w.Header().Set("Content-Type", out.contentType)
 
 	offset := 0
@@ -519,19 +571,47 @@ func (s *Server) writeRead(w http.ResponseWriter, r *http.Request, q *ir.Query, 
 	}
 }
 
-// readStatus applies PostgREST's 200/206 rule: 206 when a bounded window was
-// requested and does not cover the whole result, 200 otherwise. When a count is
-// present, a window that returned every matching row is 200; without a count,
-// any window is treated as partial.
+// readStatus applies PostgREST's 200/206 rule.
+//   - count=exact: 206 when nRows < total (window is partial), 200 when all rows returned.
+//   - count=planned/estimated: always 206 when count is present (estimated totals are
+//     inherently uncertain so PostgREST signals partial content even for full results).
+//   - No count: always 200.
 func readStatus(q *ir.Query, out *rendered, _ int) int {
-	hasWindow := q.Limit != nil || q.Offset != nil
-	if !hasWindow {
+	if !out.hasTotl {
 		return http.StatusOK
 	}
-	if out.hasTotl && int64(out.nRows) >= out.total {
-		return http.StatusOK
+	switch q.Count {
+	case ir.CountPlanned, ir.CountEstimated:
+		return http.StatusPartialContent
+	case ir.CountExact:
+		if int64(out.nRows) < out.total {
+			return http.StatusPartialContent
+		}
 	}
-	return http.StatusPartialContent
+	return http.StatusOK
+}
+
+// parseRangeHeader parses an HTTP Range header value of the form "start-end"
+// (as used with Range-Unit: items). Returns (offset, limit, true) where limit
+// is -1 for an open-ended range ("0-"). Returns (0, 0, false) on parse error.
+func parseRangeHeader(s string) (offset, limit int, ok bool) {
+	dash := strings.LastIndex(s, "-")
+	if dash < 0 {
+		return 0, 0, false
+	}
+	startStr, endStr := s[:dash], s[dash+1:]
+	start, err := strconv.Atoi(startStr)
+	if err != nil || start < 0 {
+		return 0, 0, false
+	}
+	if endStr == "" {
+		return start, -1, true // open-ended: "0-"
+	}
+	end, err := strconv.Atoi(endStr)
+	if err != nil || end < start {
+		return 0, 0, false
+	}
+	return start, end - start + 1, true
 }
 
 // asAPIError normalizes a backend execution error to the API envelope, asking
@@ -545,6 +625,18 @@ func asAPIError(b backend.Backend, err error) *pgerr.APIError {
 		return mapped
 	}
 	return pgerr.ErrInternal(err.Error())
+}
+
+// mapExecError wraps asAPIError with the PostgREST 401/403 rule: a 42501
+// (insufficient_privilege) error to an anonymous request is 401 (authentication
+// required), not 403 (forbidden). An authenticated request that is denied
+// remains 403 so the caller knows to authenticate, not just retry.
+func mapExecError(b backend.Backend, err error, anonymous bool) *pgerr.APIError {
+	e := asAPIError(b, err)
+	if anonymous && e.Code == pgerr.CodeInsufficientPrivilege {
+		e = pgerr.ErrPermissionDenied("", anonymous)
+	}
+	return e
 }
 
 func writeError(w http.ResponseWriter, e *pgerr.APIError) {

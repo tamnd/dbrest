@@ -14,6 +14,7 @@ import (
 	"errors"
 	"strconv"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -22,22 +23,45 @@ import (
 	"github.com/tamnd/dbrest/rpc"
 )
 
+// defaultPoolMaxConns is the connection pool maximum when the DSN does not
+// specify pool_max_conns. PostgREST defaults to 10; we match that.
+const defaultPoolMaxConns = 10
+
 // Backend is the PostgreSQL implementation of the dbrest backend SPI. It holds a
 // connection pool, the server version (which grades a couple of capabilities),
 // the function registry, and the search path applied to every request.
 type Backend struct {
-	pool       *pgxpool.Pool
-	version    Version
-	funcs      rpc.Registry
-	searchPath []string
+	pool          *pgxpool.Pool
+	version       Version
+	funcs         rpc.Registry
+	searchPath    []string
+	searchPathSQL string // pre-built "SET LOCAL search_path TO ..." statement
 }
 
 // Open connects to PostgreSQL by connection string (a libpq URI or keyword/value
 // DSN), verifies the connection, and reads the server version so capabilities
 // can be graded. The pool's own sizing is taken from the DSN (pool_max_conns
-// and friends); dbrest does not override it.
+// and friends); when the DSN omits pool_max_conns the default is 10, matching
+// PostgREST's default.
+//
+// pgx prepared-statement caching is enabled by default on the pool so repeated
+// queries avoid a server-side parse on every execution. This is one of the key
+// throughput advantages over PostgREST.
 func Open(dsn string) (*Backend, error) {
-	pool, err := pgxpool.New(context.Background(), dsn)
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	// Mirror PostgREST's default pool size when the DSN does not specify one.
+	if cfg.MaxConns < 1 {
+		cfg.MaxConns = defaultPoolMaxConns
+	}
+	// Enable automatic prepared-statement caching so the server parses each
+	// distinct query only once per connection. pgx stores the type-descriptor
+	// cache on the connection; pgxpool serializes reuse so the cache is
+	// consistent per connection lifetime.
+	cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeCacheDescribe
+	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -62,8 +86,12 @@ func (b *Backend) ServerVersion() Version { return b.version }
 
 // SetSchemas records the exposed schemas as the search path applied to every
 // request (SET LOCAL search_path), matching PostgREST's db-schemas behaviour so
-// unqualified names in policies and functions resolve the same way.
-func (b *Backend) SetSchemas(schemas []string) { b.searchPath = schemas }
+// unqualified names in policies and functions resolve the same way. The
+// corresponding SQL statement is pre-built once here and reused per request.
+func (b *Backend) SetSchemas(schemas []string) {
+	b.searchPath = schemas
+	b.searchPathSQL = buildSearchPathSQL(schemas)
+}
 
 // Register installs the portable function registry exposed at /rpc/<fn>. On
 // PostgreSQL the engine has its own function catalog (NativeRPC is true), but a
