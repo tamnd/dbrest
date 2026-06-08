@@ -122,3 +122,38 @@ func TestCompileCallNoRealizationUnsupported(t *testing.T) {
 		t.Fatalf("want PGRST127, got %v", err)
 	}
 }
+
+// The count of a table-returning function wraps the body in count(*) and applies
+// the post-filter, leaving select, order, and window out of the count, exactly
+// as a table read's count does.
+func TestCompileCallCountWrapsAndFilters(t *testing.T) {
+	fn := &rpc.Function{
+		Name:    "films_after",
+		Params:  []rpc.Param{{Name: "y"}},
+		Returns: rpc.ReturnShape{Kind: rpc.ReturnTable, Columns: []rpc.Column{{Name: "id"}}},
+		Query:   &rpc.PortableQuery{SQL: "SELECT id FROM films WHERE year > :y"},
+	}
+	where := ir.Cond(ir.Compare{Path: []string{"id"}, Op: ir.OpGt, Value: ir.Value{Text: "10"}})
+	c := &ir.Call{Args: map[string]ir.Value{"y": {Text: "2000"}}, Where: &where}
+	st, err := CompileCallCount(stub{}, c, fn)
+	if err != nil {
+		t.Fatalf("CompileCallCount: %v", err)
+	}
+	want := `SELECT count(*) FROM (SELECT id FROM films WHERE year > $1) _rpc WHERE "id" > $2`
+	if st.SQL != want {
+		t.Errorf("SQL = %q\nwant   %q", st.SQL, want)
+	}
+	if len(st.Args) != 2 || st.Args[0] != "2000" || st.Args[1] != "10" {
+		t.Errorf("Args = %v, want [2000 10]", st.Args)
+	}
+}
+
+// A function with no portable realization cannot be counted either; it reports
+// PGRST127 rather than running an empty body.
+func TestCompileCallCountNoRealizationUnsupported(t *testing.T) {
+	fn := &rpc.Function{Name: "native_only", Returns: rpc.ReturnShape{Kind: rpc.ReturnScalar}}
+	_, err := CompileCallCount(stub{}, &ir.Call{}, fn)
+	if err == nil || err.Code != "PGRST127" {
+		t.Fatalf("want PGRST127, got %v", err)
+	}
+}
