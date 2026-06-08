@@ -1,0 +1,29 @@
+# PostgreSQL, the reference oracle the conformance harness diffs every other
+# backend against (spec 06/22). This brings up the server that dbrest's postgres
+# data plane (a follow-on slice) and the conformance suite connect to.
+#
+#   podman compose -f docker/postgres/compose.yaml up -d
+#
+#   db-backend = "postgres"
+#   db-uri     = "postgres://dbrest:Dbrest!Passw0rd@localhost:5432/dbrest"
+
+services:
+  postgres:
+    image: docker.io/library/postgres:16
+    container_name: dbrest-postgres
+    environment:
+      POSTGRES_USER: dbrest
+      POSTGRES_PASSWORD: "Dbrest!Passw0rd"
+      POSTGRES_DB: dbrest
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dbrest -d dbrest"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres-data:

@@ -1,0 +1,30 @@
+# MySQL 8.4. Exercises the MySQL side of the backend/mysql dialect: REGEXP_LIKE
+# is native on 8.x, RETURNING is Emulated (MySQL has none), and ON DUPLICATE KEY
+# UPDATE backs the upsert.
+#
+#   podman compose -f docker/mysql/compose.yaml up -d
+#
+#   db-backend = "mysql"
+#   db-uri     = "dbrest:Dbrest!Passw0rd@tcp(localhost:3306)/dbrest"
+
+services:
+  mysql:
+    image: docker.io/library/mysql:8.4
+    container_name: dbrest-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: "Dbrest!Passw0rd"
+      MYSQL_DATABASE: dbrest
+      MYSQL_USER: dbrest
+      MYSQL_PASSWORD: "Dbrest!Passw0rd"
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "dbrest", "-pDbrest!Passw0rd"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  mysql-data:

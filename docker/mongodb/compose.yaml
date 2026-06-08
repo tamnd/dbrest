@@ -1,0 +1,40 @@
+# MongoDB 7 as a single-node replica set. The topology matters: the
+# backend/mongo capability gate resolves Transactions to TxFull only on a replica
+# set (4.0+) or a sharded cluster (4.2+); a standalone mongod is TxNone. Running
+# one node with --replSet is the smallest deployment that gives multi-document
+# transactions, so the per-request transaction model and tx=rollback work.
+#
+# The healthcheck initiates the replica set on first start and reports healthy
+# once it is up, so no separate init step is needed. The member advertises
+# localhost:27017, which a client on the host reaches through the published port.
+# Authentication is off for local development; a replica set with auth needs a
+# shared keyFile, which is out of scope for a dev compose.
+#
+#   podman compose -f docker/mongodb/compose.yaml up -d
+#
+#   db-backend = "mongodb"
+#   db-uri     = "mongodb://localhost:27017/dbrest?replicaSet=rs0"
+
+services:
+  mongodb:
+    image: docker.io/library/mongo:7
+    container_name: dbrest-mongodb
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb-data:/data/db
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - >-
+          mongosh --quiet --eval
+          "try { rs.status().ok } catch (e) { rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'localhost:27017'}]}).ok }"
+          | grep -q 1
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 5s
+
+volumes:
+  mongodb-data:
