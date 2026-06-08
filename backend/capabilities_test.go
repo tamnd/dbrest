@@ -39,3 +39,22 @@ func TestOperatorDefaultNative(t *testing.T) {
 		t.Error("non-overridden operator should still default to Native")
 	}
 }
+
+// Operator is read by the planner for every horizontal-filter operator on every
+// request, so its lookup sits on the hot path. The benchmark grades an operator
+// present in the override map, the case that walks the map rather than taking
+// the nil-map fast return.
+func BenchmarkOperatorLookup(b *testing.B) {
+	c := Capabilities{Operators: map[int]Tier{
+		int(ir.OpRangeSL): Unsupported,
+		int(ir.OpFTS):     BestEffort,
+		int(ir.OpMatch):   Emulated,
+	}}
+	op := int(ir.OpRangeSL)
+	b.ReportAllocs()
+	for b.Loop() {
+		if c.Operator(op) != Unsupported {
+			b.Fatal("OpRangeSL is graded Unsupported")
+		}
+	}
+}
