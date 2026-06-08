@@ -124,3 +124,89 @@ func TestCallPostFilterKnownColumnOK(t *testing.T) {
 		t.Fatalf("Call: %v", err)
 	}
 }
+
+// filmsAfter is the table-returning fixture whose declared columns (id, title)
+// the post-filter validators check against.
+func filmsAfter() *rpc.Function {
+	return &rpc.Function{
+		Name:       "films_after",
+		Params:     []rpc.Param{{Name: "y", Type: "integer"}},
+		Returns:    rpc.ReturnShape{Kind: rpc.ReturnTable, Columns: []rpc.Column{{Name: "id"}, {Name: "title"}}},
+		Volatility: rpc.Stable,
+		Query:      &rpc.PortableQuery{SQL: "SELECT id, title FROM films WHERE year > :y"},
+	}
+}
+
+func callWith(where ir.Cond) *ir.Call {
+	w := where
+	return &ir.Call{
+		Function: ir.Ref{Name: "films_after"},
+		Args:     map[string]ir.Value{"y": {Text: "2000"}},
+		Where:    &w,
+	}
+}
+
+// A post-filter tree over the declared columns validates through every logical
+// node: And, Or, Not, and the Compare leaves all reference known columns.
+func TestCallPostFilterWhereTreeKnownColumns(t *testing.T) {
+	where := ir.Cond(ir.And{Kids: []ir.Cond{
+		ir.Compare{Path: []string{"id"}, Op: ir.OpGt, Value: ir.Value{Text: "10"}},
+		ir.Or{Kids: []ir.Cond{
+			ir.Compare{Path: []string{"title"}, Op: ir.OpLike, Value: ir.Value{Text: "A*"}},
+			ir.Not{Kid: ir.Compare{Path: []string{"id"}, Op: ir.OpEq, Value: ir.Value{Text: "0"}}},
+		}},
+	}})
+	if _, err := Call(reg(filmsAfter()), callWith(where), true, nil); err != nil {
+		t.Fatalf("Call with a valid filter tree: %v", err)
+	}
+}
+
+// An unknown column anywhere in the tree is rejected, including one buried under
+// Or and Not, so the validator recurses rather than checking only the top node.
+func TestCallPostFilterWhereTreeUnknownColumn(t *testing.T) {
+	cases := map[string]ir.Cond{
+		"top-compare": ir.Compare{Path: []string{"ghost"}, Op: ir.OpEq, Value: ir.Value{Text: "1"}},
+		"under-and": ir.And{Kids: []ir.Cond{
+			ir.Compare{Path: []string{"id"}, Op: ir.OpGt, Value: ir.Value{Text: "1"}},
+			ir.Compare{Path: []string{"ghost"}, Op: ir.OpEq, Value: ir.Value{Text: "1"}},
+		}},
+		"under-or-not": ir.Or{Kids: []ir.Cond{
+			ir.Not{Kid: ir.Compare{Path: []string{"ghost"}, Op: ir.OpEq, Value: ir.Value{Text: "1"}}},
+		}},
+	}
+	for name, where := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := Call(reg(filmsAfter()), callWith(where), true, nil)
+			if err == nil || err.Code != "PGRST204" {
+				t.Fatalf("want PGRST204, got %v", err)
+			}
+		})
+	}
+}
+
+// An order term naming a column the table return does not declare is rejected.
+func TestCallPostFilterOrderUnknownColumn(t *testing.T) {
+	c := &ir.Call{
+		Function: ir.Ref{Name: "films_after"},
+		Args:     map[string]ir.Value{"y": {Text: "2000"}},
+		Order:    []ir.OrderTerm{{Path: []string{"ghost"}}},
+	}
+	_, err := Call(reg(filmsAfter()), c, true, nil)
+	if err == nil || err.Code != "PGRST204" {
+		t.Fatalf("want PGRST204, got %v", err)
+	}
+}
+
+// A scalar return declares no columns, so its post-filters are not validated
+// here (they are checked against the engine result at run time).
+func TestCallScalarReturnSkipsFilterValidation(t *testing.T) {
+	where := ir.Cond(ir.Compare{Path: []string{"anything"}, Op: ir.OpEq, Value: ir.Value{Text: "1"}})
+	c := &ir.Call{
+		Function: ir.Ref{Name: "add_them"},
+		Args:     map[string]ir.Value{"a": {Text: "1"}, "b": {Text: "2"}},
+		Where:    &where,
+	}
+	if _, err := Call(reg(addThem()), c, true, nil); err != nil {
+		t.Fatalf("scalar return should not validate post-filter columns: %v", err)
+	}
+}
