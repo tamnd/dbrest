@@ -1,6 +1,6 @@
-# PostgreSQL, the reference oracle the conformance harness diffs every other
+# PostgreSQL 18, the reference oracle the conformance harness diffs every other
 # backend against (spec 06/22). This brings up the server that dbrest's postgres
-# data plane (a follow-on slice) and the conformance suite connect to.
+# data plane and the conformance suite connect to.
 #
 #   podman compose -f docker/postgres/compose.yaml up -d
 #
@@ -9,7 +9,7 @@
 
 services:
   postgres:
-    image: docker.io/library/postgres:16
+    image: docker.io/library/postgres:18-alpine
     container_name: dbrest-postgres
     environment:
       POSTGRES_USER: dbrest

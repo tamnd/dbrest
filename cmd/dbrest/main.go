@@ -1,8 +1,6 @@
 // Command dbrest serves a PostgREST-compatible REST API over a database. It
 // reads its configuration from a file and the environment (spec 20), selects a
-// backend, introspects the schema, and serves the HTTP frontend. Only the
-// SQLite reference backend is built into this binary today; selecting another
-// engine is an honest startup error until that backend lands.
+// backend, introspects the schema, and serves the HTTP frontend.
 package main
 
 import (
@@ -16,6 +14,7 @@ import (
 
 	"github.com/tamnd/dbrest/auth"
 	"github.com/tamnd/dbrest/backend"
+	"github.com/tamnd/dbrest/backend/postgres"
 	"github.com/tamnd/dbrest/backend/sqlite"
 	"github.com/tamnd/dbrest/config"
 	"github.com/tamnd/dbrest/httpapi"
@@ -65,9 +64,7 @@ func run() error {
 	return nil
 }
 
-// openBackend opens the engine the configuration selected. Backends other than
-// SQLite are accepted by the configuration but not yet built into this binary,
-// so selecting one is a clear startup error rather than a silent fallback.
+// openBackend opens the engine the configuration selected.
 func openBackend(cfg *config.Config) (backend.Backend, error) {
 	switch cfg.Backend {
 	case config.BackendSQLite:
@@ -76,20 +73,21 @@ func openBackend(cfg *config.Config) (backend.Backend, error) {
 			return nil, fmt.Errorf("open database: %w", err)
 		}
 		return be, nil
-	case config.BackendPostgres, config.BackendMySQL, config.BackendSQLServer:
-		// The PostgreSQL, MySQL/MariaDB, and SQL Server SQL dialects and capability
-		// profiles have landed (backend/postgres, backend/mysql, backend/sqlserver),
-		// but each driver data plane (Execute, introspection) is a separate slice
-		// that needs a live server to test, so none is yet runnable from this binary.
-		// Selecting one is a clear startup error.
-		return nil, fmt.Errorf("db-backend %q has its dialect but no runnable data plane yet; only sqlite is available", cfg.Backend)
+	case config.BackendPostgres:
+		be, err := postgres.Open(cfg.DBURI)
+		if err != nil {
+			return nil, fmt.Errorf("open database: %w", err)
+		}
+		be.SetSchemas(cfg.Schemas)
+		return be, nil
+	case config.BackendMySQL, config.BackendSQLServer:
+		// The MySQL/MariaDB and SQL Server dialects have landed but the live driver
+		// data plane is a separate slice.
+		return nil, fmt.Errorf("db-backend %q has its dialect but no runnable data plane yet", cfg.Backend)
 	case config.BackendMongoDB:
-		// The MongoDB filter-to-query-document lowering, read-pipeline assembly, and
-		// topology-computed capabilities have landed (backend/mongo), but the live
-		// driver data plane (the mongo.Client, $lookup/$graphLookup embedding, writes,
-		// and sampling-based introspection) needs a running server to test and is a
-		// separate slice. Selecting it is a clear startup error.
-		return nil, fmt.Errorf("db-backend %q has its query lowering but no runnable data plane yet; only sqlite is available", cfg.Backend)
+		// The MongoDB query lowering has landed but the live driver data plane is a
+		// separate slice.
+		return nil, fmt.Errorf("db-backend %q has its query lowering but no runnable data plane yet", cfg.Backend)
 	default:
 		return nil, fmt.Errorf("db-backend %q is unknown", cfg.Backend)
 	}

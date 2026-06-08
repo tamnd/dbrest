@@ -1,0 +1,52 @@
+# dbrest + PostgreSQL 18: the dbrest side of the conformance and performance
+# comparison. The compat test harness sends identical requests to this stack and
+# to docker/postgrest/compose.yaml, then diffs the responses.
+#
+#   podman compose -f docker/dbrest/compose.yaml up -d
+#
+# dbrest listens on localhost:3001.
+# PostgreSQL listens on localhost:5434 (offset to avoid clashing with other stacks).
+#
+# The seed SQL in docker/seed/ is mounted into the PG container and executed
+# once on first start. It creates the same authenticator/web_anon/web_user roles
+# and api schema used by the PostgREST stack, giving both a level playing field.
+#
+# Build the image first:
+#   podman build -t dbrest:local -f Dockerfile .
+
+services:
+  db-dbrest:
+    image: docker.io/library/postgres:18-alpine
+    container_name: compat-dbrest-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5434:5432"
+    volumes:
+      - dbrest-pg-data:/var/lib/postgresql/data
+      - ../../docker/seed:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  dbrest:
+    image: dbrest:local
+    container_name: compat-dbrest
+    depends_on:
+      db-dbrest:
+        condition: service_healthy
+    environment:
+      DBREST_DB_BACKEND: "postgres"
+      DBREST_DB_URI: "postgres://authenticator:authenticator_pass@db-dbrest:5432/postgres"
+      DBREST_DB_SCHEMAS: "api"
+      DBREST_DB_ANON_ROLE: "web_anon"
+      DBREST_SERVER_PORT: "3001"
+    ports:
+      - "3001:3001"
+
+volumes:
+  dbrest-pg-data:
