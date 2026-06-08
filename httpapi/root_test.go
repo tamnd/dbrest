@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/tamnd/dbrest/config"
 )
 
 // TestRootServesOpenAPI checks GET / returns the OpenAPI document with the
@@ -54,6 +56,38 @@ func TestRootHeadHasNoBody(t *testing.T) {
 	buf := make([]byte, 1)
 	if n, _ := resp.Body.Read(buf); n != 0 {
 		t.Error("HEAD / should have no body")
+	}
+}
+
+// TestRootDisabledIs404 checks openapi-mode=disabled turns the root off.
+func TestRootDisabledIs404(t *testing.T) {
+	srv := newServer(t)
+	srv.SetOpenAPI(config.OpenAPIDisabled, "")
+	resp := do(t, srv, http.MethodGet, "/", nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestRootProxyURIRewritesHost checks openapi-server-proxy-uri overrides the
+// host, scheme, and base path the document advertises.
+func TestRootProxyURIRewritesHost(t *testing.T) {
+	srv := newServer(t)
+	srv.SetOpenAPI(config.OpenAPIFollowPrivileges, "https://api.example.com/v1")
+	resp := do(t, srv, http.MethodGet, "/", nil)
+	var doc map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if doc["host"] != "api.example.com" {
+		t.Errorf("host = %v, want api.example.com", doc["host"])
+	}
+	if doc["basePath"] != "/v1" {
+		t.Errorf("basePath = %v, want /v1", doc["basePath"])
+	}
+	schemes := doc["schemes"].([]any)
+	if len(schemes) != 1 || schemes[0] != "https" {
+		t.Errorf("schemes = %v, want [https]", schemes)
 	}
 }
 

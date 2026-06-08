@@ -36,16 +36,31 @@ Early, and built subsystem by subsystem against a complete design spec. What wor
 - **Request context**: the verified claims, the request headers and cookies, the method, the path, and the role are carried on a backend-neutral context (with the GUC JSON serializers a native backend writes verbatim); on the emulated backend the values a policy needs are bound as parameters, and response controls (a status override and added headers a function or policy sets) are applied uniformly across reads, writes, and RPC.
 - **Types and casts**: a single canonical PostgreSQL type surface, with the aliases a client may write (`integer`, `boolean`, `double precision`) folded onto it; a query-string operand is coerced against the column's canonical type in the frontend, so a non-integer on an integer column is a clean `22P02` `400` before the query reaches the engine, identical on every backend, while a pattern, an `is` keyword, and a text column are left alone. The value codecs render a driver-native `bool`, timestamp, and uuid to one canonical JSON form regardless of the engine's physical storage.
 - **Full-text and regex operators**: `fts`/`plfts`/`phfts`/`wfts` and `match`/`imatch`, parsed identically on every backend (the parenthesized `fts(english)` config is read as a language, not a quantifier). On SQLite a full-text filter lowers to an FTS5 `MATCH` against the virtual table that shadows the column, with the FTS5 table and its shadow tables hidden from the exposed schema; a column with no covering FTS5 index is a clean `PGRST127` rather than a silent substring scan. Regex lowers to a registered RE2 `regexp()`, and a pattern using a feature RE2 lacks (a backreference, lookaround) is rejected up front with `PGRST127` instead of failing inside the engine.
-- **OpenAPI root**: `GET /` returns the self-describing Swagger 2.0 document PostgREST emits (`application/openapi+json`), built from the schema model and the function registry: a path and definition per relation, the read/write operation set, `/rpc/<fn>` paths by volatility, primary-key and foreign-key notes, and a JWT security scheme when auth is configured. Each column advertises only the filter operators the active backend can actually serve, consulting the capability matrix, so the document never promises a feature the next request would reject.
+- **OpenAPI root**: `GET /` returns the self-describing Swagger 2.0 document PostgREST emits (`application/openapi+json`), built from the schema model and the function registry: a path and definition per relation, the read/write operation set, `/rpc/<fn>` paths by volatility, primary-key and foreign-key notes, and a JWT security scheme when auth is configured. Each column advertises only the filter operators the active backend can actually serve, consulting the capability matrix, so the document never promises a feature the next request would reject. `openapi-mode=disabled` turns the root off; `openapi-server-proxy-uri` rewrites the advertised host and base path for service behind a reverse proxy.
+- **Configuration**: a flat PostgREST-style config file (`key = "value"`, comments, triple-quoted multi-line values) layered with the environment, where the environment overrides the file key by key. Every option is settable under the PostgREST `PGRST_*` spelling, so an existing deployment's environment keeps working, and the native `DBREST_*` spelling, which wins when both are present. `db-backend` selects the engine (only `sqlite` is built in today; another known engine is a clear startup error, an unknown one a validation error), `db-uri` carries the connection string, and the file types and validates the full option surface (ports and modes are range- and enum-checked, an unknown key fails loudly) before the server starts. The command takes a single `-config` path and otherwise reads the environment.
 - A shared **IR-to-SQL compiler** parameterized by a per-engine `Dialect`, with every value bound and every identifier quoted.
 - **Introspection** into the unified schema model and a planner that validates names and binds them.
 
-The capability model, the backend SPI, and the error envelope are in place. Configuration, the conformance harness, and the PostgreSQL/MySQL/SQL Server/MongoDB backends are on the roadmap and land against the same SPI.
+The capability model, the backend SPI, and the error envelope are in place. The conformance harness and the PostgreSQL/MySQL/SQL Server/MongoDB backends are on the roadmap and land against the same SPI.
 
 ## Quick start
 
+Write a config file naming the backend and the database:
+
 ```sh
-go run ./cmd/dbrest -db ./example.sqlite -addr :3000
+cat > dbrest.conf <<'EOF'
+db-backend  = "sqlite"
+db-uri      = "file:./example.sqlite"
+server-port = 3000
+EOF
+
+go run ./cmd/dbrest -config dbrest.conf
+```
+
+The same options are settable from the environment instead, with no file:
+
+```sh
+DBREST_DB_URI='file:./example.sqlite' DBREST_SERVER_PORT=3000 go run ./cmd/dbrest
 ```
 
 Then query it the way you would query PostgREST:
@@ -86,6 +101,8 @@ Flat packages, no `internal/`, no `/vN` suffixes.
 | `authz` | The privilege and RLS registry: the column gate and the unbypassable policy injection. |
 | `reqctx` | The per-request context handed to a backend (role, claims, headers, cookies, schema, and response controls). |
 | `httpapi` | The HTTP frontend: router, read and write pipelines, PostgREST-shaped renderer. |
+| `config` | The file and environment loader: the PostgREST option surface, the `PGRST_*`/`DBREST_*` env spellings, typing and validation. |
+| `openapi` | The Swagger 2.0 generator behind the `GET /` root. |
 | `cmd/dbrest` | The server entry point. |
 
 ## Development
