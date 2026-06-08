@@ -155,6 +155,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleRPC(w, r, fn, id)
 		return
 	}
+	if r.URL.Path == "/" {
+		s.handleRoot(w, r)
+		return
+	}
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
 		s.handleRead(w, r, id)
