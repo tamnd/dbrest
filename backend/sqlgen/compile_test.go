@@ -82,6 +82,7 @@ func (stub) BoolValue(v bool) string {
 	}
 	return "FALSE"
 }
+func (stub) ILike(col, val string) (string, bool) { return col + " ILIKE " + val, true }
 
 func compile(t *testing.T, q *ir.Query) *Statement {
 	t.Helper()

@@ -73,3 +73,11 @@ GRANT USAGE, SELECT  ON api.private_todos_id_seq    TO web_user;
 CREATE OR REPLACE VIEW api.readonly_view AS
   SELECT id, task FROM api.todos;
 GRANT SELECT ON api.readonly_view TO web_anon, web_user;
+
+-- Seed private_todos for RLS tests (Group 19). Insert rows with owner='web_user'
+-- (the role the JWT will claim) so test 19.2 returns non-empty results.
+INSERT INTO api.private_todos (id, owner, task) VALUES
+    (1, 'web_user', 'user private task'),
+    (2, 'other_role', 'not visible to web_user')
+ON CONFLICT (id) DO NOTHING;
+SELECT setval('api.private_todos_id_seq', (SELECT MAX(id) FROM api.private_todos));

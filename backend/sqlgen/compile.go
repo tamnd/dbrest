@@ -431,8 +431,22 @@ func (b *builder) writeCompare(c ir.Compare) *pgerr.APIError {
 	var frag string
 	var err *pgerr.APIError
 	switch c.Op {
-	case ir.OpEq, ir.OpNeq, ir.OpGt, ir.OpGte, ir.OpLt, ir.OpLte, ir.OpLike, ir.OpILike:
+	case ir.OpEq, ir.OpNeq:
+		if c.Value.Text == "true" {
+			frag = col + " " + binaryOp(c.Op) + " " + b.d.BoolValue(true)
+		} else if c.Value.Text == "false" {
+			frag = col + " " + binaryOp(c.Op) + " " + b.d.BoolValue(false)
+		} else {
+			frag = col + " " + binaryOp(c.Op) + " " + b.bind(c.Value.Text)
+		}
+	case ir.OpGt, ir.OpGte, ir.OpLt, ir.OpLte, ir.OpLike:
 		frag = col + " " + binaryOp(c.Op) + " " + b.bind(c.Value.Text)
+	case ir.OpILike:
+		var ok bool
+		frag, ok = b.d.ILike(col, b.bind(c.Value.Text))
+		if !ok {
+			return pgerr.ErrUnsupported("case-insensitive LIKE", "sql")
+		}
 	case ir.OpIn:
 		frag, err = b.writeIn(col, c.Value.List)
 	case ir.OpIs:

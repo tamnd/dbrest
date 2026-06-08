@@ -1,0 +1,66 @@
+# dbrest + SQL Server 2022: the SQL Server subject for the compat tests.
+# Compare against docker/postgrest/compose.yaml (the PostgREST golden reference).
+#
+#   podman compose -f docker/dbrest-sqlserver/compose.yaml up -d
+#
+# dbrest-sqlserver listens on localhost:3004.
+# SQL Server listens on localhost:1434 (offset from default 1433).
+#
+# Build the dbrest image first:
+#   podman build -t dbrest:local -f Dockerfile .
+#
+# Seed SQL is run by the init container on first start; SQL Server has no
+# docker-entrypoint-initdb.d, so a one-shot init container applies the seed.
+
+services:
+  db-sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: compat-dbrest-sqlserver
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Dbrest!Passw0rd"
+      MSSQL_DB: dbrest
+    ports:
+      - "1434:1433"
+    volumes:
+      - dbrest-sqlserver-data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Dbrest!Passw0rd' -Q 'SELECT 1' -No -b -C || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+
+  db-sqlserver-init:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: compat-dbrest-sqlserver-init
+    depends_on:
+      db-sqlserver:
+        condition: service_healthy
+    environment:
+      MSSQL_SA_PASSWORD: "Dbrest!Passw0rd"
+    volumes:
+      - ../../docker/seed/sqlserver:/seed:ro
+    command: >
+      bash -c "
+        /opt/mssql-tools18/bin/sqlcmd -S db-sqlserver -U sa -P 'Dbrest!Passw0rd' -i /seed/01-schema.sql -No -b -C &&
+        /opt/mssql-tools18/bin/sqlcmd -S db-sqlserver -U sa -P 'Dbrest!Passw0rd' -d dbrest -i /seed/02-data.sql -No -b -C
+      "
+    restart: "no"
+
+  dbrest-sqlserver:
+    image: dbrest:local
+    container_name: compat-dbrest-sqlserver-server
+    depends_on:
+      db-sqlserver-init:
+        condition: service_completed_successfully
+    environment:
+      DBREST_DB_BACKEND: "sqlserver"
+      DBREST_DB_URI: "sqlserver://dbrest:Dbrest%21Passw0rd@db-sqlserver:1433?database=dbrest&encrypt=disable"
+      DBREST_DB_ANON_ROLE: ""
+      DBREST_SERVER_PORT: "3004"
+    ports:
+      - "3004:3004"
+
+volumes:
+  dbrest-sqlserver-data:

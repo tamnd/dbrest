@@ -228,3 +228,6 @@ func (Dialect) BoolValue(v bool) string {
 	}
 	return "FALSE"
 }
+
+// ILike renders a case-insensitive LIKE predicate using PostgreSQL's ILIKE.
+func (Dialect) ILike(col, val string) (string, bool) { return col + " ILIKE " + val, true }

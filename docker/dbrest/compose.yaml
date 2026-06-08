@@ -42,8 +42,9 @@ services:
     environment:
       DBREST_DB_BACKEND: "postgres"
       DBREST_DB_URI: "postgres://authenticator:authenticator_pass@db-dbrest:5432/postgres"
-      DBREST_DB_SCHEMAS: "api"
+      DBREST_DB_SCHEMAS: "api, private"
       DBREST_DB_ANON_ROLE: "web_anon"
+      DBREST_JWT_SECRET: "reallyreallyreallyreallyverysafe"
       DBREST_SERVER_PORT: "3001"
     ports:
       - "3001:3001"

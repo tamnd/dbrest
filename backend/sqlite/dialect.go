@@ -153,3 +153,6 @@ func (dialect) BoolValue(v bool) string {
 	}
 	return "0"
 }
+
+// ILike uses plain LIKE; SQLite LIKE is case-insensitive for ASCII.
+func (dialect) ILike(col, val string) (string, bool) { return col + " LIKE " + val, true }

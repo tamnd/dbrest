@@ -11,7 +11,8 @@ CREATE TABLE api.todos (
     id      serial  PRIMARY KEY,
     done    boolean NOT NULL DEFAULT false,
     task    text    NOT NULL,
-    due     date
+    due     date,
+    tags    text[]  NOT NULL DEFAULT '{}'::text[]
 );
 
 CREATE TABLE api.persons (
@@ -40,3 +41,15 @@ GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA api TO web_anon;
 GRANT USAGE  ON SCHEMA api          TO web_user;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA api TO web_user;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA api TO web_user;
+
+-- private schema for Accept-Profile / schema-switching tests (Group 28)
+CREATE SCHEMA IF NOT EXISTS private;
+
+CREATE TABLE IF NOT EXISTS private.items (
+    id   serial PRIMARY KEY,
+    name text   NOT NULL
+);
+
+GRANT USAGE  ON SCHEMA private        TO web_anon, web_user;
+GRANT SELECT ON private.items         TO web_anon, web_user;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA private TO web_anon, web_user;

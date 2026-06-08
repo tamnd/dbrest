@@ -200,3 +200,6 @@ func (Dialect) BoolValue(v bool) string {
 	}
 	return "0"
 }
+
+// ILike uses plain LIKE; MySQL's default collation is case-insensitive.
+func (Dialect) ILike(col, val string) (string, bool) { return col + " LIKE " + val, true }

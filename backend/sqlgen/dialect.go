@@ -78,6 +78,12 @@ type Dialect interface {
 
 	// BoolValue renders a boolean literal.
 	BoolValue(v bool) string
+
+	// ILike renders a case-insensitive LIKE predicate, or reports ok=false when
+	// the engine does not support it. Engines whose default collation is already
+	// case-insensitive (SQL Server, SQLite, MySQL with utf8mb4_unicode_ci) return
+	// a plain LIKE fragment with ok=true; PostgreSQL returns ILIKE.
+	ILike(col, val string) (frag string, ok bool)
 }
 
 // PatternMark is the sentinel a Dialect.Regex fragment carries where the bound
