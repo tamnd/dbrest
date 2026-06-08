@@ -343,6 +343,46 @@ func TestWriteColumnGateRejectsUngrantedColumn(t *testing.T) {
 	}
 }
 
+// An UPDATE under a column-restricted grant gates the Set map too, not just an
+// insert's column list. Assigning a column outside the grant is denied.
+func TestUpdateColumnGateRejectsUngrantedSet(t *testing.T) {
+	reg := authz.NewRegistry(
+		[]authz.Grant{{Role: "web_user", Relation: "films", Action: authz.Update, Columns: []string{"title"}}},
+		nil,
+	)
+	p := &ir.Plan{
+		Rel: filmsRel(),
+		Query: &ir.Query{
+			Kind:     ir.Update,
+			Relation: ir.Ref{Schema: "public", Name: "films"},
+			Write:    &ir.WriteSpec{Set: map[string]ir.Value{"secret": {Text: "x"}}},
+		},
+	}
+	if err := reg.Authorize(&reqctx.Context{Role: "web_user"}, p); err == nil {
+		t.Fatal("updating an ungranted column through Set was allowed")
+	}
+}
+
+// The same restricted UPDATE is allowed when every Set column is within the
+// grant, so the gate is not simply refusing all column-restricted writes.
+func TestUpdateColumnGateAllowsGrantedSet(t *testing.T) {
+	reg := authz.NewRegistry(
+		[]authz.Grant{{Role: "web_user", Relation: "films", Action: authz.Update, Columns: []string{"title"}}},
+		nil,
+	)
+	p := &ir.Plan{
+		Rel: filmsRel(),
+		Query: &ir.Query{
+			Kind:     ir.Update,
+			Relation: ir.Ref{Schema: "public", Name: "films"},
+			Write:    &ir.WriteSpec{Set: map[string]ir.Value{"title": {Text: "Dune"}}},
+		},
+	}
+	if err := reg.Authorize(&reqctx.Context{Role: "web_user"}, p); err != nil {
+		t.Fatalf("updating a granted column should be allowed: %v", err)
+	}
+}
+
 func TestNumericClaimComparesAsText(t *testing.T) {
 	reg := authz.NewRegistry(
 		[]authz.Grant{{Role: "web_user", Relation: "films", Action: authz.Insert}},
