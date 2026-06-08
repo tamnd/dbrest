@@ -180,11 +180,11 @@ var cases = []compatCase{
 
 	// ── Group 7: Counting ─────────────────────────────────────────────────
 	{name: "7.1 count=exact", method: "GET", path: "/todos",
-		headers: map[string]string{"Prefer": "count=exact"}},
+		headers: map[string]string{"Prefer": "count=exact"}, wantContentRange: "0-2/3"},
 	{name: "7.2 limit+count=exact 206", method: "GET", path: "/todos?limit=1&order=id",
-		headers: map[string]string{"Prefer": "count=exact"}, wantStatus: 206},
+		headers: map[string]string{"Prefer": "count=exact"}, wantStatus: 206, wantContentRange: "0-0/3"},
 	{name: "7.3 empty+count=exact", method: "GET", path: "/todos?id=eq.99999",
-		headers: map[string]string{"Prefer": "count=exact"}},
+		headers: map[string]string{"Prefer": "count=exact"}, wantContentRange: "*/0"},
 	{name: "7.4 count=planned", method: "GET", path: "/todos",
 		headers:  map[string]string{"Prefer": "count=planned"},
 		bodyMode: "status"},
@@ -222,9 +222,10 @@ var cases = []compatCase{
 		body:       `{"task":"compat insert repr"}`,
 		wantStatus: 201, bodyMode: "schema"},
 	{name: "10.3 insert return=headers-only 201", method: "POST", path: "/todos",
-		headers:    map[string]string{"Content-Type": "application/json", "Prefer": "return=headers-only"},
-		body:       `{"task":"compat insert headers-only"}`,
-		wantStatus: 201, bodyMode: "empty"},
+		headers:            map[string]string{"Content-Type": "application/json", "Prefer": "return=headers-only"},
+		body:               `{"task":"compat insert headers-only"}`,
+		wantStatus:         201, bodyMode: "empty",
+		wantLocationPrefix: "/todos?id=eq."},
 	{name: "10.4 bulk insert 201", method: "POST", path: "/todos",
 		headers:    map[string]string{"Content-Type": "application/json", "Prefer": "return=representation"},
 		body:       `[{"task":"bulk a"},{"task":"bulk b"}]`,
@@ -288,6 +289,14 @@ var cases = []compatCase{
 		headers:    map[string]string{"Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=representation"},
 		body:       `{"id":1,"task":"conflict target upsert","done":false}`,
 		wantStatus: 200, bodyMode: "schema"},
+	{name: "13.4 PUT upsert existing 200", method: "PUT", path: "/todos?id=eq.1",
+		headers:    map[string]string{"Content-Type": "application/json", "Prefer": "return=representation"},
+		body:       `{"id":1,"task":"put upsert","done":false}`,
+		wantStatus: 200, bodyMode: "schema"},
+	{name: "13.5 PUT upsert new 201", method: "PUT", path: "/todos?id=eq.9999",
+		headers:    map[string]string{"Content-Type": "application/json", "Prefer": "return=representation"},
+		body:       `{"id":9999,"task":"new via put","done":false}`,
+		wantStatus: 201, bodyMode: "schema"},
 
 	// ── Group 15: tx=rollback ─────────────────────────────────────────────
 	{name: "15.1 tx=rollback insert", method: "POST", path: "/todos",
@@ -340,6 +349,9 @@ var cases = []compatCase{
 	// ── Group 20: Error responses ─────────────────────────────────────────
 	{name: "20.1 unknown table 404", method: "GET", path: "/nonexistent_xyz_table",
 		wantStatus: 404, bodyMode: "status"},
+	{name: "20.2 missing Content-Type 415", method: "POST", path: "/todos",
+		body:       `{"task":"no content type"}`,
+		wantStatus: 415, bodyMode: "status"},
 	{name: "20.3 bad value for int col 400", method: "GET", path: "/todos?id=eq.notanint",
 		wantStatus: 400, bodyMode: "status"},
 	{name: "20.4 bad operator 400", method: "GET", path: "/todos?id=badop.1",
@@ -347,6 +359,20 @@ var cases = []compatCase{
 	{name: "20.5 unsupported media type 406", method: "GET", path: "/todos",
 		headers:    map[string]string{"Accept": "application/xml"},
 		wantStatus: 406, bodyMode: "status"},
+	{name: "20.6 NOT NULL violation 400", method: "POST", path: "/persons",
+		headers:    map[string]string{"Content-Type": "application/json"},
+		body:       `{"name":null,"email":"nulltest@example.com"}`,
+		wantStatus: 400, bodyMode: "status"},
+	{name: "20.7 readonly view 405", method: "POST", path: "/readonly_view",
+		headers:    map[string]string{"Content-Type": "application/json"},
+		body:       `{"id":999,"task":"write to view"}`,
+		wantStatus: 405, bodyMode: "status"},
+
+	// ── Group 21: Content-Range (exact) ───────────────────────────────────
+	// 21.1–21.3 covered by 7.1–7.3 with wantContentRange above.
+	// 21.4: limit without count gives unknown total.
+	{name: "21.4 Content-Range no count", method: "GET", path: "/todos?limit=1&order=id",
+		wantContentRange: "0-0/*", wantStatus: 200},
 
 	// ── Group 22: Preference-Applied header ───────────────────────────────
 	{name: "22.1 pref-applied return=representation", method: "POST", path: "/todos",
@@ -359,6 +385,31 @@ var cases = []compatCase{
 		headers:         map[string]string{"Prefer": "count=exact"},
 		wantPrefApplied: "count=exact",
 		bodyMode:        "status"},
+
+	// ── Group 24: Full-text search operators ──────────────────────────────
+	// Uses task text column; no tsvector index required.
+	{name: "24.1 fts basic", method: "GET", path: "/todos?task=fts.laundry",
+		wantStatus: 200, bodyMode: "schema"},
+	{name: "24.2 plfts plain text", method: "GET", path: "/todos?task=plfts.do%20laundry",
+		wantStatus: 200, bodyMode: "schema"},
+	{name: "24.3 wfts websearch", method: "GET", path: "/todos?task=wfts.laundry",
+		wantStatus: 200, bodyMode: "schema"},
+	{name: "24.4 fts with language config", method: "GET", path: "/todos?task=fts(english).laundry",
+		wantStatus: 200, bodyMode: "schema"},
+	{name: "24.5 phfts phrase", method: "GET", path: "/todos?task=phfts.do%20laundry",
+		wantStatus: 200, bodyMode: "schema"},
+
+	// ── Group 25: isdistinct operator ─────────────────────────────────────
+	{name: "25.1 isdistinct int", method: "GET", path: "/todos?id=isdistinct.1",
+		wantStatus: 200},
+	{name: "25.2 not.isdistinct", method: "GET", path: "/todos?id=not.isdistinct.1",
+		wantStatus: 200},
+
+	// ── Group 26: Aggregate functions ─────────────────────────────────────
+	{name: "26.1 count aggregate", method: "GET", path: "/todos?select=n:count(*)",
+		wantStatus: 200, bodyMode: "schema"},
+	{name: "26.2 max aggregate", method: "GET", path: "/todos?select=top:max(id)",
+		wantStatus: 200, bodyMode: "schema"},
 }
 
 // resetTestDB deletes all non-seed rows from both servers so each TestCompatibility
