@@ -7,7 +7,10 @@
 // frontend never branches on the backend. See spec 08-introspection.
 package schema
 
-import "strings"
+import (
+	"slices"
+	"strings"
+)
 
 // Kind distinguishes the relation flavors the planner cares about.
 type Kind uint8
@@ -37,6 +40,11 @@ type Relation struct {
 	// ForeignKeys are the relation's outgoing foreign keys, the raw material the
 	// planner resolves embeds from (spec 09). Empty on an engine without them.
 	ForeignKeys []*ForeignKey
+	// FullText are the relation's full-text indexes, the structure an fts
+	// predicate lowers against on engines that need one (spec 21). SQLite fills it
+	// from the FTS5 virtual tables that shadow a base table; an engine with
+	// column-agnostic full-text (PostgreSQL's tsvector) leaves it empty.
+	FullText []*FullTextIndex
 
 	byName map[string]*Column
 }
@@ -49,6 +57,32 @@ type Column struct {
 	HasDefault bool
 	// Position is the 1-based ordinal, used for stable ordering.
 	Position int
+}
+
+// FullTextIndex is an engine-side full-text facility covering one or more of a
+// relation's columns. The planner attaches the covering index to an fts predicate
+// so the compiler can lower the engine's match form; a backend that requires one
+// and finds none raises PGRST127 rather than silently scanning (spec 21).
+type FullTextIndex struct {
+	// Name is the engine object that answers the match (a SQLite FTS5 virtual
+	// table).
+	Name string
+	// Columns are the base-relation columns the index covers.
+	Columns []string
+	// RowidColumn is the base column aligned with the index's rowid (FTS5
+	// content_rowid); empty means the implicit rowid.
+	RowidColumn string
+}
+
+// FullTextIndexFor returns the first full-text index covering the named column,
+// or nil when none does.
+func (r *Relation) FullTextIndexFor(column string) *FullTextIndex {
+	for _, idx := range r.FullText {
+		if slices.Contains(idx.Columns, column) {
+			return idx
+		}
+	}
+	return nil
 }
 
 // NewModel builds a Model from a flat relation slice, indexing it for lookup.

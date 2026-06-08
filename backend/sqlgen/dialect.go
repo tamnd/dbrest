@@ -10,6 +10,8 @@
 // rejects it first.
 package sqlgen
 
+import "github.com/tamnd/dbrest/ir"
+
 // Dialect is the per-engine spelling of the fragments that differ between SQL
 // engines. One Dialect plus one Capabilities is the whole of what a new SQL
 // engine must supply; the compiler, planner, and renderer are reused. See the
@@ -52,6 +54,21 @@ type Dialect interface {
 	// engine has no regex so the planner marks the feature Unsupported.
 	Regex(expr, pattern string, ci bool) (string, bool)
 
+	// RegexFeatureGap reports a regex construct in pattern that the engine's regex
+	// flavor cannot honor and dbrest detects before lowering, naming it for a
+	// PGRST127; it returns "" when the pattern is within the engine's grammar. See
+	// spec 21, "the semantic-divergence problem".
+	RegexFeatureGap(pattern string) string
+
+	// FullText lowers a full-text predicate. col is the quoted column reference
+	// (PostgreSQL builds to_tsvector over it); idx is the resolved covering index,
+	// or nil when the schema has none (an engine that requires one reports ok=false
+	// and the compiler raises PGRST127). variant is the fts/plfts/phfts/wfts
+	// grammar; config is the language argument (may be empty); value is the raw
+	// query text. The returned fragment carries PatternMark where the bound,
+	// engine-translated query value goes, and bind is that value. See spec 21.
+	FullText(col string, idx *FullTextRef, variant ir.FTSVariant, config, value string) (frag, bind string, ok bool)
+
 	// SessionRead reads a request-context value (the GUC analog).
 	SessionRead(key string) string
 
@@ -68,6 +85,15 @@ type Dialect interface {
 // it, so a dialect that itself needs a literal ? (such as a (?i) prefix) is not
 // disturbed.
 const PatternMark = "$PAT$"
+
+// FullTextRef is the resolved engine-side structure a full-text predicate lowers
+// against, built by the compiler from the schema's covering index. Table is the
+// quoted full-text object (the FTS5 virtual table); RowidRef is the quoted
+// base-table rowid reference that joins it back to the row.
+type FullTextRef struct {
+	Table    string
+	RowidRef string
+}
 
 // Pair is a key/value entry for JSONObject. Key is a literal JSON key; Value is
 // an already-compiled SQL expression.

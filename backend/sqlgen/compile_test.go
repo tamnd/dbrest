@@ -63,8 +63,19 @@ func (stub) JSONObject([]Pair) string                  { return "" }
 func (stub) JSONAgg(e, o string) string                { return "" }
 func (stub) Cast(e, t string) string                   { return "CAST(" + e + " AS " + t + ")" }
 func (stub) Regex(e, p string, ci bool) (string, bool) { return e + " ~ " + PatternMark, true }
-func (stub) SessionRead(k string) string               { return "" }
-func (stub) SessionWrite(k string) (string, bool)      { return "", false }
+func (stub) RegexFeatureGap(string) string             { return "" }
+
+// FullText models a PostgreSQL-flavored, column-agnostic full text: the index is
+// ignored (tsvector works on any column), so a nil idx is fine.
+func (stub) FullText(col string, _ *FullTextRef, v ir.FTSVariant, _, _ string) (string, string, bool) {
+	ctor := map[ir.FTSVariant]string{
+		ir.FTSPlain: "to_tsquery", ir.FTSPlainText: "plainto_tsquery",
+		ir.FTSPhrase: "phraseto_tsquery", ir.FTSWeb: "websearch_to_tsquery",
+	}[v]
+	return "to_tsvector(" + col + ") @@ " + ctor + "(" + PatternMark + ")", "", true
+}
+func (stub) SessionRead(k string) string          { return "" }
+func (stub) SessionWrite(k string) (string, bool) { return "", false }
 func (stub) BoolValue(v bool) string {
 	if v {
 		return "TRUE"
@@ -177,6 +188,18 @@ func TestCompileRegexUsesPatternMark(t *testing.T) {
 	}
 	if len(st.Args) != 1 || st.Args[0] != "^a" {
 		t.Errorf("Args = %v", st.Args)
+	}
+}
+
+// TestCompileFTSColumnAgnostic checks an fts predicate compiles through the
+// dialect on a backend with column-agnostic full text (the stub models
+// PostgreSQL), where the planner attached no covering index.
+func TestCompileFTSColumnAgnostic(t *testing.T) {
+	where := ir.Cond(ir.Compare{Path: []string{"body"}, Op: ir.OpFTS, FTS: ir.FTSWeb, Value: ir.Value{Text: "cat"}})
+	st := compile(t, &ir.Query{Relation: ir.Ref{Name: "docs"}, Where: &where})
+	want := `SELECT * FROM "docs" WHERE to_tsvector("body") @@ websearch_to_tsquery($1)`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
 	}
 }
 

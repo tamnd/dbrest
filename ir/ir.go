@@ -195,6 +195,18 @@ type Not struct{ Kid Cond }
 
 func (Not) isCond() {}
 
+// FTSVariant selects the full-text query grammar of an fts predicate, one per
+// PostgREST operator. Parsing records the variant; each backend maps it onto its
+// own full-text query language (spec 21).
+type FTSVariant uint8
+
+const (
+	FTSPlain     FTSVariant = iota // fts: to_tsquery grammar (&, |, !, <->)
+	FTSPlainText                   // plfts: plainto_tsquery, lexemes ANDed
+	FTSPhrase                      // phfts: phraseto_tsquery, word order kept
+	FTSWeb                         // wfts: websearch_to_tsquery, web-style string
+)
+
 // Compare is a single column-operator-value predicate.
 type Compare struct {
 	Path   []string
@@ -202,6 +214,13 @@ type Compare struct {
 	Value  Value
 	Quant  Quant
 	Negate bool
+	// FTS is the full-text grammar when Op is OpFTS; Config is its optional
+	// language argument (fts(english)), empty when absent. FullText is the covering
+	// index the planner resolved for the predicate's column, nil when the schema
+	// has none (the backend decides whether that is an error). See spec 21.
+	FTS      FTSVariant
+	Config   string
+	FullText *schema.FullTextIndex
 }
 
 func (Compare) isCond() {}

@@ -120,6 +120,17 @@ func ErrUnsupported(feature, backend string) *APIError {
 	return e.WithHint("see the capability matrix for supported features on this backend")
 }
 
+// ErrFullTextUnavailable is the PGRST127 for a full-text predicate on a column the
+// backend has no full-text structure for (a SQLite column with no covering FTS5
+// table). It names the column so the missing structure is actionable, per spec
+// 21's "never silently wrong" rule: dbrest errors rather than degrading to a
+// substring scan. Emission happens before any backend call.
+func ErrFullTextUnavailable(column, backend string) *APIError {
+	e := New(http.StatusBadRequest, CodeUnsupported, "feature not implemented on this backend")
+	e = e.WithDetails(fmt.Sprintf("full-text search on column %q has no full-text index on the %s backend", column, backend))
+	return e.WithHint("create a full-text index covering the column")
+}
+
 // The class-23 SQLSTATEs are PostgreSQL's integrity-constraint violations. Every
 // backend maps its native constraint error to one of these so a client sees the
 // same code regardless of engine; PostgREST reports the SQLSTATE as the error
