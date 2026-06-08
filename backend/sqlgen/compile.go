@@ -4,11 +4,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/tamnd/dbrest/ir"
 	"github.com/tamnd/dbrest/pgerr"
 )
+
+// CountColName is the synthetic column appended by CompileReadCounted to carry
+// the window count alongside the result rows. Backends strip it from cols/rows
+// after extracting the total, keeping the representation clean.
+const CountColName = "_pgrst_count"
 
 // Statement is a compiled, parameterized SQL statement and its argument list, in
 // placeholder order.
@@ -78,11 +84,36 @@ func CompileRead(d Dialect, q *ir.Query) (*Statement, *pgerr.APIError) {
 	if len(q.Embeds) > 0 {
 		return compileReadEmbedded(d, q)
 	}
+	return compileReadPlain(d, q, false)
+}
+
+// CompileReadCounted lowers a non-embedded read query to a SELECT that appends
+// count(*) OVER () AS "_pgrst_count" to the projection. This lets the backend
+// retrieve both the rows and the total row-count in a single query, avoiding
+// a separate COUNT statement. It is only valid for non-embedded queries; an
+// embedded query returns an internal error.
+func CompileReadCounted(d Dialect, q *ir.Query) (*Statement, *pgerr.APIError) {
+	if len(q.Embeds) > 0 {
+		return nil, pgerr.ErrInternal("CompileReadCounted called on embedded query")
+	}
+	return compileReadPlain(d, q, true)
+}
+
+// compileReadPlain compiles a non-embedded read query. When withCount is true,
+// count(*) OVER () AS "_pgrst_count" is appended to the SELECT list so callers
+// can extract the total alongside the result rows.
+func compileReadPlain(d Dialect, q *ir.Query, withCount bool) (*Statement, *pgerr.APIError) {
 	b := newBuilder(d)
 	b.sb.WriteString("SELECT ")
 
 	if err := b.writeSelect(q.Select); err != nil {
 		return nil, err
+	}
+
+	if withCount {
+		b.sb.WriteString(`, count(*) OVER () AS "`)
+		b.sb.WriteString(CountColName)
+		b.sb.WriteString(`"`)
 	}
 
 	b.sb.WriteString(" FROM ")
@@ -281,9 +312,14 @@ func (b *builder) writeReturning(cols []string) *pgerr.APIError {
 	return nil
 }
 
-// writeArg converts a decoded JSON payload value to a driver argument. Numbers
+// WriteArg converts a decoded JSON payload value to a driver argument. Numbers
 // arrive as json.Number (the decoder preserves integer precision); objects and
 // arrays are re-encoded to their JSON text so they land in a json/text column.
+// It is exported for backends (e.g. the COPY path) that need the same coercion
+// without going through the SQL builder.
+func WriteArg(v ir.Value) any { return writeArg(v) }
+
+// writeArg is the unexported implementation used by the builder methods.
 func writeArg(v ir.Value) any {
 	switch x := v.JSON.(type) {
 	case nil:
@@ -296,7 +332,12 @@ func writeArg(v ir.Value) any {
 			return f
 		}
 		return x.String()
-	case map[string]any, []any:
+	case []any:
+		// PostgreSQL array columns use {elem1,elem2} input syntax, not JSON
+		// ["elem1","elem2"]. Build the array literal so the server-side cast
+		// from text to text[]/int4[]/etc. succeeds with or without type OIDs.
+		return pgArrayLiteral(x)
+	case map[string]any:
 		bs, err := json.Marshal(x)
 		if err != nil {
 			return nil
@@ -305,6 +346,75 @@ func writeArg(v ir.Value) any {
 	default:
 		return x
 	}
+}
+
+// pgArrayLiteral converts a JSON array into a PostgreSQL array literal string
+// of the form {elem1,"elem with spaces",NULL}. Elements that are plain
+// alphanumeric strings (and json.Number/bool) are emitted unquoted; strings
+// that contain commas, braces, backslashes, double-quotes, or whitespace are
+// double-quoted with internal backslash escaping, matching PostgreSQL's own
+// array output format.
+func pgArrayLiteral(elems []any) string {
+	var sb strings.Builder
+	sb.WriteByte('{')
+	for i, e := range elems {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		switch v := e.(type) {
+		case nil:
+			sb.WriteString("NULL")
+		case bool:
+			if v {
+				sb.WriteByte('t')
+			} else {
+				sb.WriteByte('f')
+			}
+		case json.Number:
+			sb.WriteString(v.String())
+		case float64:
+			sb.WriteString(strconv.FormatFloat(v, 'f', -1, 64))
+		case int64:
+			sb.WriteString(strconv.FormatInt(v, 10))
+		case string:
+			if pgArrayElemNeedsQuote(v) {
+				sb.WriteByte('"')
+				for _, c := range v {
+					if c == '"' || c == '\\' {
+						sb.WriteByte('\\')
+					}
+					sb.WriteRune(c)
+				}
+				sb.WriteByte('"')
+			} else {
+				sb.WriteString(v)
+			}
+		default:
+			// Nested arrays or unexpected types: fall back to JSON.
+			if bs, err := json.Marshal(v); err == nil {
+				sb.Write(bs)
+			}
+		}
+	}
+	sb.WriteByte('}')
+	return sb.String()
+}
+
+// pgArrayElemNeedsQuote reports whether a string element must be double-quoted
+// in a PostgreSQL array literal. Quoting is required for strings that contain
+// commas, braces, backslashes, double-quotes, or whitespace, or that could be
+// mistaken for NULL or a bare number.
+func pgArrayElemNeedsQuote(s string) bool {
+	if s == "" || strings.EqualFold(s, "null") {
+		return true
+	}
+	for _, c := range s {
+		if c == ',' || c == '{' || c == '}' || c == '"' || c == '\\' ||
+			c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			return true
+		}
+	}
+	return false
 }
 
 // sortedKeys returns the keys of a value map in lexical order, for deterministic
@@ -431,8 +541,25 @@ func (b *builder) writeCompare(c ir.Compare) *pgerr.APIError {
 	var frag string
 	var err *pgerr.APIError
 	switch c.Op {
-	case ir.OpEq, ir.OpNeq, ir.OpGt, ir.OpGte, ir.OpLt, ir.OpLte, ir.OpLike, ir.OpILike:
+	case ir.OpEq, ir.OpNeq:
+		// Boolean literals "true"/"false" are rendered via BoolValue so engines
+		// without a native BOOL type (MySQL TINYINT) produce correct predicates
+		// (e.g. done = 1 rather than done = 'true' which MySQL coerces to 0).
+		if c.Value.Text == "true" {
+			frag = col + " " + binaryOp(c.Op) + " " + b.d.BoolValue(true)
+		} else if c.Value.Text == "false" {
+			frag = col + " " + binaryOp(c.Op) + " " + b.d.BoolValue(false)
+		} else {
+			frag = col + " " + binaryOp(c.Op) + " " + b.bind(c.Value.Text)
+		}
+	case ir.OpGt, ir.OpGte, ir.OpLt, ir.OpLte, ir.OpLike:
 		frag = col + " " + binaryOp(c.Op) + " " + b.bind(c.Value.Text)
+	case ir.OpILike:
+		var ok bool
+		frag, ok = b.d.ILike(col, b.bind(c.Value.Text))
+		if !ok {
+			return pgerr.ErrUnsupported("case-insensitive LIKE", "sql")
+		}
 	case ir.OpIn:
 		frag, err = b.writeIn(col, c.Value.List)
 	case ir.OpIs:
@@ -453,6 +580,24 @@ func (b *builder) writeCompare(c ir.Compare) *pgerr.APIError {
 		frag = strings.Replace(expr, PatternMark, b.bind(c.Value.Text), 1)
 	case ir.OpFTS:
 		frag, err = b.writeFTS(c, col)
+	case ir.OpIsDistinct:
+		frag = col + " IS DISTINCT FROM " + b.bind(c.Value.Text)
+	case ir.OpContains, ir.OpContained, ir.OpOverlap:
+		var sqlOp string
+		switch c.Op {
+		case ir.OpContains:
+			sqlOp = "@>"
+		case ir.OpContained:
+			sqlOp = "<@"
+		default:
+			sqlOp = "&&"
+		}
+		val := b.bind(c.Value.Text)
+		var ok bool
+		frag, ok = b.d.ArrayOp(col, sqlOp, val)
+		if !ok {
+			return pgerr.ErrUnsupported("array operator "+sqlOp, "sql")
+		}
 	default:
 		return pgerr.ErrUnsupported("filter operator "+opName(c.Op), "sql")
 	}

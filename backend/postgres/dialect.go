@@ -221,6 +221,14 @@ func sqlLiteral(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
+// ArrayOp renders a PostgreSQL array containment/overlap expression.
+func (Dialect) ArrayOp(col, op, val string) (string, bool) {
+	return col + " " + op + " " + val, true
+}
+
+// ILike renders col ILIKE val using PostgreSQL's native case-insensitive LIKE.
+func (Dialect) ILike(col, val string) (string, bool) { return col + " ILIKE " + val, true }
+
 // BoolValue renders a boolean as the PostgreSQL keyword TRUE/FALSE.
 func (Dialect) BoolValue(v bool) string {
 	if v {

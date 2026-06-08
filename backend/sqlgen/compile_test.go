@@ -76,6 +76,10 @@ func (stub) FullText(col string, _ *FullTextRef, v ir.FTSVariant, _, _ string) (
 }
 func (stub) SessionRead(k string) string          { return "" }
 func (stub) SessionWrite(k string) (string, bool) { return "", false }
+func (stub) ArrayOp(col, op, val string) (string, bool) {
+	return col + " " + op + " " + val, true
+}
+func (stub) ILike(col, val string) (string, bool) { return col + " ILIKE " + val, true }
 func (stub) BoolValue(v bool) string {
 	if v {
 		return "TRUE"
