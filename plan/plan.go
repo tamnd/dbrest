@@ -308,7 +308,18 @@ func validateCond(rel *schema.Relation, c *ir.Cond) *pgerr.APIError {
 		if err := checkColumn(rel, n.Path); err != nil {
 			return err
 		}
-		return checkOperand(rel, n)
+		if err := checkOperand(rel, n); err != nil {
+			return err
+		}
+		// An fts predicate carries its covering full-text index, when the schema has
+		// one for the column, so the compiler can lower the engine's match form. A
+		// nil index is left for the backend to interpret: an engine with
+		// column-agnostic full-text (PostgreSQL) ignores it, one that needs a
+		// structure (SQLite's FTS5) raises PGRST127. See spec 21.
+		if n.Op == ir.OpFTS && len(n.Path) == 1 {
+			n.FullText = rel.FullTextIndexFor(n.Path[0])
+			*c = n
+		}
 	}
 	return nil
 }

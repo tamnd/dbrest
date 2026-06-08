@@ -435,6 +435,12 @@ func (b *builder) writeCompare(c ir.Compare) *pgerr.APIError {
 	case ir.OpIs:
 		frag, err = b.writeIs(col, c.Value.Text)
 	case ir.OpMatch, ir.OpIMatch:
+		// A pattern that uses a construct the engine's regex flavor lacks (a
+		// backreference on RE2-backed SQLite) is rejected before lowering, naming
+		// the feature, rather than matching a quietly different set. See spec 21.
+		if feat := b.d.RegexFeatureGap(c.Value.Text); feat != "" {
+			return pgerr.ErrUnsupported(feat, "sql")
+		}
 		expr, ok := b.d.Regex(col, c.Value.Text, c.Op == ir.OpIMatch)
 		if !ok {
 			return pgerr.ErrUnsupported("regular-expression match", "sql")
@@ -442,6 +448,8 @@ func (b *builder) writeCompare(c ir.Compare) *pgerr.APIError {
 		// Regex returns an already-formed boolean expression carrying PatternMark
 		// where the bound pattern placeholder goes.
 		frag = strings.Replace(expr, PatternMark, b.bind(c.Value.Text), 1)
+	case ir.OpFTS:
+		frag, err = b.writeFTS(c, col)
 	default:
 		return pgerr.ErrUnsupported("filter operator "+opName(c.Op), "sql")
 	}
@@ -453,6 +461,30 @@ func (b *builder) writeCompare(c ir.Compare) *pgerr.APIError {
 	}
 	b.sb.WriteString(frag)
 	return nil
+}
+
+// writeFTS lowers a full-text predicate by handing the resolved covering index
+// (when the planner found one) to the dialect. A dialect that needs an index and
+// got none reports ok=false, which becomes the PGRST127 naming the column, so a
+// missing full-text structure is a clear error rather than a silent scan. col is
+// the already-qualified column reference. See spec 21.
+func (b *builder) writeFTS(c ir.Compare, col string) (string, *pgerr.APIError) {
+	var ref *FullTextRef
+	if c.FullText != nil {
+		rowid := c.FullText.RowidColumn
+		if rowid == "" {
+			rowid = "rowid"
+		}
+		ref = &FullTextRef{
+			Table:    b.d.QuoteIdent(c.FullText.Name),
+			RowidRef: b.colRef(rowid),
+		}
+	}
+	expr, bindVal, ok := b.d.FullText(col, ref, c.FTS, c.Config, c.Value.Text)
+	if !ok {
+		return "", pgerr.ErrFullTextUnavailable(c.Path[0], "sql")
+	}
+	return strings.Replace(expr, PatternMark, b.bind(bindVal), 1), nil
 }
 
 func (b *builder) writeIn(col string, list []string) (string, *pgerr.APIError) {

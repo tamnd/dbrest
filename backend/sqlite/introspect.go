@@ -18,8 +18,17 @@ func (b *Backend) Introspect(ctx context.Context) (*schema.Model, error) {
 	if err != nil {
 		return nil, err
 	}
+	// FTS5 virtual tables are not exposed as relations; they are full-text indexes
+	// attached to the base table they shadow (external content) or, when standalone,
+	// to themselves. Their auto-created shadow tables (_data, _idx, ...) are hidden
+	// too. See spec 21, "index requirements".
+	ftsByContent, excluded := classifyFTS(rels)
+
 	out := make([]*schema.Relation, 0, len(rels))
 	for _, r := range rels {
+		if excluded[r.name] {
+			continue
+		}
 		cols, pk, err := b.columns(ctx, r.name)
 		if err != nil {
 			return nil, err
@@ -34,6 +43,7 @@ func (b *Backend) Introspect(ctx context.Context) (*schema.Model, error) {
 			Columns:     cols,
 			PrimaryKey:  pk,
 			ForeignKeys: fks,
+			FullText:    ftsByContent[r.name],
 		})
 	}
 	return schema.NewModel(out), nil
@@ -42,11 +52,12 @@ func (b *Backend) Introspect(ctx context.Context) (*schema.Model, error) {
 type relInfo struct {
 	name string
 	kind schema.Kind
+	sql  string
 }
 
 func (b *Backend) relationNames(ctx context.Context) ([]relInfo, error) {
 	rows, err := b.db.QueryContext(ctx,
-		`SELECT name, type FROM sqlite_master
+		`SELECT name, type, COALESCE(sql, '') FROM sqlite_master
 		 WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%'
 		 ORDER BY name`)
 	if err != nil {
@@ -56,17 +67,171 @@ func (b *Backend) relationNames(ctx context.Context) ([]relInfo, error) {
 
 	var out []relInfo
 	for rows.Next() {
-		var name, typ string
-		if err := rows.Scan(&name, &typ); err != nil {
+		var name, typ, ddl string
+		if err := rows.Scan(&name, &typ, &ddl); err != nil {
 			return nil, err
 		}
 		kind := schema.KindTable
 		if typ == "view" {
 			kind = schema.KindView
 		}
-		out = append(out, relInfo{name: name, kind: kind})
+		out = append(out, relInfo{name: name, kind: kind, sql: ddl})
 	}
 	return out, rows.Err()
+}
+
+// ftsShadowSuffixes are the auto-created backing tables of an FTS5 virtual table,
+// named <fts><suffix>. They are real tables in sqlite_master but are internal, so
+// they are hidden from the exposed schema.
+var ftsShadowSuffixes = []string{"_data", "_idx", "_content", "_docsize", "_config"}
+
+// classifyFTS scans the catalog for FTS5 virtual tables and returns the full-text
+// indexes keyed by the base relation they cover, plus the set of relation names to
+// hide from the exposed schema (external-content FTS5 tables and every FTS5 table's
+// shadow tables). A standalone FTS5 table (no content= option) stays exposed and
+// indexes itself.
+func classifyFTS(rels []relInfo) (map[string][]*schema.FullTextIndex, map[string]bool) {
+	byContent := map[string][]*schema.FullTextIndex{}
+	excluded := map[string]bool{}
+	for _, r := range rels {
+		decl, ok := parseFTS5(r.name, r.sql)
+		if !ok {
+			continue
+		}
+		target := decl.content
+		if target == "" {
+			target = decl.name // standalone: indexes its own columns
+		} else {
+			excluded[decl.name] = true // external content: the vtab itself is hidden
+		}
+		byContent[target] = append(byContent[target], &schema.FullTextIndex{
+			Name:        decl.name,
+			Columns:     decl.columns,
+			RowidColumn: decl.rowidCol,
+		})
+		for _, suf := range ftsShadowSuffixes {
+			excluded[decl.name+suf] = true
+		}
+	}
+	return byContent, excluded
+}
+
+// ftsDecl is a parsed FTS5 CREATE VIRTUAL TABLE statement.
+type ftsDecl struct {
+	name     string
+	columns  []string // indexed column names, in declared order
+	content  string   // external content table, "" when standalone
+	rowidCol string   // content_rowid column, "" for the implicit rowid
+}
+
+// ftsOptionKeys are the FTS5 configuration arguments that are not columns. Any
+// other parenthesized item is an indexed column name.
+var ftsOptionKeys = map[string]bool{
+	"content": true, "content_rowid": true, "tokenize": true,
+	"prefix": true, "columnsize": true, "detail": true,
+}
+
+// parseFTS5 recognizes a CREATE VIRTUAL TABLE ... USING fts5(...) statement and
+// extracts its indexed columns and the content/content_rowid options. It reports
+// ok=false for any other DDL. The sql comes from sqlite_master, a trusted catalog.
+func parseFTS5(name, sql string) (ftsDecl, bool) {
+	low := strings.ToLower(sql)
+	if !strings.Contains(low, "virtual table") || !strings.Contains(low, "fts5") {
+		return ftsDecl{}, false
+	}
+	open := strings.IndexByte(sql, '(')
+	close := strings.LastIndexByte(sql, ')')
+	if open < 0 || close < open {
+		return ftsDecl{}, false
+	}
+	decl := ftsDecl{name: name}
+	for _, arg := range splitArgs(sql[open+1 : close]) {
+		arg = strings.TrimSpace(arg)
+		if arg == "" {
+			continue
+		}
+		if key, val, ok := splitOption(arg); ok {
+			switch key {
+			case "content":
+				decl.content = val
+			case "content_rowid":
+				decl.rowidCol = val
+			}
+			continue
+		}
+		decl.columns = append(decl.columns, ftsColumnName(arg))
+	}
+	return decl, true
+}
+
+// splitOption splits an FTS5 option of the form key=value when key is a known
+// option name; it reports ok=false for a column spec. The value is unquoted.
+func splitOption(arg string) (key, val string, ok bool) {
+	lhs, rhs, found := strings.Cut(arg, "=")
+	if !found {
+		return "", "", false
+	}
+	key = strings.ToLower(strings.TrimSpace(lhs))
+	if !ftsOptionKeys[key] {
+		return "", "", false
+	}
+	return key, unquoteIdent(strings.TrimSpace(rhs)), true
+}
+
+// ftsColumnName extracts the column name from an FTS5 column spec, dropping a
+// trailing UNINDEXED keyword and any surrounding quoting.
+func ftsColumnName(spec string) string {
+	if i := strings.IndexAny(spec, " \t"); i >= 0 {
+		spec = spec[:i]
+	}
+	return unquoteIdent(spec)
+}
+
+// unquoteIdent strips one layer of SQLite identifier or string quoting: "x", 'x',
+// `x`, or [x]. A bare word is returned unchanged.
+func unquoteIdent(s string) string {
+	if len(s) < 2 {
+		return s
+	}
+	first, last := s[0], s[len(s)-1]
+	switch {
+	case first == '"' && last == '"',
+		first == '\'' && last == '\'',
+		first == '`' && last == '`':
+		return strings.ReplaceAll(s[1:len(s)-1], string(first)+string(first), string(first))
+	case first == '[' && last == ']':
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
+// splitArgs splits an FTS5 argument list on top-level commas, ignoring commas
+// inside quotes or parentheses (a tokenize='porter unicode61' value can contain
+// neither, but nested parens guard against future option forms).
+func splitArgs(s string) []string {
+	var out []string
+	depth := 0
+	var quote byte
+	start := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case quote != 0:
+			if c == quote {
+				quote = 0
+			}
+		case c == '"' || c == '\'' || c == '`':
+			quote = c
+		case c == '(' || c == '[':
+			depth++
+		case c == ')' || c == ']':
+			depth--
+		case c == ',' && depth == 0:
+			out = append(out, s[start:i])
+			start = i + 1
+		}
+	}
+	return append(out, s[start:])
 }
 
 // columns reads PRAGMA table_info for one relation, returning its columns in

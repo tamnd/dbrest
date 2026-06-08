@@ -753,25 +753,42 @@ func parseCompare(path []string, raw string) (Compare, *pgerr.APIError) {
 	if !ok {
 		return Compare{}, pgerr.ErrParse("filter must be operator.value: " + raw)
 	}
-	// quantifier: op(any) / op(all)
+	// An operator may carry a parenthesized argument. For the full-text family it
+	// is a language config (fts(english)); for the comparison operators it is a
+	// quantifier (op(any)/op(all)). The base token before the paren selects which.
+	base := opTok
+	var paren string
+	hasParen := false
 	if i := strings.IndexByte(opTok, '('); i >= 0 {
 		if !strings.HasSuffix(opTok, ")") {
-			return Compare{}, pgerr.ErrParse("malformed quantifier in operator: " + opTok)
+			return Compare{}, pgerr.ErrParse("malformed argument in operator: " + opTok)
 		}
-		q := opTok[i+1 : len(opTok)-1]
-		switch q {
+		base = opTok[:i]
+		paren = opTok[i+1 : len(opTok)-1]
+		hasParen = true
+	}
+	// The full-text operators carry their variant and an optional language config;
+	// they share one IR op and never take a quantifier.
+	if variant, isFTS := ftsVariant(base); isFTS {
+		c.Op = OpFTS
+		c.FTS = variant
+		c.Config = paren
+		c.Value = Value{Text: operand}
+		return c, nil
+	}
+	if hasParen {
+		switch paren {
 		case "any":
 			c.Quant = QAny
 		case "all":
 			c.Quant = QAll
 		default:
-			return Compare{}, pgerr.ErrParse("unknown quantifier: " + q)
+			return Compare{}, pgerr.ErrParse("unknown quantifier: " + paren)
 		}
-		opTok = opTok[:i]
 	}
-	op, ok := opFromToken(opTok)
+	op, ok := opFromToken(base)
 	if !ok {
-		return Compare{}, pgerr.ErrParse("unknown operator: " + opTok)
+		return Compare{}, pgerr.ErrParse("unknown operator: " + base)
 	}
 	c.Op = op
 	switch op {
@@ -819,6 +836,23 @@ func parseInList(raw string) ([]string, *pgerr.APIError) {
 	return out, nil
 }
 
+// ftsVariant maps a full-text operator token to its IR variant. The four tokens
+// share the single OpFTS op and differ only in the query grammar a backend lowers
+// them to (spec 21).
+func ftsVariant(tok string) (FTSVariant, bool) {
+	switch tok {
+	case "fts":
+		return FTSPlain, true
+	case "plfts":
+		return FTSPlainText, true
+	case "phfts":
+		return FTSPhrase, true
+	case "wfts":
+		return FTSWeb, true
+	}
+	return 0, false
+}
+
 // opFromToken maps a query-string operator token to an Op.
 func opFromToken(tok string) (Op, bool) {
 	switch tok {
@@ -848,8 +882,6 @@ func opFromToken(tok string) (Op, bool) {
 		return OpIs, true
 	case "isdistinct":
 		return OpIsDistinct, true
-	case "fts", "plfts", "phfts", "wfts":
-		return OpFTS, true
 	case "cs":
 		return OpContains, true
 	case "cd":
