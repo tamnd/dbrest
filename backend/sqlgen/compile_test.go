@@ -424,6 +424,20 @@ func TestCompileInsertEmptyPayloadRejected(t *testing.T) {
 	}
 }
 
+// The base SQL compiler does not lower the array and range operators; a backend
+// grades them per dialect. A read using one here reports PGRST127 and names the
+// operator, rather than emitting a quietly different predicate.
+func TestCompileRangeOperatorRejectedNamed(t *testing.T) {
+	where := ir.Cond(ir.Compare{Path: []string{"period"}, Op: ir.OpRangeSL, Value: ir.Value{Text: "[1,2)"}})
+	_, err := CompileRead(stub{}, &ir.Query{Relation: ir.Ref{Name: "t"}, Where: &where})
+	if err == nil || err.Code != "PGRST127" {
+		t.Fatalf("want PGRST127, got %v", err)
+	}
+	if err.Details == nil || !strings.Contains(*err.Details, "sl") {
+		t.Errorf("details = %v, want it to name the sl operator", err.Details)
+	}
+}
+
 func TestCompileAggregateRejected(t *testing.T) {
 	_, err := CompileRead(stub{}, &ir.Query{
 		Relation: ir.Ref{Name: "t"},
