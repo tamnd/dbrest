@@ -76,7 +76,13 @@ func openBackend(cfg *config.Config) (backend.Backend, error) {
 			return nil, fmt.Errorf("open database: %w", err)
 		}
 		return be, nil
-	case config.BackendPostgres, config.BackendMySQL, config.BackendSQLServer, config.BackendMongoDB:
+	case config.BackendPostgres:
+		// The PostgreSQL SQL dialect and capability profile have landed
+		// (backend/postgres), but the pgx data plane (Execute, introspection) is a
+		// separate slice that needs a live server to test, so postgres is not yet
+		// runnable from this binary. Selecting it is a clear startup error.
+		return nil, fmt.Errorf("db-backend %q has its dialect but no runnable data plane yet; only sqlite is available", cfg.Backend)
+	case config.BackendMySQL, config.BackendSQLServer, config.BackendMongoDB:
 		return nil, fmt.Errorf("db-backend %q is not built into this binary yet; only sqlite is available", cfg.Backend)
 	default:
 		return nil, fmt.Errorf("db-backend %q is unknown", cfg.Backend)
