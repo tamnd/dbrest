@@ -54,3 +54,15 @@ jobs:
           check-latest: true
       - name: Run benchmarks once
         run: go test -run '^$' -bench . -benchtime 1x ./...
+
+  conformance:
+    name: Conformance (sqlite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+      - name: Replay the corpus and check the matrix
+        run: go run ./cmd/dbrest-conformance --backend sqlite

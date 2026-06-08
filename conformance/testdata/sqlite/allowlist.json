@@ -1,0 +1,23 @@
+{
+  "backend": "sqlite",
+  "entries": [
+    {
+      "feature": "fts",
+      "backend": "sqlite",
+      "tier": "N",
+      "request": "/films?title=fts.metropolis",
+      "expected": "same row set as golden; an fts filter over a covering FTS5 index lowers to MATCH",
+      "reason": "SQLite FTS5 serves the four full-text operators against the shadow index",
+      "matrix_id": "FullText[sqlite]"
+    },
+    {
+      "feature": "array-contains",
+      "backend": "sqlite",
+      "tier": "U",
+      "request": "/films?title=cs.{a}",
+      "expected": "PGRST127, status 400, details naming feature and backend",
+      "reason": "SQLite has no array or range types, so the array operators are unsupported",
+      "matrix_id": "ArrayRangeTypes[sqlite]"
+    }
+  ]
+}
