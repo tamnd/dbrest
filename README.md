@@ -38,10 +38,11 @@ Early, and built subsystem by subsystem against a complete design spec. What wor
 - **Full-text and regex operators**: `fts`/`plfts`/`phfts`/`wfts` and `match`/`imatch`, parsed identically on every backend (the parenthesized `fts(english)` config is read as a language, not a quantifier). On SQLite a full-text filter lowers to an FTS5 `MATCH` against the virtual table that shadows the column, with the FTS5 table and its shadow tables hidden from the exposed schema; a column with no covering FTS5 index is a clean `PGRST127` rather than a silent substring scan. Regex lowers to a registered RE2 `regexp()`, and a pattern using a feature RE2 lacks (a backreference, lookaround) is rejected up front with `PGRST127` instead of failing inside the engine.
 - **OpenAPI root**: `GET /` returns the self-describing Swagger 2.0 document PostgREST emits (`application/openapi+json`), built from the schema model and the function registry: a path and definition per relation, the read/write operation set, `/rpc/<fn>` paths by volatility, primary-key and foreign-key notes, and a JWT security scheme when auth is configured. Each column advertises only the filter operators the active backend can actually serve, consulting the capability matrix, so the document never promises a feature the next request would reject. `openapi-mode=disabled` turns the root off; `openapi-server-proxy-uri` rewrites the advertised host and base path for service behind a reverse proxy.
 - **Configuration**: a flat PostgREST-style config file (`key = "value"`, comments, triple-quoted multi-line values) layered with the environment, where the environment overrides the file key by key. Every option is settable under the PostgREST `PGRST_*` spelling, so an existing deployment's environment keeps working, and the native `DBREST_*` spelling, which wins when both are present. `db-backend` selects the engine (only `sqlite` is built in today; another known engine is a clear startup error, an unknown one a validation error), `db-uri` carries the connection string, and the file types and validates the full option surface (ports and modes are range- and enum-checked, an unknown key fails loudly) before the server starts. The command takes a single `-config` path and otherwise reads the environment.
+- **Conformance harness**: a differential test harness that replays one neutral request corpus against a subject and a golden reference and compares the responses after normalization (canonical JSON, unordered object keys, set-versus-sequence row comparison driven by whether the request pins `order`, volatile-field masking by JSON pointer, transport headers dropped, the contractual headers and the four-key error envelope compared exactly). A capability-aware allowlist is the ledger of every documented divergence, and an allowlist tier that disagrees with the live capability matrix is a build failure. The matrix is made executable: a Native or Emulated feature must reproduce the golden response, and an Unsupported one must return `PGRST127` rather than a wrong answer, checked against the live SQLite subject. `go run ./cmd/dbrest-conformance --backend sqlite` reproduces a pass locally; CI runs it as a gating job. The golden side is currently a checked-in recorded corpus (the form captured PostgREST responses take); the live PostgreSQL-plus-PostgREST capture lands with the container CI matrix.
 - A shared **IR-to-SQL compiler** parameterized by a per-engine `Dialect`, with every value bound and every identifier quoted.
 - **Introspection** into the unified schema model and a planner that validates names and binds them.
 
-The capability model, the backend SPI, and the error envelope are in place. The conformance harness and the PostgreSQL/MySQL/SQL Server/MongoDB backends are on the roadmap and land against the same SPI.
+The capability model, the backend SPI, and the error envelope are in place. The PostgreSQL/MySQL/SQL Server/MongoDB backends are on the roadmap and land against the same SPI; each joins the conformance harness by adding its fixture and a CI job, with no harness changes.
 
 ## Quick start
 
@@ -103,7 +104,9 @@ Flat packages, no `internal/`, no `/vN` suffixes.
 | `httpapi` | The HTTP frontend: router, read and write pipelines, PostgREST-shaped renderer. |
 | `config` | The file and environment loader: the PostgREST option surface, the `PGRST_*`/`DBREST_*` env spellings, typing and validation. |
 | `openapi` | The Swagger 2.0 generator behind the `GET /` root. |
+| `conformance` | The differential harness: the neutral corpus, response normalization and comparison, the capability-aware allowlist, and the matrix and capability self-consistency checks. |
 | `cmd/dbrest` | The server entry point. |
+| `cmd/dbrest-conformance` | The local conformance runner (`--backend sqlite`). |
 
 ## Development
 
@@ -112,6 +115,8 @@ go test ./...                  # unit + end-to-end tests
 go test ./... -race            # with the race detector
 go test ./httpapi/ -bench .    # request benchmarks
 go vet ./...
+
+go run ./cmd/dbrest-conformance --backend sqlite   # replay the conformance corpus
 ```
 
 The SQLite backend is cgo-free, so the whole suite runs anywhere Go runs, with no database to install.

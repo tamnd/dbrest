@@ -1,0 +1,68 @@
+[
+  {
+    "name": "every column, all rows, ordered",
+    "request": { "method": "GET", "path": "/films", "query": "order=id.asc" },
+    "golden": {
+      "status": 200,
+      "body": "[{\"id\":1,\"title\":\"Metropolis\",\"year\":1927,\"rating\":\"NR\"},{\"id\":2,\"title\":\"Blade Runner\",\"year\":1982,\"rating\":\"R\"},{\"id\":3,\"title\":\"Arrival\",\"year\":2016,\"rating\":\"PG13\"}]"
+    }
+  },
+  {
+    "name": "single row by id",
+    "request": { "method": "GET", "path": "/films", "query": "id=eq.1" },
+    "golden": {
+      "status": 200,
+      "body": "[{\"id\":1,\"title\":\"Metropolis\",\"year\":1927,\"rating\":\"NR\"}]"
+    }
+  },
+  {
+    "name": "projection and filter",
+    "request": { "method": "GET", "path": "/films", "query": "select=title,year&year=gte.2000&order=year.asc" },
+    "golden": {
+      "status": 200,
+      "body": "[{\"title\":\"Arrival\",\"year\":2016}]"
+    }
+  },
+  {
+    "name": "empty match is an empty array, not a 404",
+    "request": { "method": "GET", "path": "/films", "query": "id=eq.999" },
+    "golden": { "status": 200, "body": "[]" }
+  },
+  {
+    "name": "unknown table is a PGRST205 envelope",
+    "request": { "method": "GET", "path": "/ghosts" },
+    "golden": {
+      "status": 404,
+      "body": "{\"code\":\"PGRST205\",\"message\":\"\",\"details\":\"\",\"hint\":\"\"}"
+    },
+    "mask": ["/message", "/details", "/hint"]
+  },
+  {
+    "name": "full-text filter lowers to FTS5 MATCH",
+    "feature": "fts",
+    "request": { "method": "GET", "path": "/films", "query": "title=fts.metropolis" },
+    "golden": {
+      "status": 200,
+      "body": "[{\"id\":1,\"title\":\"Metropolis\",\"year\":1927,\"rating\":\"NR\"}]"
+    }
+  },
+  {
+    "name": "regex filter lowers to RE2 regexp",
+    "feature": "regex",
+    "request": { "method": "GET", "path": "/films", "query": "title=match.^Bl&order=id.asc" },
+    "golden": {
+      "status": 200,
+      "body": "[{\"id\":2,\"title\":\"Blade Runner\",\"year\":1982,\"rating\":\"R\"}]"
+    }
+  },
+  {
+    "name": "array-contains is unsupported and returns PGRST127",
+    "feature": "array-contains",
+    "request": { "method": "GET", "path": "/films", "query": "title=cs.{a}" },
+    "golden": {
+      "status": 400,
+      "body": "{\"code\":\"PGRST127\",\"message\":\"\",\"details\":\"\",\"hint\":\"\"}"
+    },
+    "mask": ["/message", "/details", "/hint"]
+  }
+]
