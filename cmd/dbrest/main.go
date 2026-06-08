@@ -84,7 +84,12 @@ func openBackend(cfg *config.Config) (backend.Backend, error) {
 		// Selecting one is a clear startup error.
 		return nil, fmt.Errorf("db-backend %q has its dialect but no runnable data plane yet; only sqlite is available", cfg.Backend)
 	case config.BackendMongoDB:
-		return nil, fmt.Errorf("db-backend %q is not built into this binary yet; only sqlite is available", cfg.Backend)
+		// The MongoDB filter-to-query-document lowering, read-pipeline assembly, and
+		// topology-computed capabilities have landed (backend/mongo), but the live
+		// driver data plane (the mongo.Client, $lookup/$graphLookup embedding, writes,
+		// and sampling-based introspection) needs a running server to test and is a
+		// separate slice. Selecting it is a clear startup error.
+		return nil, fmt.Errorf("db-backend %q has its query lowering but no runnable data plane yet; only sqlite is available", cfg.Backend)
 	default:
 		return nil, fmt.Errorf("db-backend %q is unknown", cfg.Backend)
 	}
