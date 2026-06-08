@@ -42,7 +42,7 @@ Early, and built subsystem by subsystem against a complete design spec. What wor
 - A shared **IR-to-SQL compiler** parameterized by a per-engine `Dialect`, with every value bound and every identifier quoted.
 - **Introspection** into the unified schema model and a planner that validates names and binds them.
 
-The capability model, the backend SPI, and the error envelope are in place. The PostgreSQL dialect and its version-computed capabilities have landed (`backend/postgres`), the reference oracle the conformance harness diffs against; its pgx data plane is a follow-on slice, since it needs a live server to test. The MySQL, SQL Server, and MongoDB backends are on the roadmap and land against the same SPI; each joins the conformance harness by adding its fixture and a CI job, with no harness changes.
+The capability model, the backend SPI, and the error envelope are in place. The PostgreSQL dialect and its version-computed capabilities have landed (`backend/postgres`), the reference oracle the conformance harness diffs against. The MySQL/MariaDB dialect has landed too (`backend/mysql`), the first real divergence from the oracle: an explicit IS NULL sort key for NULL placement, a no-conflict-target upsert with a no-op ignore, restricted CAST targets, `REGEXP_LIKE`, and MATCH/AGAINST boolean-mode full text. Each driver data plane (Execute and introspection over a live server) is a follow-on slice, since it needs a running database to test. The SQL Server and MongoDB backends are on the roadmap and land against the same SPI; each joins the conformance harness by adding its fixture and a CI job, with no harness changes.
 
 ## Quick start
 
@@ -99,6 +99,7 @@ Flat packages, no `internal/`, no `/vN` suffixes.
 | `backend/sqlgen` | The single IR-to-SQL compiler, parameterized by a `Dialect`. |
 | `backend/sqlite` | The SQLite reference backend (pure-Go [modernc.org/sqlite](https://modernc.org/sqlite), cgo-free). |
 | `backend/postgres` | The PostgreSQL dialect and its version-computed capabilities (the reference oracle). The pgx data plane is a follow-on slice. |
+| `backend/mysql` | The MySQL/MariaDB dialect and capabilities: the IS NULL sort key, the no-conflict-target upsert, restricted casts, `REGEXP_LIKE`, and MATCH/AGAINST full text. The driver data plane is a follow-on slice. |
 | `auth` | Stateless JWT verification, role resolution, and the bounded SIEVE verification cache. |
 | `authz` | The privilege and RLS registry: the column gate and the unbypassable policy injection. |
 | `reqctx` | The per-request context handed to a backend (role, claims, headers, cookies, schema, and response controls). |
