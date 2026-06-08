@@ -472,7 +472,9 @@ func (s *Server) writeWrite(w http.ResponseWriter, r *http.Request, q *ir.Query,
 //   - PATCH/DELETE without representation: 204 No Content.
 func writeStatus(method string, kind ir.QueryKind, representation bool, ctrl *reqctx.ResponseControls) int {
 	if method == http.MethodPost {
-		if kind == ir.Upsert && ctrl != nil && !ctrl.UpsertInsert {
+		// When the backend has determined that the upsert hit at least one existing
+		// row (ON CONFLICT UPDATE fired), return 200. Otherwise return 201.
+		if kind == ir.Upsert && ctrl != nil && ctrl.UpsertStatusKnown && !ctrl.UpsertInsert {
 			return http.StatusOK
 		}
 		return http.StatusCreated

@@ -105,9 +105,11 @@ func TestGetSelectFilterOrder(t *testing.T) {
 
 func TestGetPaginationPartial(t *testing.T) {
 	srv := newServer(t)
+	// PostgREST v14: ?limit= without count=exact returns 200, not 206.
+	// 206 only when count=exact confirms the window is partial.
 	resp := do(t, srv, http.MethodGet, "/films?order=id&limit=2", nil)
-	if resp.StatusCode != http.StatusPartialContent {
-		t.Fatalf("status = %d, want 206", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 	if cr := resp.Header.Get("Content-Range"); cr != "0-1/*" {
 		t.Errorf("Content-Range = %q, want 0-1/*", cr)
@@ -271,19 +273,33 @@ func send(t *testing.T, srv *httpapi.Server, method, target, body string, header
 	return rec.Result()
 }
 
-func TestPostInsertMinimalIs201WithLocation(t *testing.T) {
+func TestPostInsertMinimalIs201WithoutLocation(t *testing.T) {
 	srv := newServer(t)
+	// PostgREST v14: minimal insert (no Prefer) returns 201 with no Location header.
 	resp := send(t, srv, http.MethodPost, "/films", `{"id":5,"title":"Dune","year":2021}`, nil)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("status = %d, want 201", resp.StatusCode)
 	}
-	if loc := resp.Header.Get("Location"); loc != "/films?id=eq.5" {
-		t.Errorf("Location = %q, want /films?id=eq.5", loc)
+	if loc := resp.Header.Get("Location"); loc != "" {
+		t.Errorf("Location = %q, want empty for minimal insert", loc)
 	}
-	// Minimal: no body.
 	buf := make([]byte, 1)
 	if n, _ := resp.Body.Read(buf); n != 0 {
 		t.Error("minimal insert should have no body")
+	}
+}
+
+func TestPostInsertHeadersOnlyIs201WithLocation(t *testing.T) {
+	srv := newServer(t)
+	// PostgREST v14: return=headers-only sets the Location header.
+	resp := send(t, srv, http.MethodPost, "/films",
+		`{"id":6,"title":"Dune2","year":2024}`,
+		map[string]string{"Prefer": "return=headers-only"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "/films?id=eq.6" {
+		t.Errorf("Location = %q, want /films?id=eq.6", loc)
 	}
 }
 

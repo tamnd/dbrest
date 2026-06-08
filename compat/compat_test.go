@@ -257,10 +257,11 @@ var cases = []compatCase{
 		headers:    map[string]string{"Content-Type": "application/json", "Prefer": "return=representation"},
 		body:       `{"done":true}`,
 		wantStatus: 200},
+	// RETURNING order for bulk updates is unspecified; check status only.
 	{name: "11.4 bulk update 200", method: "PATCH", path: "/todos?done=eq.false",
 		headers:    map[string]string{"Content-Type": "application/json", "Prefer": "return=representation"},
 		body:       `{"done":false}`,
-		wantStatus: 200, bodyMode: "schema"},
+		wantStatus: 200, bodyMode: "status"},
 
 	// ── Group 12: Deletes ─────────────────────────────────────────────────
 	{name: "12.1 delete minimal 204", method: "DELETE", path: "/todos?id=gt.9000",
@@ -483,6 +484,7 @@ func TestCompatibility(t *testing.T) {
 // easy to spot without reading individual failure messages.
 func TestCompatSummary(t *testing.T) {
 	pgrest, dbrest := urls(t)
+	resetTestDB(t, pgrest, dbrest)
 	var passed, failed int
 
 	for _, c := range cases {
@@ -528,16 +530,12 @@ func TestPerformanceComparison(t *testing.T) {
 		t.Skip("performance comparison skipped in short mode")
 	}
 
-	type bench struct {
-		label string
-		url   string
-	}
 	benches := []struct {
-		name    string
-		path    string
-		accept  string
-		warmup  int
-		n       int
+		name   string
+		path   string
+		accept string
+		warmup int
+		n      int
 	}{
 		{"GET /todos (simple)", "/todos?order=id", "application/json", 50, 500},
 		{"GET /todos?select=id,task", "/todos?select=id,task&order=id", "application/json", 50, 500},

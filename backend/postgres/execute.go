@@ -102,12 +102,13 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 	// an INSERT from an ON CONFLICT UPDATE and set the 201/200 status correctly.
 	isUpsert := q.Kind == ir.Upsert
 	xmaxIdx := -1
-	var returningForSQL []string
+	returningForSQL := returning
 	if isUpsert {
 		xmaxIdx = len(returning)
-		returningForSQL = append(returning, "xmax")
-	} else {
-		returningForSQL = returning
+		tmp := make([]string, len(returning)+1)
+		copy(tmp, returning)
+		tmp[len(returning)] = "xmax"
+		returningForSQL = tmp
 	}
 
 	st, apiErr := compileWrite(q, returningForSQL)
@@ -164,9 +165,8 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 			}
 			buf = cleaned
 			cols = append(cols[:xmaxIdx], cols[xmaxIdx+1:]...)
-			if allInsert {
-				res.controls.UpsertInsert = true
-			}
+			res.controls.UpsertStatusKnown = true
+			res.controls.UpsertInsert = allInsert
 		}
 		res.cols, res.rows = cols, buf
 		res.affected, res.hasAff = int64(len(buf)), true

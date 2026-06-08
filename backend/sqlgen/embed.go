@@ -174,10 +174,13 @@ func (b *builder) writeEmbed(emb *ir.Embed, parentAlias string) *pgerr.APIError 
 
 	// to-many: aggregate per-row objects into a JSON array. COALESCE wraps the
 	// aggregate so that a parent row with no matching children returns [] instead
-	// of NULL, matching PostgREST's behavior.
+	// of NULL, matching PostgREST's behavior. The empty-array literal is cast via
+	// the dialect so it works across engines (PG: '[]'::json, SQLite: json('[]')).
 	b.sb.WriteString("(SELECT COALESCE(")
 	b.sb.WriteString(b.d.JSONAgg(b.d.Cast(`je."__e"`, "json"), ""))
-	b.sb.WriteString(", '[]'::json)")
+	b.sb.WriteString(", ")
+	b.sb.WriteString(b.d.Cast("'[]'", "json"))
+	b.sb.WriteString(")")
 	b.sb.WriteString(" FROM (SELECT ")
 	b.sb.WriteString(obj)
 	b.sb.WriteString(` AS "__e" FROM `)

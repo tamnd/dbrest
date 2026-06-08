@@ -43,7 +43,7 @@ func TestBinaryOp(t *testing.T) {
 		{ir.OpLt, "<"},
 		{ir.OpLte, "<="},
 		{ir.OpLike, "LIKE"},
-		{ir.OpILike, "LIKE"},
+		{ir.OpILike, "ILIKE"},
 		{ir.OpIn, "="}, // not an infix op: the default arm falls back to equality
 	}
 	for _, c := range cases {
