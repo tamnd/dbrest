@@ -244,10 +244,13 @@ func (b *builder) writeConflict(w *ir.WriteSpec) *pgerr.APIError {
 	for _, t := range w.Conflict.Target {
 		spec.Target = append(spec.Target, b.d.QuoteIdent(t))
 	}
-	if !spec.Ignore {
-		for _, c := range w.Columns {
-			spec.Update = append(spec.Update, b.d.QuoteIdent(c))
-		}
+	// Update carries the payload columns for both resolutions. A merge sets each
+	// to its excluded value; an ignore on an engine whose ignore form is a no-op
+	// update (MySQL's ON DUPLICATE KEY UPDATE col = col) needs the same columns.
+	// Engines that spell ignore as a distinct clause (PostgreSQL/SQLite DO
+	// NOTHING) read Ignore first and never look at Update, so passing it is inert.
+	for _, c := range w.Columns {
+		spec.Update = append(spec.Update, b.d.QuoteIdent(c))
 	}
 	clause, err := b.d.Upsert(spec)
 	if err != nil {
