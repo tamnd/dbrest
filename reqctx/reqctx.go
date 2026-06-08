@@ -117,6 +117,9 @@ type ResponseControls struct {
 	Status int
 	// Headers are extra response headers to merge in.
 	Headers map[string]string
+	// UpsertInsert is set by the backend when an upsert resulted in a pure INSERT
+	// (all rows were new). The HTTP layer uses this to return 201 vs 200.
+	UpsertInsert bool
 }
 
 // Controls returns a pointer to the mutable response controls.

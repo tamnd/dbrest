@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 
@@ -97,13 +98,25 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 	q := plan.Query
 	returning := returningCols(q, plan.Rel)
 
-	st, apiErr := compileWrite(q, returning)
+	// For upserts, append xmax to the RETURNING list so we can distinguish
+	// an INSERT from an ON CONFLICT UPDATE and set the 201/200 status correctly.
+	isUpsert := q.Kind == ir.Upsert
+	xmaxIdx := -1
+	var returningForSQL []string
+	if isUpsert {
+		xmaxIdx = len(returning)
+		returningForSQL = append(returning, "xmax")
+	} else {
+		returningForSQL = returning
+	}
+
+	st, apiErr := compileWrite(q, returningForSQL)
 	if apiErr != nil {
 		return nil, apiErr
 	}
 
 	res := &bufResult{controls: rc.Controls()}
-	if len(returning) > 0 {
+	if len(returningForSQL) > 0 {
 		rows, err := tx.Query(ctx, st.SQL, st.Args...)
 		if err != nil {
 			return nil, b.MapError(err)
@@ -112,6 +125,48 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 		buf, err := drainRows(rows)
 		if err != nil {
 			return nil, b.MapError(err)
+		}
+		// Strip the xmax column from the result and use it to decide insert/update status.
+		if isUpsert && xmaxIdx >= 0 && xmaxIdx < len(cols) {
+			allInsert := true
+			cleaned := make([][]any, len(buf))
+			for i, row := range buf {
+				// Check if xmax indicates an update (non-zero value means the row
+				// existed before and was updated via ON CONFLICT DO UPDATE).
+				if xmaxIdx < len(row) {
+					switch xv := row[xmaxIdx].(type) {
+					case []byte:
+						if string(xv) != "0" && string(xv) != "" {
+							allInsert = false
+						}
+					case string:
+						if xv != "0" && xv != "" {
+							allInsert = false
+						}
+					case int64:
+						if xv != 0 {
+							allInsert = false
+						}
+					case uint32:
+						if xv != 0 {
+							allInsert = false
+						}
+					}
+				}
+				// Remove the xmax column from the row.
+				r := make([]any, 0, len(row)-1)
+				for j, v := range row {
+					if j != xmaxIdx {
+						r = append(r, v)
+					}
+				}
+				cleaned[i] = r
+			}
+			buf = cleaned
+			cols = append(cols[:xmaxIdx], cols[xmaxIdx+1:]...)
+			if allInsert {
+				res.controls.UpsertInsert = true
+			}
 		}
 		res.cols, res.rows = cols, buf
 		res.affected, res.hasAff = int64(len(buf)), true
@@ -141,7 +196,15 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 // function runs in a read-write transaction that commits (or rolls back under
 // Prefer: tx=rollback) so its side effects persist.
 func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Context) (backend.Result, error) {
-	st, apiErr := sqlgen.CompileCall(Dialect{}, plan.Call, plan.Func)
+	var (
+		st     *sqlgen.Statement
+		apiErr *pgerr.APIError
+	)
+	if plan.Func != nil {
+		st, apiErr = sqlgen.CompileCall(Dialect{}, plan.Call, plan.Func)
+	} else {
+		st, apiErr = b.compileNativeCall(plan.Call)
+	}
 	if apiErr != nil {
 		return nil, apiErr
 	}
@@ -164,6 +227,7 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 	if err != nil {
 		return nil, b.MapError(err)
 	}
+	isVoid := isVoidResult(rows)
 	cols := fieldNames(rows)
 	buf, err := drainRows(rows)
 	if err != nil {
@@ -173,6 +237,11 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 	res := &bufResult{cols: cols, rows: buf, controls: rc.Controls()}
 	if err := readResponseControls(ctx, tx, res.controls); err != nil {
 		return nil, b.MapError(err)
+	}
+	// Void-returning functions produce no meaningful body; signal 204 to the
+	// HTTP layer unless the function already set a status override via GUC.
+	if isVoid && res.controls.Status == 0 {
+		res.controls.Status = 204
 	}
 
 	if plan.Call.Prefer.Tx != nil && *plan.Call.Prefer.Tx == ir.TxRollback {
@@ -223,6 +292,42 @@ func (b *Backend) executeCallRead(ctx context.Context, plan *ir.Plan, rc *reqctx
 	return res, nil
 }
 
+// compileNativeCall generates the PostgreSQL function-call SQL for the native
+// RPC path (NativeRPC=true), where there is no declared function registry. It
+// renders SELECT * FROM schema.fn(arg := $1, ...) using the search path's first
+// schema as the function schema. Arguments come from the call's parsed arg map;
+// they are bound as named parameters (fn_name := $N) which is how PostgREST
+// calls PG functions. When no args are supplied the call has an empty arg list.
+func (b *Backend) compileNativeCall(c *ir.Call) (*sqlgen.Statement, *pgerr.APIError) {
+	schema := "public"
+	if len(b.searchPath) > 0 {
+		schema = b.searchPath[0]
+	}
+
+	d := Dialect{}
+	var sb strings.Builder
+	sb.WriteString("SELECT * FROM ")
+	sb.WriteString(d.QuoteIdent(schema))
+	sb.WriteString(".")
+	sb.WriteString(d.QuoteIdent(c.Function.Name))
+	sb.WriteString("(")
+
+	args := make([]any, 0, len(c.Args))
+	i := 0
+	for name, val := range c.Args {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString(d.QuoteIdent(name))
+		sb.WriteString(" := ")
+		sb.WriteString(d.Placeholder(i + 1))
+		args = append(args, val.Text)
+		i++
+	}
+	sb.WriteString(")")
+	return &sqlgen.Statement{SQL: sb.String(), Args: args}, nil
+}
+
 // compileWrite dispatches to the right compiler for the mutation kind.
 func compileWrite(q *ir.Query, returning []string) (*sqlgen.Statement, *pgerr.APIError) {
 	switch q.Kind {
@@ -254,6 +359,14 @@ func returningCols(q *ir.Query, rel *schema.Relation) []string {
 	return nil
 }
 
+// isVoidResult reports whether the pgx result represents a void-returning function.
+// PostgreSQL void has OID 2278; a SELECT * FROM void_fn() returns exactly one column
+// with that OID and value null.
+func isVoidResult(rows pgx.Rows) bool {
+	fields := rows.FieldDescriptions()
+	return len(fields) == 1 && fields[0].DataTypeOID == 2278
+}
+
 // fieldNames extracts column names from pgx.Rows without advancing the cursor.
 func fieldNames(rows pgx.Rows) []string {
 	descs := rows.FieldDescriptions()
@@ -265,17 +378,18 @@ func fieldNames(rows pgx.Rows) []string {
 }
 
 // drainRows reads every row of a pgx cursor into memory, normalizing values so
-// json/jsonb and bytea render correctly. The rows are closed by drainRows; the
-// caller must not close them again.
+// json/jsonb, bytea, and date columns render correctly. The rows are closed by
+// drainRows; the caller must not close them again.
 func drainRows(rows pgx.Rows) ([][]any, error) {
 	defer rows.Close()
+	fields := rows.FieldDescriptions()
 	var out [][]any
 	for rows.Next() {
 		vals, err := rows.Values()
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, normalizeValues(vals))
+		out = append(out, normalizeValues(vals, fields))
 	}
 	return out, rows.Err()
 }

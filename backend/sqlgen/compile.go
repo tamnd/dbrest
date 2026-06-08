@@ -562,7 +562,7 @@ func binaryOp(op ir.Op) string {
 	case ir.OpLike:
 		return "LIKE"
 	case ir.OpILike:
-		return "LIKE" // case-insensitivity handled by dialect collation in later work
+		return "ILIKE"
 	default:
 		return "="
 	}

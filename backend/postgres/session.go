@@ -66,7 +66,8 @@ func applySession(ctx context.Context, tx pgx.Tx, b *Backend, rc *reqctx.Context
 func readResponseControls(ctx context.Context, tx pgx.Tx, controls *reqctx.ResponseControls) error {
 	var status, headers string
 	err := tx.QueryRow(ctx,
-		"SELECT current_setting('response.status', true), current_setting('response.headers', true)",
+		"SELECT COALESCE(current_setting('response.status', true), ''),"+
+			" COALESCE(current_setting('response.headers', true), '')",
 	).Scan(&status, &headers)
 	if err != nil {
 		return err

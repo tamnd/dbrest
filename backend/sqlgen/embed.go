@@ -172,11 +172,12 @@ func (b *builder) writeEmbed(emb *ir.Embed, parentAlias string) *pgerr.APIError 
 		return nil
 	}
 
-	// to-many: aggregate per-row objects into a JSON array. The inner subquery is
-	// where filtering, ordering, and the embed window apply; the outer wrapper
-	// only folds the array, re-parsing each object so it nests as JSON.
-	b.sb.WriteString("(SELECT ")
+	// to-many: aggregate per-row objects into a JSON array. COALESCE wraps the
+	// aggregate so that a parent row with no matching children returns [] instead
+	// of NULL, matching PostgREST's behavior.
+	b.sb.WriteString("(SELECT COALESCE(")
 	b.sb.WriteString(b.d.JSONAgg(b.d.Cast(`je."__e"`, "json"), ""))
+	b.sb.WriteString(", '[]'::json)")
 	b.sb.WriteString(" FROM (SELECT ")
 	b.sb.WriteString(obj)
 	b.sb.WriteString(` AS "__e" FROM `)

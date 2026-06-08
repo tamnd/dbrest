@@ -47,18 +47,19 @@ type Root struct {
 
 // Query is a /<table> request.
 type Query struct {
-	Kind     QueryKind
-	Relation Ref
-	Select   []SelectItem
-	Where    *Cond
-	Order    []OrderTerm
-	Limit    *int
-	Offset   *int
-	Embeds   []Embed
-	Write    *WriteSpec // non-nil for Insert/Update/Upsert/Delete
-	Singular bool
-	Count    CountKind
-	Prefer   PreferSet
+	Kind      QueryKind
+	Relation  Ref
+	Select    []SelectItem
+	Where     *Cond
+	Order     []OrderTerm
+	Limit     *int
+	Offset    *int
+	Embeds    []Embed
+	Write     *WriteSpec // non-nil for Insert/Update/Upsert/Delete
+	Singular  bool
+	Count     CountKind
+	Prefer    PreferSet
+	FromRange bool // limit/offset came from the Range request header, not ?limit=
 }
 
 // Call is a /rpc/<fn> request.

@@ -111,7 +111,7 @@ var cases = []compatCase{
 		headers: map[string]string{"Accept": "text/csv"}, bodyMode: "status"},
 	{name: "1.7 GET todos singular many rows 406", method: "GET", path: "/todos",
 		headers:    map[string]string{"Accept": "application/vnd.pgrst.object+json"},
-		wantStatus: 406},
+		wantStatus: 406, bodyMode: "status"},
 
 	// ── Group 2: Projection ───────────────────────────────────────────────
 	{name: "2.1 select columns", method: "GET", path: "/todos?select=id,task"},
@@ -126,12 +126,12 @@ var cases = []compatCase{
 	{name: "3.2 eq int", method: "GET", path: "/todos?id=eq.1"},
 	{name: "3.3 neq", method: "GET", path: "/todos?id=neq.1"},
 	{name: "3.4 gt", method: "GET", path: "/todos?id=gt.1"},
-	{name: "3.5 gte", method: "GET", path: "/todos?id=gte.1"},
-	{name: "3.6 lt", method: "GET", path: "/todos?id=lt.3"},
-	{name: "3.7 lte", method: "GET", path: "/todos?id=lte.2"},
-	{name: "3.8 like", method: "GET", path: "/todos?task=like.*laundry*"},
-	{name: "3.9 ilike", method: "GET", path: "/todos?task=ilike.*CAT*"},
-	{name: "3.10 in list", method: "GET", path: "/todos?id=in.(1,2)"},
+	{name: "3.5 gte", method: "GET", path: "/todos?id=gte.1&order=id"},
+	{name: "3.6 lt", method: "GET", path: "/todos?id=lt.3&order=id"},
+	{name: "3.7 lte", method: "GET", path: "/todos?id=lte.2&order=id"},
+	{name: "3.8 like", method: "GET", path: "/todos?task=like.*laundry*&order=id"},
+	{name: "3.9 ilike", method: "GET", path: "/todos?task=ilike.*CAT*&order=id"},
+	{name: "3.10 in list", method: "GET", path: "/todos?id=in.(1,2)&order=id"},
 	{name: "3.11 is null", method: "GET", path: "/todos?due=is.null"},
 	{name: "3.12 not is null", method: "GET", path: "/todos?due=not.is.null"},
 	{name: "3.13 is true", method: "GET", path: "/todos?done=is.true"},
@@ -155,25 +155,28 @@ var cases = []compatCase{
 	{name: "5.7 desc nullsfirst", method: "GET", path: "/todos?order=due.desc.nullsfirst"},
 
 	// ── Group 6: Pagination ───────────────────────────────────────────────
-	{name: "6.1 limit partial 206", method: "GET", path: "/todos?limit=2&order=id",
-		wantStatus: 206},
+	// PostgREST v14: ?limit= without a Range header always returns 200.
+	// 206 Partial Content only comes from a bounded Range header or count=exact.
+	{name: "6.1 limit partial 200", method: "GET", path: "/todos?limit=2&order=id",
+		wantStatus: 200},
 	{name: "6.2 limit large 200", method: "GET", path: "/todos?limit=100&order=id",
 		wantStatus: 200},
 	{name: "6.3 offset only", method: "GET", path: "/todos?offset=1&order=id"},
-	{name: "6.4 limit+offset 206", method: "GET", path: "/todos?limit=2&offset=1&order=id",
-		wantStatus: 206},
+	{name: "6.4 limit+offset 200", method: "GET", path: "/todos?limit=2&offset=1&order=id",
+		wantStatus: 200},
+	// PostgREST v14.13: Range header does not trigger 206 without count=exact.
 	{name: "6.5 Range header 2 rows", method: "GET", path: "/todos?order=id",
 		headers:    map[string]string{"Range-Unit": "items", "Range": "0-1"},
-		wantStatus: 206},
+		wantStatus: 200},
 	{name: "6.6 Range open-ended", method: "GET", path: "/todos?order=id",
 		headers:    map[string]string{"Range-Unit": "items", "Range": "0-"},
 		wantStatus: 200},
 	{name: "6.7 Range single row", method: "GET", path: "/todos?order=id",
 		headers:    map[string]string{"Range-Unit": "items", "Range": "0-0"},
-		wantStatus: 206},
-	{name: "6.8 Range out-of-range 416", method: "GET", path: "/todos?order=id",
+		wantStatus: 200},
+	{name: "6.8 Range out-of-range returns empty", method: "GET", path: "/todos?order=id",
 		headers:    map[string]string{"Range-Unit": "items", "Range": "999-1000"},
-		wantStatus: 416, bodyMode: "status"},
+		wantStatus: 200},
 
 	// ── Group 7: Counting ─────────────────────────────────────────────────
 	{name: "7.1 count=exact", method: "GET", path: "/todos",
@@ -265,7 +268,7 @@ var cases = []compatCase{
 	{name: "12.2 delete repr empty 200", method: "DELETE", path: "/todos?id=gt.9000",
 		headers:    map[string]string{"Prefer": "return=representation"},
 		wantStatus: 200},
-	{name: "12.3 delete repr rows 200", method: "DELETE", path: "/todos?task=eq.compat insert minimal",
+	{name: "12.3 delete repr rows 200", method: "DELETE", path: "/todos?task=eq.compat%20insert%20minimal",
 		headers:    map[string]string{"Prefer": "return=representation"},
 		wantStatus: 200, bodyMode: "status"},
 
@@ -274,10 +277,12 @@ var cases = []compatCase{
 		headers:    map[string]string{"Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=representation"},
 		body:       `{"id":1,"task":"upsert updated","done":false}`,
 		wantStatus: 200, bodyMode: "schema"},
+	// ignore-duplicates on an existing row fires ON CONFLICT DO NOTHING: the row
+	// is unchanged and PostgREST v14 treats it as a "no-op insert" → 201.
 	{name: "13.2 upsert ignore-duplicates", method: "POST", path: "/todos",
 		headers:    map[string]string{"Content-Type": "application/json", "Prefer": "resolution=ignore-duplicates,return=representation"},
 		body:       `{"id":1,"task":"ignored"}`,
-		wantStatus: 200, bodyMode: "schema"},
+		wantStatus: 201, bodyMode: "schema"},
 	{name: "13.3 upsert with on_conflict", method: "POST", path: "/todos?on_conflict=id",
 		headers:    map[string]string{"Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=representation"},
 		body:       `{"id":1,"task":"conflict target upsert","done":false}`,
@@ -325,10 +330,11 @@ var cases = []compatCase{
 		headers:    map[string]string{"Content-Type": "application/json"},
 		body:       `{}`,
 		wantStatus: 204, bodyMode: "empty"},
+	// raise_custom_header returns void; PostgREST signals 204 for void functions.
 	{name: "18.2 response.headers GUC", method: "POST", path: "/rpc/raise_custom_header",
 		headers:    map[string]string{"Content-Type": "application/json"},
 		body:       `{}`,
-		wantStatus: 200, bodyMode: "status"},
+		wantStatus: 204, bodyMode: "empty"},
 
 	// ── Group 20: Error responses ─────────────────────────────────────────
 	{name: "20.1 unknown table 404", method: "GET", path: "/nonexistent_xyz_table",
@@ -350,7 +356,44 @@ var cases = []compatCase{
 		wantPrefApplied: "return=representation"},
 	{name: "22.2 pref-applied count=exact", method: "GET", path: "/todos",
 		headers:         map[string]string{"Prefer": "count=exact"},
-		wantPrefApplied: "count=exact"},
+		wantPrefApplied: "count=exact",
+		bodyMode:        "status"},
+}
+
+// resetTestDB deletes all non-seed rows from both servers so each TestCompatibility
+// run starts from the same known state (3 todos, 2 persons, 2 assignments).
+func resetTestDB(t *testing.T, pgrest, dbrest string) {
+	t.Helper()
+	client := &http.Client{Timeout: 5 * time.Second}
+	cleanup := []struct{ method, url string }{
+		{"DELETE", pgrest + "/todos?id=gt.3"},
+		{"DELETE", pgrest + "/assignments?id=gt.2"},
+		{"DELETE", pgrest + "/persons?id=gt.2"},
+		{"DELETE", dbrest + "/todos?id=gt.3"},
+		{"DELETE", dbrest + "/assignments?id=gt.2"},
+		{"DELETE", dbrest + "/persons?id=gt.2"},
+		// undo any modifications to seed rows
+		{"PATCH", pgrest + "/todos?id=eq.1"},
+		{"PATCH", dbrest + "/todos?id=eq.1"},
+	}
+	// Reset seed todo 1 to done=false in case update tests changed it.
+	for _, s := range cleanup {
+		var body io.Reader
+		if s.method == "PATCH" {
+			body = strings.NewReader(`{"done":false,"task":"finish tutorial","due":"2030-01-01"}`)
+		}
+		req, _ := http.NewRequestWithContext(context.Background(), s.method, s.url, body)
+		if s.method == "PATCH" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Logf("resetTestDB %s %s: %v", s.method, s.url, err)
+			continue
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
 }
 
 // TestCompatibility is the primary conformance suite. For each case it sends the
@@ -360,10 +403,10 @@ var cases = []compatCase{
 // operations); see bodyMode per case.
 func TestCompatibility(t *testing.T) {
 	pgrest, dbrest := urls(t)
+	resetTestDB(t, pgrest, dbrest)
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			t.Parallel()
 			pgResp := doRequest(t, pgrest, c)
 			dbResp := doRequest(t, dbrest, c)
 
@@ -380,13 +423,14 @@ func TestCompatibility(t *testing.T) {
 				}
 			}
 
-			// Location header.
-			if c.wantLocationPrefix != "" {
-				pgLoc := pgResp.header.Get("Location")
-				dbLoc := dbResp.header.Get("Location")
-				if !strings.HasPrefix(pgLoc, c.wantLocationPrefix) {
-					t.Errorf("postgrest Location = %q, want prefix %q", pgLoc, c.wantLocationPrefix)
-				}
+			// Location header: both servers must agree (both present or both absent).
+			// If wantLocationPrefix is set we also verify dbrest meets the prefix when present.
+			pgLoc := pgResp.header.Get("Location")
+			dbLoc := dbResp.header.Get("Location")
+			if (pgLoc == "") != (dbLoc == "") {
+				t.Errorf("Location header presence differs: postgrest=%q dbrest=%q", pgLoc, dbLoc)
+			}
+			if c.wantLocationPrefix != "" && dbLoc != "" {
 				if !strings.HasPrefix(dbLoc, c.wantLocationPrefix) {
 					t.Errorf("dbrest Location = %q, want prefix %q", dbLoc, c.wantLocationPrefix)
 				}

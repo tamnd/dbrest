@@ -3,8 +3,11 @@ package postgres
 import (
 	"context"
 	"io"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/tamnd/dbrest/backend"
 	"github.com/tamnd/dbrest/reqctx"
@@ -58,7 +61,7 @@ func (s *streamRows) Values() ([]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return normalizeValues(vals), nil
+	return normalizeValues(vals, s.rows.FieldDescriptions()), nil
 }
 
 // Close releases the cursor and commits the transaction that scoped the role and
@@ -116,12 +119,19 @@ func (s *bufStream) Close() error           { return nil }
 // JSON. json and jsonb arrive as raw bytes; they are turned into strings so the
 // renderer's raw-JSON columns pass them through verbatim rather than base64. A
 // bytea value also arrives as bytes, but its column is not a raw-JSON column, so
-// it renders as a string like the other backends. Every other value is left as
-// pgx decoded it.
-func normalizeValues(vals []any) []any {
+// it renders as a string like the other backends. PostgreSQL date columns
+// (OID 1082) arrive as time.Time but must be formatted as "YYYY-MM-DD" to match
+// PostgREST, not as a full RFC3339 timestamp. Every other value is left as pgx
+// decoded it.
+func normalizeValues(vals []any, fields []pgconn.FieldDescription) []any {
 	for i, v := range vals {
-		if b, ok := v.([]byte); ok {
-			vals[i] = string(b)
+		switch t := v.(type) {
+		case []byte:
+			vals[i] = string(t)
+		case time.Time:
+			if i < len(fields) && fields[i].DataTypeOID == pgtype.DateOID {
+				vals[i] = t.Format("2006-01-02")
+			}
 		}
 	}
 	return vals
