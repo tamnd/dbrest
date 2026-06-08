@@ -31,12 +31,14 @@ const maxBodyBytes = 16 << 20 // 16 MiB
 // verifier, when set, resolves the request role from the JWT; with none, every
 // request runs as the static default role.
 type Server struct {
-	backend    backend.Backend
-	model      *schema.Model
-	searchPath []string
-	role       string
-	verifier   *auth.Verifier
-	authz      *authz.Registry
+	backend      backend.Backend
+	model        *schema.Model
+	searchPath   []string
+	role         string
+	verifier     *auth.Verifier
+	authz        *authz.Registry
+	openapiMode  string
+	openapiProxy string
 }
 
 // NewServer builds a Server over a backend, its introspected model, and the
@@ -44,6 +46,17 @@ type Server struct {
 // request as the anon role until a verifier is attached with SetVerifier.
 func NewServer(b backend.Backend, model *schema.Model, searchPath []string) *Server {
 	return &Server{backend: b, model: model, searchPath: searchPath, role: "anon"}
+}
+
+// SetOpenAPI configures the root document. mode is the openapi-mode option:
+// "disabled" turns the root off (a request there is 404); the two privilege
+// modes leave it on. proxyURI, when set, is the externally visible base URL the
+// document advertises (the openapi-server-proxy-uri option), overriding the
+// host and scheme the request arrived on so a document served behind a reverse
+// proxy points at the public address. See spec 20.
+func (s *Server) SetOpenAPI(mode, proxyURI string) {
+	s.openapiMode = mode
+	s.openapiProxy = proxyURI
 }
 
 // SetVerifier attaches a JWT verifier. Once set, the role and claims of each
