@@ -11,7 +11,8 @@ ON CONFLICT (id) DO UPDATE SET
 
 INSERT INTO api.persons (id, name, age, email) VALUES
     (1, 'Alice', 30, 'alice@example.com'),
-    (2, 'Bob',   25, 'bob@example.com')
+    (2, 'Bob',   25, 'bob@example.com'),
+    (3, 'Carol', 35, 'carol@example.com')
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO api.assignments (id, person_id, todo_id) VALUES

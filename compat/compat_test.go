@@ -463,18 +463,18 @@ var cases = []compatCase{
 }
 
 // resetTestDB deletes all non-seed rows from both servers so each TestCompatibility
-// run starts from the same known state (3 todos, 2 persons, 2 assignments).
+// run starts from the same known state (3 todos, 3 persons, 2 assignments).
 func resetTestDB(t *testing.T, pgrest, dbrest string) {
 	t.Helper()
 	client := &http.Client{Timeout: 5 * time.Second}
 	cleanup := []struct{ method, url string }{
 		{"DELETE", pgrest + "/todos?id=gt.3"},
 		{"DELETE", pgrest + "/assignments?id=gt.2"},
-		{"DELETE", pgrest + "/persons?id=gt.2"},
+		{"DELETE", pgrest + "/persons?id=gt.3"},
 		{"DELETE", pgrest + "/private_todos?id=gt.2"},
 		{"DELETE", dbrest + "/todos?id=gt.3"},
 		{"DELETE", dbrest + "/assignments?id=gt.2"},
-		{"DELETE", dbrest + "/persons?id=gt.2"},
+		{"DELETE", dbrest + "/persons?id=gt.3"},
 		{"DELETE", dbrest + "/private_todos?id=gt.2"},
 		// undo any modifications to seed rows
 		{"PATCH", pgrest + "/todos?id=eq.1"},
