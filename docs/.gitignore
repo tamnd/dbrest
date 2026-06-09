@@ -1,0 +1,5 @@
+# tago build output and cache
+public/
+public-pages/
+public-cf/
+.tago-cache.db

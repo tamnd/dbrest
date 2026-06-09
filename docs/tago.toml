@@ -1,0 +1,14 @@
+title       = "dbrest"
+baseURL     = "https://dbrest.tamnd.com/"
+description = "A REST server that speaks the PostgREST API on top of any database."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/dbrest"
+heroTitle = "The PostgREST API on any database"
+heroLead = "dbrest keeps the PostgREST HTTP contract and makes the database underneath pluggable. PostgreSQL, SQLite, MySQL, SQL Server, or MongoDB, one API."
+heroPrimaryURL = "/getting-started/introduction/"
+heroPrimaryText = "Get started"
