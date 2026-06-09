@@ -1,0 +1,49 @@
+# dbrest + MySQL 8.4: the MySQL subject for the compat and benchmark tests.
+# Compare against docker/postgrest/compose.yaml (the PostgREST golden reference).
+#
+#   podman compose -f docker/dbrest-mysql/compose.yaml up -d
+#
+# dbrest-mysql listens on localhost:3003.
+# MySQL listens on localhost:3308 (offset from 3306 to avoid the standalone stack).
+#
+# Build the dbrest image first:
+#   podman build -t dbrest:local -f Dockerfile .
+#
+# Seed SQL is mounted from docker/seed/mysql/ and executed once on first start.
+
+services:
+  db-mysql:
+    image: docker.io/library/mysql:8.4
+    container_name: compat-dbrest-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: "Dbrest!Passw0rd"
+      MYSQL_DATABASE: dbrest
+      MYSQL_USER: dbrest
+      MYSQL_PASSWORD: "Dbrest!Passw0rd"
+    ports:
+      - "3308:3306"
+    volumes:
+      - dbrest-mysql-data:/var/lib/mysql
+      - ../../docker/seed/mysql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "dbrest", "-pDbrest!Passw0rd"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  dbrest-mysql:
+    image: dbrest:local
+    container_name: compat-dbrest-mysql-server
+    depends_on:
+      db-mysql:
+        condition: service_healthy
+    environment:
+      DBREST_DB_BACKEND: "mysql"
+      DBREST_DB_URI: "dbrest:Dbrest!Passw0rd@tcp(db-mysql:3306)/dbrest?parseTime=true"
+      DBREST_DB_ANON_ROLE: ""
+      DBREST_SERVER_PORT: "3003"
+    ports:
+      - "3003:3003"
+
+volumes:
+  dbrest-mysql-data:

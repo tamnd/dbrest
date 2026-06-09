@@ -218,6 +218,12 @@ func (Dialect) SessionWrite(key string) (string, bool) {
 	return "EXEC sp_set_session_context N'" + strings.ReplaceAll(key, "'", "''") + "', " + sqlgen.PatternMark, true
 }
 
+// ArrayOp returns false; SQL Server has no array types or containment operators.
+func (Dialect) ArrayOp(_, _, _ string) (string, bool) { return "", false }
+
+// ILike uses plain LIKE; SQL Server's default collation is case-insensitive.
+func (Dialect) ILike(col, val string) (string, bool) { return col + " LIKE " + val, true }
+
 // BoolValue renders a boolean as the BIT literal 1/0. SQL Server has no boolean
 // type or TRUE/FALSE keyword.
 func (Dialect) BoolValue(v bool) string {
