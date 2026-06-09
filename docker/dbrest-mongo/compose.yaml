@@ -1,0 +1,56 @@
+name: dbrest-mongo
+
+services:
+  db-mongo:
+    image: mongo:7
+    container_name: dbrest-mongo-db
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: Dbrest1Passw0rd
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  seed:
+    image: mongo:7
+    container_name: dbrest-mongo-seed
+    depends_on:
+      db-mongo:
+        condition: service_healthy
+    volumes:
+      - ../seed/mongo:/seed:ro
+    entrypoint: >
+      sh -c "
+        mongosh 'mongodb://root:Dbrest1Passw0rd@db-mongo:27017/admin' --eval \"
+          db.getSiblingDB('dbrest').dropUser('dbrest');
+          db.getSiblingDB('dbrest').createUser({
+            user: 'dbrest', pwd: 'Dbrest1Passw0rd',
+            roles: [{role: 'readWrite', db: 'dbrest'}]
+          });
+        \" &&
+        mongosh 'mongodb://root:Dbrest1Passw0rd@db-mongo:27017/dbrest' /seed/seed.js
+      "
+    restart: "no"
+
+  dbrest:
+    image: golang:1.24-alpine
+    container_name: dbrest-mongo-api
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+    ports:
+      - "3005:3005"
+    volumes:
+      - ../../:/app:ro
+    working_dir: /app
+    command: >
+      sh -c "go run ./cmd/dbrest/"
+    environment:
+      DBREST_DB_BACKEND: mongodb
+      DBREST_DB_URI: "mongodb://dbrest:Dbrest1Passw0rd@db-mongo:27017/dbrest"
+      DBREST_DB_ANON_ROLE: ""
+      DBREST_SERVER_PORT: "3005"
