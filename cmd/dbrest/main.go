@@ -14,6 +14,7 @@ import (
 
 	"github.com/tamnd/dbrest/auth"
 	"github.com/tamnd/dbrest/backend"
+	"github.com/tamnd/dbrest/backend/mysql"
 	"github.com/tamnd/dbrest/backend/postgres"
 	"github.com/tamnd/dbrest/backend/sqlite"
 	"github.com/tamnd/dbrest/backend/sqlserver"
@@ -83,9 +84,11 @@ func openBackend(cfg *config.Config) (backend.Backend, error) {
 		be.SetSchemas(cfg.Schemas)
 		return be, nil
 	case config.BackendMySQL:
-		// The MySQL/MariaDB dialect has landed but the live driver data plane is a
-		// separate slice.
-		return nil, fmt.Errorf("db-backend %q has its dialect but no runnable data plane yet", cfg.Backend)
+		be, err := mysql.Open(cfg.DBURI)
+		if err != nil {
+			return nil, fmt.Errorf("open database: %w", err)
+		}
+		return be, nil
 	case config.BackendSQLServer:
 		be, err := sqlserver.Open(cfg.DBURI)
 		if err != nil {

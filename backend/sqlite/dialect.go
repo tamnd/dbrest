@@ -146,6 +146,12 @@ func (dialect) SessionRead(string) string { return "" }
 // SessionWrite reports ok=false: there is no engine setting to write.
 func (dialect) SessionWrite(string) (string, bool) { return "", false }
 
+// ArrayOp returns false; SQLite has no array types or containment operators.
+func (dialect) ArrayOp(_, _, _ string) (string, bool) { return "", false }
+
+// ILike uses plain LIKE which is case-insensitive for ASCII in SQLite.
+func (dialect) ILike(col, val string) (string, bool) { return col + " LIKE " + val, true }
+
 // BoolValue renders a boolean as 1/0; SQLite has no native boolean.
 func (dialect) BoolValue(v bool) string {
 	if v {
@@ -154,5 +160,4 @@ func (dialect) BoolValue(v bool) string {
 	return "0"
 }
 
-// ILike uses plain LIKE; SQLite LIKE is case-insensitive for ASCII.
-func (dialect) ILike(col, val string) (string, bool) { return col + " LIKE " + val, true }
+

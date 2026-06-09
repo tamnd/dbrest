@@ -76,14 +76,22 @@ type Dialect interface {
 	// engine has no SQL-readable session store.
 	SessionWrite(key string) (stmt string, ok bool)
 
+	// ILike renders a case-insensitive LIKE predicate, or reports ok=false when
+	// the engine does not support it (compiler emits PGRST127). col and val are
+	// already-compiled SQL fragments. Engines where plain LIKE is case-insensitive
+	// by default (MySQL, SQLite, SQL Server typical collation) return ok=true with
+	// a LIKE expression; PostgreSQL returns ILIKE.
+	ILike(col, val string) (frag string, ok bool)
+
 	// BoolValue renders a boolean literal.
 	BoolValue(v bool) string
 
-	// ILike renders a case-insensitive LIKE predicate, or reports ok=false when
-	// the engine does not support it. Engines whose default collation is already
-	// case-insensitive (SQL Server, SQLite, MySQL with utf8mb4_unicode_ci) return
-	// a plain LIKE fragment with ok=true; PostgreSQL returns ILIKE.
-	ILike(col, val string) (frag string, ok bool)
+	// ArrayOp renders an array containment/overlap operator expression, or
+	// reports ok=false when the engine does not support array types (SQLite,
+	// MySQL, SQL Server). The compiler emits PGRST127 when ok=false.
+	// op is one of "@>", "<@", "&&"; col is the quoted column; val is the
+	// placeholder returned by bind().
+	ArrayOp(col, op, val string) (string, bool)
 }
 
 // PatternMark is the sentinel a Dialect.Regex fragment carries where the bound
