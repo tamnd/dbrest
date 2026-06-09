@@ -198,10 +198,10 @@ var cases = []compatCase{
 	// 7.4/7.5: count=planned/estimated status depends on planner statistics which
 	// differ between two independent databases; skip cross-server status match.
 	{name: "7.4 count=planned", method: "GET", path: "/todos",
-		headers: map[string]string{"Prefer": "count=planned"},
+		headers:  map[string]string{"Prefer": "count=planned"},
 		bodyMode: "status", skipStatusMatch: true, wantPrefApplied: "count=planned"},
 	{name: "7.5 count=estimated", method: "GET", path: "/todos",
-		headers: map[string]string{"Prefer": "count=estimated"},
+		headers:  map[string]string{"Prefer": "count=estimated"},
 		bodyMode: "status", skipStatusMatch: true, wantPrefApplied: "count=estimated"},
 
 	// ── Group 8: Singular object ──────────────────────────────────────────
@@ -234,9 +234,9 @@ var cases = []compatCase{
 		body:       `{"task":"compat insert repr"}`,
 		wantStatus: 201, bodyMode: "schema"},
 	{name: "10.3 insert return=headers-only 201", method: "POST", path: "/todos",
-		headers:            map[string]string{"Content-Type": "application/json", "Prefer": "return=headers-only"},
-		body:               `{"task":"compat insert headers-only"}`,
-		wantStatus:         201, bodyMode: "empty",
+		headers:    map[string]string{"Content-Type": "application/json", "Prefer": "return=headers-only"},
+		body:       `{"task":"compat insert headers-only"}`,
+		wantStatus: 201, bodyMode: "empty",
 		wantLocationPrefix: "/todos?id=eq."},
 	{name: "10.4 bulk insert 201", method: "POST", path: "/todos",
 		headers:    map[string]string{"Content-Type": "application/json", "Prefer": "return=representation"},

@@ -130,7 +130,7 @@ func (s *batchStreamRows) Close() error {
 	s.rows.Close()
 	rowErr := s.rows.Err()
 	s.br.Exec() //nolint:errcheck // ROLLBACK; ignore error, it's cleanup
-	s.br.Close()
+	_ = s.br.Close()
 	s.conn.Release()
 	return rowErr
 }

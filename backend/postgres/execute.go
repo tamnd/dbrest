@@ -76,7 +76,7 @@ func (b *Backend) executeRead(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 	br := conn.SendBatch(ctx, batch)
 
 	abort := func(e error) (backend.Result, error) {
-		br.Close()
+		_ = br.Close()
 		release()
 		return nil, e
 	}

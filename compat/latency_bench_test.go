@@ -34,9 +34,9 @@ import (
 )
 
 const (
-	toxiAPI       = "http://127.0.0.1:8474"
-	proxyPGRESTListen  = "127.0.0.1:5453"
-	proxyDBRestListen  = "127.0.0.1:5464"
+	toxiAPI             = "http://127.0.0.1:8474"
+	proxyPGRESTListen   = "127.0.0.1:5453"
+	proxyDBRestListen   = "127.0.0.1:5464"
 	proxyPGRESTUpstream = "127.0.0.1:5433"
 	proxyDBRestUpstream = "127.0.0.1:5434"
 	latencyPGRESTPort   = "3010"
@@ -94,10 +94,10 @@ func TestLatencyBenchmark(t *testing.T) {
 
 	// ── cases ────────────────────────────────────────────────────────────────
 	cases := []struct {
-		name    string
-		path    string
-		warmup  int
-		n       int
+		name   string
+		path   string
+		warmup int
+		n      int
 	}{
 		{"GET /todos sequential (200 reqs)", "/todos?order=id", 30, 200},
 		{"GET /todos?select=id,task sequential", "/todos?select=id,task&order=id", 30, 200},
@@ -245,10 +245,10 @@ func createToxiProxy(t *testing.T, name, listen, upstream string) {
 func addLatencyToxic(t *testing.T, proxyName string, ms int) {
 	t.Helper()
 	toxiDo(t, http.MethodPost, "/proxies/"+proxyName+"/toxics", map[string]any{
-		"type":      "latency",
-		"name":      "latency",
-		"stream":    "downstream",
-		"toxicity":  1.0,
+		"type":       "latency",
+		"name":       "latency",
+		"stream":     "downstream",
+		"toxicity":   1.0,
 		"attributes": map[string]any{"latency": ms, "jitter": 0},
 	})
 }

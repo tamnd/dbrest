@@ -18,7 +18,6 @@ type result struct {
 	rows     *sql.Rows
 	cols     []string
 	jsonIdx  map[int]bool   // column indices carrying a JSON value (NVARCHAR with schema flag)
-	boolIdx  map[int]bool   // column indices that need coercion: BIT → bool (natively true, kept for consistency)
 	timeIdx  map[int]string // column indices with time.Time → format string
 	controls *reqctx.ResponseControls
 	count    int64

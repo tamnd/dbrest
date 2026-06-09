@@ -14,6 +14,7 @@ import (
 
 	"github.com/tamnd/dbrest/auth"
 	"github.com/tamnd/dbrest/backend"
+	mongobackend "github.com/tamnd/dbrest/backend/mongo"
 	"github.com/tamnd/dbrest/backend/mysql"
 	"github.com/tamnd/dbrest/backend/postgres"
 	"github.com/tamnd/dbrest/backend/sqlite"
@@ -96,9 +97,11 @@ func openBackend(cfg *config.Config) (backend.Backend, error) {
 		}
 		return be, nil
 	case config.BackendMongoDB:
-		// The MongoDB query lowering has landed but the live driver data plane is a
-		// separate slice.
-		return nil, fmt.Errorf("db-backend %q has its query lowering but no runnable data plane yet", cfg.Backend)
+		be, err := mongobackend.Open(cfg.DBURI)
+		if err != nil {
+			return nil, fmt.Errorf("open database: %w", err)
+		}
+		return be, nil
 	default:
 		return nil, fmt.Errorf("db-backend %q is unknown", cfg.Backend)
 	}

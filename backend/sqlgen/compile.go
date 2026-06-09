@@ -545,11 +545,12 @@ func (b *builder) writeCompare(c ir.Compare) *pgerr.APIError {
 		// Boolean literals "true"/"false" are rendered via BoolValue so engines
 		// without a native BOOL type (MySQL TINYINT) produce correct predicates
 		// (e.g. done = 1 rather than done = 'true' which MySQL coerces to 0).
-		if c.Value.Text == "true" {
+		switch c.Value.Text {
+		case "true":
 			frag = col + " " + binaryOp(c.Op) + " " + b.d.BoolValue(true)
-		} else if c.Value.Text == "false" {
+		case "false":
 			frag = col + " " + binaryOp(c.Op) + " " + b.d.BoolValue(false)
-		} else {
+		default:
 			frag = col + " " + binaryOp(c.Op) + " " + b.bind(c.Value.Text)
 		}
 	case ir.OpGt, ir.OpGte, ir.OpLt, ir.OpLte, ir.OpLike:

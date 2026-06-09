@@ -27,7 +27,6 @@ import (
 	"github.com/tamnd/dbrest/backend"
 	"github.com/tamnd/dbrest/pgerr"
 	"github.com/tamnd/dbrest/rpc"
-	"github.com/tamnd/dbrest/schema"
 )
 
 const defaultPoolSize = 10
@@ -205,24 +204,6 @@ func sqlServerCanonicalType(dataType string) string {
 	default:
 		return "text"
 	}
-}
-
-// buildBoolCols returns the set of column names whose canonical type is
-// "boolean" for the given relation.
-func buildBoolCols(rel *schema.Relation) map[string]bool {
-	if rel == nil {
-		return nil
-	}
-	var m map[string]bool
-	for _, col := range rel.Columns {
-		if col.Type == "boolean" {
-			if m == nil {
-				m = make(map[string]bool)
-			}
-			m[col.Name] = true
-		}
-	}
-	return m
 }
 
 // asMSSQLError unwraps err as a *mssql.Error.

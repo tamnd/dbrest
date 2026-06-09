@@ -43,16 +43,16 @@ var workloads = []benchCase{
 		path: "/todos?select=id,task&order=id", warmup: 50, n: 500,
 	},
 	{
-		name: "GET /todos count=exact",
-		path: "/todos?order=id",
+		name:    "GET /todos count=exact",
+		path:    "/todos?order=id",
 		headers: map[string]string{"Prefer": "count=exact"},
-		warmup: 50, n: 500,
+		warmup:  50, n: 500,
 	},
 	{
-		name: "GET /todos?limit=1 singular",
-		path: "/todos?id=eq.1",
+		name:    "GET /todos?limit=1 singular",
+		path:    "/todos?id=eq.1",
 		headers: map[string]string{"Accept": "application/vnd.pgrst.object+json"},
-		warmup: 30, n: 300,
+		warmup:  30, n: 300,
 	},
 	{
 		name: "GET /persons embed",

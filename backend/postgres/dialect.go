@@ -236,5 +236,3 @@ func (Dialect) BoolValue(v bool) string {
 	}
 	return "FALSE"
 }
-
-
