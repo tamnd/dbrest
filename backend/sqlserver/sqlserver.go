@@ -212,3 +212,9 @@ func asMSSQLError(err error) (*mssql.Error, bool) {
 	ok := errors.As(err, &me)
 	return me, ok
 }
+
+func init() { backend.Register("sqlserver", sqlserverDriver{}) }
+
+type sqlserverDriver struct{}
+
+func (sqlserverDriver) Open(dsn string) (backend.Backend, error) { return Open(dsn) }

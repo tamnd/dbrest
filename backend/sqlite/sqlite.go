@@ -379,3 +379,9 @@ func drain(rows *sql.Rows, ncols int) ([][]any, error) {
 	}
 	return out, rows.Err()
 }
+
+func init() { backend.Register("sqlite", sqliteDriver{}) }
+
+type sqliteDriver struct{}
+
+func (sqliteDriver) Open(dsn string) (backend.Backend, error) { return Open(dsn) }

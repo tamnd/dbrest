@@ -14,11 +14,11 @@ import (
 
 	"github.com/tamnd/dbrest/auth"
 	"github.com/tamnd/dbrest/backend"
-	mongobackend "github.com/tamnd/dbrest/backend/mongo"
-	"github.com/tamnd/dbrest/backend/mysql"
-	"github.com/tamnd/dbrest/backend/postgres"
-	"github.com/tamnd/dbrest/backend/sqlite"
-	"github.com/tamnd/dbrest/backend/sqlserver"
+	_ "github.com/tamnd/dbrest/backend/mongo"
+	_ "github.com/tamnd/dbrest/backend/mysql"
+	_ "github.com/tamnd/dbrest/backend/postgres"
+	_ "github.com/tamnd/dbrest/backend/sqlite"
+	_ "github.com/tamnd/dbrest/backend/sqlserver"
 	"github.com/tamnd/dbrest/config"
 	"github.com/tamnd/dbrest/httpapi"
 )
@@ -69,42 +69,17 @@ func run() error {
 }
 
 // openBackend opens the engine the configuration selected.
+// Each backend driver self-registers via its package init function; this file
+// imports them as blank imports so their init functions run.
 func openBackend(cfg *config.Config) (backend.Backend, error) {
-	switch cfg.Backend {
-	case config.BackendSQLite:
-		be, err := sqlite.Open(cfg.DBURI)
-		if err != nil {
-			return nil, fmt.Errorf("open database: %w", err)
-		}
-		return be, nil
-	case config.BackendPostgres:
-		be, err := postgres.Open(cfg.DBURI)
-		if err != nil {
-			return nil, fmt.Errorf("open database: %w", err)
-		}
-		be.SetSchemas(cfg.Schemas)
-		return be, nil
-	case config.BackendMySQL:
-		be, err := mysql.Open(cfg.DBURI)
-		if err != nil {
-			return nil, fmt.Errorf("open database: %w", err)
-		}
-		return be, nil
-	case config.BackendSQLServer:
-		be, err := sqlserver.Open(cfg.DBURI)
-		if err != nil {
-			return nil, fmt.Errorf("open database: %w", err)
-		}
-		return be, nil
-	case config.BackendMongoDB:
-		be, err := mongobackend.Open(cfg.DBURI)
-		if err != nil {
-			return nil, fmt.Errorf("open database: %w", err)
-		}
-		return be, nil
-	default:
-		return nil, fmt.Errorf("db-backend %q is unknown", cfg.Backend)
+	be, err := backend.Open(cfg.Backend, cfg.DBURI)
+	if err != nil {
+		return nil, fmt.Errorf("open database: %w", err)
 	}
+	if sc, ok := be.(interface{ SetSchemas([]string) }); ok {
+		sc.SetSchemas(cfg.Schemas)
+	}
+	return be, nil
 }
 
 // attachAuth wires a JWT verifier onto the server when a key is configured.
