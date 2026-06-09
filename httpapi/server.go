@@ -468,16 +468,26 @@ func (s *Server) writeWrite(w http.ResponseWriter, r *http.Request, q *ir.Query,
 //   - POST insert: 201 Created.
 //   - POST upsert where ALL rows were new inserts: 201 Created.
 //   - POST upsert where at least one row was an ON CONFLICT update: 200 OK.
+//   - PUT upsert where the row is known to be a new insert: 201 Created.
+//   - PUT upsert where the row is known to be an update, or unknown: 200 OK.
 //   - PATCH/DELETE with representation: 200 OK.
 //   - PATCH/DELETE without representation: 204 No Content.
 func writeStatus(method string, kind ir.QueryKind, representation bool, ctrl *reqctx.ResponseControls) int {
 	if method == http.MethodPost {
-		// When the backend has determined that the upsert hit at least one existing
-		// row (ON CONFLICT UPDATE fired), return 200. Otherwise return 201.
+		// 200 when the upsert hit at least one existing row (ON CONFLICT UPDATE fired).
+		// 201 otherwise (new row was inserted or unknown).
 		if kind == ir.Upsert && ctrl != nil && ctrl.UpsertStatusKnown && !ctrl.UpsertInsert {
 			return http.StatusOK
 		}
 		return http.StatusCreated
+	}
+	if method == http.MethodPut && kind == ir.Upsert {
+		// PUT is semantically "create or replace"; default to 200.
+		// Only return 201 when the backend positively confirms a new insert.
+		if ctrl != nil && ctrl.UpsertStatusKnown && ctrl.UpsertInsert {
+			return http.StatusCreated
+		}
+		return http.StatusOK
 	}
 	if representation {
 		return http.StatusOK
@@ -571,22 +581,16 @@ func (s *Server) writeRead(w http.ResponseWriter, r *http.Request, q *ir.Query, 
 	}
 }
 
-// readStatus applies PostgREST's 200/206 rule.
-//   - count=exact: 206 when nRows < total (window is partial), 200 when all rows returned.
-//   - count=planned/estimated: always 206 when count is present (estimated totals are
-//     inherently uncertain so PostgREST signals partial content even for full results).
-//   - No count: always 200.
+// readStatus applies PostgREST's 200/206 rule: 206 only when a count is known
+// and the page returned is genuinely partial (nRows < total). PostgREST v14
+// returns 200 for count=planned/estimated even though the total is approximate;
+// the estimate is informational, not a range boundary.
 func readStatus(q *ir.Query, out *rendered, _ int) int {
 	if !out.hasTotl {
 		return http.StatusOK
 	}
-	switch q.Count {
-	case ir.CountPlanned, ir.CountEstimated:
+	if q.Count == ir.CountExact && int64(out.nRows) < out.total {
 		return http.StatusPartialContent
-	case ir.CountExact:
-		if int64(out.nRows) < out.total {
-			return http.StatusPartialContent
-		}
 	}
 	return http.StatusOK
 }

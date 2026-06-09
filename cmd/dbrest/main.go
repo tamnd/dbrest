@@ -17,6 +17,7 @@ import (
 	"github.com/tamnd/dbrest/backend/mysql"
 	"github.com/tamnd/dbrest/backend/postgres"
 	"github.com/tamnd/dbrest/backend/sqlite"
+	"github.com/tamnd/dbrest/backend/sqlserver"
 	"github.com/tamnd/dbrest/config"
 	"github.com/tamnd/dbrest/httpapi"
 )
@@ -89,8 +90,11 @@ func openBackend(cfg *config.Config) (backend.Backend, error) {
 		}
 		return be, nil
 	case config.BackendSQLServer:
-		// The SQL Server dialect has landed but the live driver data plane is a separate slice.
-		return nil, fmt.Errorf("db-backend %q has its dialect but no runnable data plane yet", cfg.Backend)
+		be, err := sqlserver.Open(cfg.DBURI)
+		if err != nil {
+			return nil, fmt.Errorf("open database: %w", err)
+		}
+		return be, nil
 	case config.BackendMongoDB:
 		// The MongoDB query lowering has landed but the live driver data plane is a
 		// separate slice.

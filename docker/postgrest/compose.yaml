@@ -39,8 +39,9 @@ services:
         condition: service_healthy
     environment:
       PGRST_DB_URI: "postgres://authenticator:authenticator_pass@db-postgrest:5432/postgres"
-      PGRST_DB_SCHEMAS: "api"
+      PGRST_DB_SCHEMAS: "api, private"
       PGRST_DB_ANON_ROLE: "web_anon"
+      PGRST_JWT_SECRET: "reallyreallyreallyreallyverysafe"
       PGRST_OPENAPI_SERVER_PROXY_URI: "http://localhost:3000"
       PGRST_SERVER_PORT: "3000"
       PGRST_LOG_LEVEL: "info"

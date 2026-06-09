@@ -206,3 +206,5 @@ func (Dialect) BoolValue(v bool) string {
 	}
 	return "0"
 }
+
+
