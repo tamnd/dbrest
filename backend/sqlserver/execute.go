@@ -387,11 +387,6 @@ func returningCols(q *ir.Query, rel *schema.Relation) []string {
 	return nil
 }
 
-// sqlIdentifier returns a bracket-quoted column reference.
-func sqlIdentifier(name string) string {
-	return Dialect{}.QuoteIdent(name)
-}
-
 // _ is a compile-time check that Backend implements backend.DB.
 var _ interface {
 	Execute(context.Context, *ir.Plan, *reqctx.Context) (backend.Result, error)

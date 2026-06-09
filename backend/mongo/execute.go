@@ -76,7 +76,7 @@ func (b *Backend) executeRead(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 	if err != nil {
 		return nil, b.MapError(err)
 	}
-	defer cur.Close(ctx)
+	defer func() { _ = cur.Close(ctx) }()
 
 	docs, err := cursorDocs(ctx, cur)
 	if err != nil {
@@ -215,7 +215,7 @@ func (b *Backend) findDocs(ctx context.Context, coll *mgodriver.Collection, filt
 	if err != nil {
 		return nil, b.MapError(err)
 	}
-	defer cur.Close(ctx)
+	defer func() { _ = cur.Close(ctx) }()
 	return cursorDocs(ctx, cur)
 }
 

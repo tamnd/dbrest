@@ -212,4 +212,3 @@ func buildBoolCols(rel *schema.Relation) map[string]bool {
 	}
 	return m
 }
-

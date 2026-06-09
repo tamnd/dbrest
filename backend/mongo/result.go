@@ -21,11 +21,11 @@ type bodyResult struct {
 	controls *reqctx.ResponseControls
 }
 
-func (r *bodyResult) Body() io.Reader                               { return nil }
-func (r *bodyResult) Rows() backend.RowStream                       { return r.rows }
-func (r *bodyResult) Count() (int64, bool)                          { return r.count, r.hasCount }
-func (r *bodyResult) Affected() (int64, bool)                       { return r.affected, r.hasAff }
-func (r *bodyResult) ResponseControls() *reqctx.ResponseControls    { return r.controls }
+func (r *bodyResult) Body() io.Reader                            { return nil }
+func (r *bodyResult) Rows() backend.RowStream                    { return r.rows }
+func (r *bodyResult) Count() (int64, bool)                       { return r.count, r.hasCount }
+func (r *bodyResult) Affected() (int64, bool)                    { return r.affected, r.hasAff }
+func (r *bodyResult) ResponseControls() *reqctx.ResponseControls { return r.controls }
 
 // docRowStream is a RowStream over pre-decoded BSON documents.
 type docRowStream struct {

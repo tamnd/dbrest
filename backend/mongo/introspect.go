@@ -70,7 +70,7 @@ func (b *Backend) introspectCollection(ctx context.Context, name string) (*schem
 	if err != nil {
 		return nil, err
 	}
-	defer cur.Close(ctx)
+	defer func() { _ = cur.Close(ctx) }()
 
 	fieldOrder := []string{}
 	fieldTypes := map[string]string{}
