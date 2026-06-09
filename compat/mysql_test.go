@@ -88,11 +88,11 @@ var mysqlCases = []compatCase{
 	// ── Group 4: Pagination + Content-Range ───────────────────────────────
 	{name: "mysql/4.1 count=exact",
 		method: "GET", path: "/todos",
-		headers: map[string]string{"Prefer": "count=exact"},
+		headers:         map[string]string{"Prefer": "count=exact"},
 		wantPrefApplied: "count=exact"},
 	{name: "mysql/4.2 limit+offset Content-Range",
 		method: "GET", path: "/todos?limit=1&offset=1&order=id",
-		headers: map[string]string{"Prefer": "count=exact"},
+		headers:         map[string]string{"Prefer": "count=exact"},
 		wantPrefApplied: "count=exact"},
 
 	// ── Group 5: Singular ─────────────────────────────────────────────────
@@ -139,7 +139,7 @@ var mysqlCases = []compatCase{
 			"Content-Type": "application/json",
 			"Prefer":       "return=minimal",
 		},
-		body: `{"task":"mysql test task","done":false}`,
+		body:     `{"task":"mysql test task","done":false}`,
 		bodyMode: "empty"},
 	{name: "mysql/9.2 POST insert representation",
 		method: "POST", path: "/todos",
