@@ -57,9 +57,20 @@ func renderFor(media string, res backend.Result, rawCols map[string]bool) (*rend
 // scalar media). A scalar return is the bare value; a setof-scalar return is a
 // JSON array of bare values. The object media type asks for a single value and
 // enforces the zero-or-many rule, so a setof function with one row can satisfy a
-// singular request.
-func renderCall(media string, res backend.Result, fn *rpc.Function) (*rendered, *pgerr.APIError) {
-	if fn == nil || fn.Returns.Kind == rpc.ReturnTable {
+// singular request. fnName is the bare function name; it is used for native-RPC
+// heuristic detection when fn is nil.
+func renderCall(media string, res backend.Result, fn *rpc.Function, fnName string) (*rendered, *pgerr.APIError) {
+	if fn == nil {
+		// Native RPC: detect scalar vs table by inspecting column names.
+		// res.Rows().Columns() does not advance the cursor; the stream remains
+		// fully readable for the render path below.
+		cols := res.Rows().Columns()
+		if len(cols) == 1 && cols[0] == fnName {
+			fn = &rpc.Function{Returns: rpc.ReturnShape{Kind: rpc.ReturnScalar}}
+		} else {
+			return renderFor(media, res, nil)
+		}
+	} else if fn.Returns.Kind == rpc.ReturnTable {
 		return renderFor(media, res, nil)
 	}
 	switch media {

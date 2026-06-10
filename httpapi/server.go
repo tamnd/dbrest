@@ -274,7 +274,7 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 		return
 	}
 
-	out, apiErr := renderCall(media, res, planned.Func)
+	out, apiErr := renderCall(media, res, planned.Func, fn)
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return

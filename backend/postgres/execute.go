@@ -2,6 +2,8 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
+	"strconv"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -301,10 +303,11 @@ func (b *Backend) executeCallRead(ctx context.Context, plan *ir.Plan, rc *reqctx
 
 // compileNativeCall generates the PostgreSQL function-call SQL for the native
 // RPC path (NativeRPC=true), where there is no declared function registry. It
-// renders SELECT * FROM schema.fn(arg := $1, ...) using the search path's first
-// schema as the function schema. Arguments come from the call's parsed arg map;
-// they are bound as named parameters (fn_name := $N) which is how PostgREST
-// calls PG functions. When no args are supplied the call has an empty arg list.
+// renders SELECT * FROM schema.fn(arg := <literal>, ...) with values embedded
+// as SQL literals so PostgreSQL infers the parameter types from the function
+// signature and the call does not depend on pgx OID mapping. String values are
+// single-quote escaped; numeric JSON values are written as numeric literals;
+// booleans become TRUE/FALSE; null or absent values become NULL.
 func (b *Backend) compileNativeCall(c *ir.Call) (*sqlgen.Statement, *pgerr.APIError) {
 	schema := "public"
 	if len(b.searchPath) > 0 {
@@ -319,7 +322,6 @@ func (b *Backend) compileNativeCall(c *ir.Call) (*sqlgen.Statement, *pgerr.APIEr
 	sb.WriteString(d.QuoteIdent(c.Function.Name))
 	sb.WriteString("(")
 
-	args := make([]any, 0, len(c.Args))
 	i := 0
 	for name, val := range c.Args {
 		if i > 0 {
@@ -327,16 +329,48 @@ func (b *Backend) compileNativeCall(c *ir.Call) (*sqlgen.Statement, *pgerr.APIEr
 		}
 		sb.WriteString(d.QuoteIdent(name))
 		sb.WriteString(" := ")
-		sb.WriteString(d.Placeholder(i + 1))
-		if val.JSON != nil {
-			args = append(args, val.JSON)
-		} else {
-			args = append(args, val.Text)
-		}
+		appendNativeArg(&sb, val)
 		i++
 	}
 	sb.WriteString(")")
-	return &sqlgen.Statement{SQL: sb.String(), Args: args}, nil
+	return &sqlgen.Statement{SQL: sb.String()}, nil
+}
+
+// appendNativeArg writes one function argument as a safe SQL literal. Numbers
+// are written unquoted so PostgreSQL resolves their type from context; strings
+// use single-quote escaping; booleans are TRUE/FALSE; anything else (including
+// absent values) becomes NULL. Objects and arrays are JSON-quoted.
+func appendNativeArg(sb *strings.Builder, val ir.Value) {
+	if val.JSON != nil {
+		switch v := val.JSON.(type) {
+		case string:
+			sb.WriteString("'")
+			sb.WriteString(strings.ReplaceAll(v, "'", "''"))
+			sb.WriteString("'")
+		case float64:
+			sb.WriteString(strconv.FormatFloat(v, 'f', -1, 64))
+		case bool:
+			if v {
+				sb.WriteString("TRUE")
+			} else {
+				sb.WriteString("FALSE")
+			}
+		default:
+			// JSON object / array: pass as json literal.
+			enc, _ := json.Marshal(v)
+			sb.WriteString("'")
+			sb.WriteString(strings.ReplaceAll(string(enc), "'", "''"))
+			sb.WriteString("'::json")
+		}
+		return
+	}
+	if val.Text != "" {
+		sb.WriteString("'")
+		sb.WriteString(strings.ReplaceAll(val.Text, "'", "''"))
+		sb.WriteString("'")
+		return
+	}
+	sb.WriteString("NULL")
 }
 
 // compileWrite dispatches to the right compiler for the mutation kind.
