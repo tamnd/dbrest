@@ -836,7 +836,19 @@ func parseCompare(path []string, raw string) (Compare, *pgerr.APIError) {
 		}
 	case OpLike, OpILike:
 		// PostgREST maps * to % in LIKE/ILIKE patterns so URL-friendly wildcards work.
-		c.Value = Value{Text: strings.ReplaceAll(operand, "*", "%")}
+		if c.Quant != QNone {
+			// like(any)/{*cat*,*laundry*} — expand {…} into a list, * → % in each.
+			list, perr := parseLikeList(operand)
+			if perr != nil {
+				return Compare{}, perr
+			}
+			for i, p := range list {
+				list[i] = strings.ReplaceAll(p, "*", "%")
+			}
+			c.Value = Value{List: list}
+		} else {
+			c.Value = Value{Text: strings.ReplaceAll(operand, "*", "%")}
+		}
 	default:
 		c.Value = Value{Text: operand}
 	}
@@ -864,6 +876,26 @@ func parseInList(raw string) ([]string, *pgerr.APIError) {
 			p = p[1 : len(p)-1]
 		}
 		out = append(out, p)
+	}
+	return out, nil
+}
+
+// parseLikeList parses a {pat1,pat2,...} literal (PostgREST quantified-LIKE
+// syntax) into a slice of raw pattern strings. No wildcard translation is done
+// here; the caller applies * → % after parsing.
+func parseLikeList(raw string) ([]string, *pgerr.APIError) {
+	raw = strings.TrimSpace(raw)
+	if len(raw) < 2 || raw[0] != '{' || raw[len(raw)-1] != '}' {
+		return nil, pgerr.ErrParse("like(any/all) expects a {…} list")
+	}
+	inner := raw[1 : len(raw)-1]
+	if inner == "" {
+		return []string{}, nil
+	}
+	parts := strings.Split(inner, ",")
+	out := make([]string, len(parts))
+	for i, p := range parts {
+		out[i] = strings.TrimSpace(p)
 	}
 	return out, nil
 }

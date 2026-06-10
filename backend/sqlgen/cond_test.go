@@ -77,6 +77,36 @@ func TestCompileEveryInfixOperator(t *testing.T) {
 	}
 }
 
+// like(any) expands a {pat1,pat2} list into col LIKE $1 OR col LIKE $2.
+func TestCompileLikeAny(t *testing.T) {
+	where := ir.Cond(ir.Compare{
+		Path:  []string{"task"},
+		Op:    ir.OpLike,
+		Quant: ir.QAny,
+		Value: ir.Value{List: []string{"%cat%", "%laundry%"}},
+	})
+	st := compile(t, &ir.Query{Relation: ir.Ref{Name: "todos"}, Where: &where})
+	want := `SELECT * FROM "todos" WHERE ("task" LIKE $1 OR "task" LIKE $2)`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+}
+
+// like(all) expands a {pat1,pat2} list into col LIKE $1 AND col LIKE $2.
+func TestCompileLikeAll(t *testing.T) {
+	where := ir.Cond(ir.Compare{
+		Path:  []string{"task"},
+		Op:    ir.OpLike,
+		Quant: ir.QAll,
+		Value: ir.Value{List: []string{"%A%", "%o%"}},
+	})
+	st := compile(t, &ir.Query{Relation: ir.Ref{Name: "todos"}, Where: &where})
+	want := `SELECT * FROM "todos" WHERE ("task" LIKE $1 AND "task" LIKE $2)`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+}
+
 // indexFTSDialect models an engine whose full text needs a covering index: it
 // quotes the index reference into the emitted expression, and reports ok=false
 // when the planner attached none.
