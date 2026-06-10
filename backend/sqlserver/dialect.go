@@ -232,3 +232,7 @@ func (Dialect) BoolValue(v bool) string {
 	}
 	return "0"
 }
+
+// ArrayLiteral returns the text unchanged; SQL Server does not support PostgreSQL
+// array syntax, so ArrayOp returns false before this value is ever used.
+func (Dialect) ArrayLiteral(pgText string) string { return pgText }

@@ -9,7 +9,12 @@
 // *Function without a cycle.
 package rpc
 
-import "sort"
+import (
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
+)
 
 // Volatility classifies a function's effect, which fixes the methods it allows
 // and the transaction mode it runs in (spec 12). A registry entry that omits it
@@ -216,6 +221,98 @@ func exactMatch(f *Function, args ArgSet) bool {
 		}
 	}
 	return true
+}
+
+// ParseRegistry decodes a JSON function-registry declaration into a
+// StaticRegistry ready to Register on a backend. The JSON is an array of
+// function objects; each carries:
+//
+//	name        string           required; bare function name
+//	sql         string           required; parameterized SQL with :name placeholders
+//	params      []{name, type, optional?, default?}
+//	returns     {kind: "scalar"|"setof"|"table", type?, columns?}
+//	volatility  "volatile"|"stable"|"immutable"   (default: volatile)
+//
+// Returns an error when the JSON is malformed; an empty array yields an empty
+// registry. Schemas are stripped from names; a name of "api.add" resolves as "add".
+func ParseRegistry(rawJSON string) (*StaticRegistry, error) {
+	rawJSON = strings.TrimSpace(rawJSON)
+	if rawJSON == "" {
+		return NewStaticRegistry(nil), nil
+	}
+	type paramDecl struct {
+		Name     string `json:"name"`
+		Type     string `json:"type"`
+		Optional bool   `json:"optional"`
+		Default  any    `json:"default"`
+	}
+	type returnDecl struct {
+		Kind    string `json:"kind"`
+		Type    string `json:"type"`
+		Columns []struct {
+			Name string `json:"name"`
+			Type string `json:"type"`
+		} `json:"columns"`
+	}
+	type fnDecl struct {
+		Name       string     `json:"name"`
+		SQL        string     `json:"sql"`
+		Params     []paramDecl `json:"params"`
+		Returns    returnDecl  `json:"returns"`
+		Volatility string      `json:"volatility"`
+	}
+	var decls []fnDecl
+	if err := json.Unmarshal([]byte(rawJSON), &decls); err != nil {
+		return nil, fmt.Errorf("function-registry: %w", err)
+	}
+	fns := make([]*Function, 0, len(decls))
+	for _, d := range decls {
+		// Strip schema prefix (e.g. "api.add" → "add").
+		name := d.Name
+		if dot := strings.LastIndex(name, "."); dot >= 0 {
+			name = name[dot+1:]
+		}
+		var vol Volatility
+		switch strings.ToLower(d.Volatility) {
+		case "stable":
+			vol = Stable
+		case "immutable":
+			vol = Immutable
+		default:
+			vol = Volatile
+		}
+		params := make([]Param, len(d.Params))
+		for i, p := range d.Params {
+			params[i] = Param{
+				Name:     p.Name,
+				Type:     p.Type,
+				Optional: p.Optional,
+				Default:  p.Default,
+			}
+		}
+		var ret ReturnShape
+		switch strings.ToLower(d.Returns.Kind) {
+		case "setof":
+			ret.Kind = ReturnSetOf
+		case "table":
+			ret.Kind = ReturnTable
+			ret.Columns = make([]Column, len(d.Returns.Columns))
+			for i, c := range d.Returns.Columns {
+				ret.Columns[i] = Column{Name: c.Name, Type: c.Type}
+			}
+		default:
+			ret.Kind = ReturnScalar
+		}
+		ret.Type = d.Returns.Type
+		fns = append(fns, &Function{
+			Name:       name,
+			Params:     params,
+			Returns:    ret,
+			Volatility: vol,
+			Query:      &PortableQuery{SQL: d.SQL},
+		})
+	}
+	return NewStaticRegistry(fns), nil
 }
 
 // EmptyRegistry is a registry with no functions; every Lookup misses. A backend

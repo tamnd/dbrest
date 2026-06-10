@@ -146,8 +146,44 @@ func (dialect) SessionRead(string) string { return "" }
 // SessionWrite reports ok=false: there is no engine setting to write.
 func (dialect) SessionWrite(string) (string, bool) { return "", false }
 
-// ArrayOp returns false; SQLite has no array types or containment operators.
-func (dialect) ArrayOp(_, _, _ string) (string, bool) { return "", false }
+// ArrayLiteral converts a PostgreSQL {a,b} array literal to a JSON array
+// ["a","b"] so json_each() in ArrayOp can iterate over it.
+func (dialect) ArrayLiteral(pgText string) string {
+	s := strings.TrimSpace(pgText)
+	if len(s) < 2 || s[0] != '{' || s[len(s)-1] != '}' {
+		return pgText // already JSON or empty; pass through
+	}
+	inner := s[1 : len(s)-1]
+	if inner == "" {
+		return "[]"
+	}
+	parts := strings.Split(inner, ",")
+	quoted := make([]string, len(parts))
+	for i, p := range parts {
+		p = strings.TrimSpace(p)
+		if len(p) >= 2 && p[0] == '"' && p[len(p)-1] == '"' {
+			quoted[i] = p // already JSON-quoted
+		} else {
+			quoted[i] = `"` + strings.ReplaceAll(p, `"`, `\"`) + `"`
+		}
+	}
+	return "[" + strings.Join(quoted, ",") + "]"
+}
+
+// ArrayOp implements array containment/overlap via SQLite's json_each(). The
+// column must be stored as a JSON array text (e.g. '["cat","work"]'). op is
+// one of "@>" (contains), "<@" (contained-by), "&&" (overlaps).
+func (dialect) ArrayOp(col, op, val string) (string, bool) {
+	switch op {
+	case "@>": // contains: every element of val appears in col
+		return "NOT EXISTS (SELECT 1 FROM json_each(" + val + ") AS f WHERE f.value NOT IN (SELECT value FROM json_each(" + col + ")))", true
+	case "<@": // contained-by: every element of col appears in val
+		return "NOT EXISTS (SELECT 1 FROM json_each(" + col + ") AS f WHERE f.value NOT IN (SELECT value FROM json_each(" + val + ")))", true
+	case "&&": // overlaps: at least one common element
+		return "EXISTS (SELECT 1 FROM json_each(" + col + ") AS f WHERE f.value IN (SELECT value FROM json_each(" + val + ")))", true
+	}
+	return "", false
+}
 
 // ILike uses plain LIKE which is case-insensitive for ASCII in SQLite.
 func (dialect) ILike(col, val string) (string, bool) { return col + " LIKE " + val, true }

@@ -21,6 +21,7 @@ import (
 	_ "github.com/tamnd/dbrest/backend/sqlserver"
 	"github.com/tamnd/dbrest/config"
 	"github.com/tamnd/dbrest/httpapi"
+	"github.com/tamnd/dbrest/rpc"
 )
 
 func main() {
@@ -78,6 +79,17 @@ func openBackend(cfg *config.Config) (backend.Backend, error) {
 	}
 	if sc, ok := be.(interface{ SetSchemas([]string) }); ok {
 		sc.SetSchemas(cfg.Schemas)
+	}
+	// Wire declared function registry for backends that cannot discover
+	// functions from an engine catalog (NativeRPC=false: SQLite, MySQL, …).
+	if cfg.FunctionRegistry != "" {
+		reg, err := rpc.ParseRegistry(cfg.FunctionRegistry)
+		if err != nil {
+			return nil, fmt.Errorf("function-registry: %w", err)
+		}
+		if r, ok := be.(interface{ Register(rpc.Registry) }); ok {
+			r.Register(reg)
+		}
 	}
 	return be, nil
 }

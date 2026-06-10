@@ -236,3 +236,7 @@ func (Dialect) BoolValue(v bool) string {
 	}
 	return "FALSE"
 }
+
+// ArrayLiteral returns the PostgreSQL {a,b} array literal unchanged; PostgreSQL
+// accepts it natively.
+func (Dialect) ArrayLiteral(pgText string) string { return pgText }

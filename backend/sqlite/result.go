@@ -2,7 +2,9 @@ package sqlite
 
 import (
 	"database/sql"
+	"encoding/json"
 	"io"
+	"strings"
 
 	"github.com/tamnd/dbrest/backend"
 	"github.com/tamnd/dbrest/reqctx"
@@ -64,8 +66,9 @@ func (s *bufStream) Close() error           { return nil }
 // rowStream is a forward-only cursor over the result rows. Values decode each
 // row into a []any the renderer maps to JSON by column name.
 type rowStream struct {
-	rows *sql.Rows
-	cols []string
+	rows     *sql.Rows
+	cols     []string
+	colTypes []*sql.ColumnType // lazily populated on first call to Values
 }
 
 func (s *rowStream) Columns() []string { return s.cols }
@@ -74,9 +77,19 @@ func (s *rowStream) Err() error        { return s.rows.Err() }
 func (s *rowStream) Close() error      { return s.rows.Close() }
 
 // Values scans the current row into Go values. SQLite returns int64, float64,
-// string, []byte, or nil; []byte is normalized to string so text columns render
-// as JSON strings rather than base64.
+// string, []byte, or nil. Post-scan coercions:
+//   - []byte → string so text columns render as JSON strings rather than base64.
+//   - BOOLEAN/BOOL declared columns: int64 0/1 → false/true so JSON marshals
+//     correctly as false/true rather than 0/1.
+//   - JSON declared columns: string → json.RawMessage so the JSON encoder embeds
+//     the value verbatim rather than quoting it as a string.
 func (s *rowStream) Values() ([]any, error) {
+	if s.colTypes == nil {
+		ct, err := s.rows.ColumnTypes()
+		if err == nil {
+			s.colTypes = ct
+		}
+	}
 	holders := make([]any, len(s.cols))
 	ptrs := make([]any, len(s.cols))
 	for i := range holders {
@@ -87,7 +100,20 @@ func (s *rowStream) Values() ([]any, error) {
 	}
 	for i, v := range holders {
 		if b, ok := v.([]byte); ok {
-			holders[i] = string(b)
+			v = string(b)
+			holders[i] = v
+		}
+		if s.colTypes != nil && i < len(s.colTypes) {
+			switch strings.ToUpper(s.colTypes[i].DatabaseTypeName()) {
+			case "BOOLEAN", "BOOL":
+				if n, ok := v.(int64); ok {
+					holders[i] = n != 0
+				}
+			case "JSON":
+				if str, ok := v.(string); ok {
+					holders[i] = json.RawMessage(str)
+				}
+			}
 		}
 	}
 	return holders, nil

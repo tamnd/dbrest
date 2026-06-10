@@ -601,7 +601,9 @@ func (b *builder) writeCompare(c ir.Compare) *pgerr.APIError {
 		default:
 			sqlOp = "&&"
 		}
-		val := b.bind(c.Value.Text)
+		// Normalize the PostgreSQL {a,b} array literal to the engine's format
+		// before binding; the dialect is a no-op for engines that accept {a,b}.
+		val := b.bind(b.d.ArrayLiteral(c.Value.Text))
 		var ok bool
 		frag, ok = b.d.ArrayOp(col, sqlOp, val)
 		if !ok {

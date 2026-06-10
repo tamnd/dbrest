@@ -92,6 +92,13 @@ type Dialect interface {
 	// op is one of "@>", "<@", "&&"; col is the quoted column; val is the
 	// placeholder returned by bind().
 	ArrayOp(col, op, val string) (string, bool)
+
+	// ArrayLiteral converts a PostgREST array literal (PostgreSQL {a,b} syntax)
+	// to the engine's native format for use as a bound parameter. PostgreSQL
+	// accepts {a,b} natively; SQLite needs JSON ["a","b"]. Other engines that
+	// do not support arrays may return the text unchanged (they never reach
+	// ArrayOp either).
+	ArrayLiteral(pgText string) string
 }
 
 // PatternMark is the sentinel a Dialect.Regex fragment carries where the bound
