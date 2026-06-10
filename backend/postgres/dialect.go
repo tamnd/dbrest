@@ -222,7 +222,7 @@ func sqlLiteral(s string) string {
 }
 
 // ArrayOp renders a PostgreSQL array containment/overlap expression.
-func (Dialect) ArrayOp(col, op, val string) (string, bool) {
+func (Dialect) ArrayOp(col, op, val, _ string) (string, bool) {
 	return col + " " + op + " " + val, true
 }
 

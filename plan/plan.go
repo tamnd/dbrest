@@ -323,6 +323,15 @@ func validateCond(rel *schema.Relation, c *ir.Cond) *pgerr.APIError {
 			n.FullText = rel.FullTextIndexFor(n.Path[0])
 			*c = n
 		}
+		// Array operators carry the column's canonical type so the dialect can
+		// decide whether the column supports array semantics (e.g. SQLite's
+		// json_each only applies to JSON-typed columns). See spec 21.
+		if (n.Op == ir.OpContains || n.Op == ir.OpContained || n.Op == ir.OpOverlap) && len(n.Path) == 1 {
+			if col, ok := rel.Column(n.Path[0]); ok {
+				n.ColumnType = col.Type
+				*c = n
+			}
+		}
 	}
 	return nil
 }

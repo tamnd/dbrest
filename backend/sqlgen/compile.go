@@ -606,7 +606,7 @@ func (b *builder) writeCompare(c ir.Compare) *pgerr.APIError {
 		// before binding; the dialect is a no-op for engines that accept {a,b}.
 		val := b.bind(b.d.ArrayLiteral(c.Value.Text))
 		var ok bool
-		frag, ok = b.d.ArrayOp(col, sqlOp, val)
+		frag, ok = b.d.ArrayOp(col, sqlOp, val, c.ColumnType)
 		if !ok {
 			return pgerr.ErrUnsupported("array operator "+sqlOp, "sql")
 		}

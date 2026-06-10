@@ -255,8 +255,8 @@ func ParseRegistry(rawJSON string) (*StaticRegistry, error) {
 		} `json:"columns"`
 	}
 	type fnDecl struct {
-		Name       string     `json:"name"`
-		SQL        string     `json:"sql"`
+		Name       string      `json:"name"`
+		SQL        string      `json:"sql"`
 		Params     []paramDecl `json:"params"`
 		Returns    returnDecl  `json:"returns"`
 		Volatility string      `json:"volatility"`

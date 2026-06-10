@@ -222,6 +222,11 @@ type Compare struct {
 	FTS      FTSVariant
 	Config   string
 	FullText *schema.FullTextIndex
+	// ColumnType is the canonical type of the column at Path[0], resolved by
+	// the planner from the schema. The dialect uses it to decide whether an
+	// engine-specific operator (e.g. json_each for array ops on SQLite) can
+	// apply; it is empty when the column is unknown or for multi-step paths.
+	ColumnType string
 }
 
 func (Compare) isCond() {}

@@ -171,9 +171,14 @@ func (dialect) ArrayLiteral(pgText string) string {
 }
 
 // ArrayOp implements array containment/overlap via SQLite's json_each(). The
-// column must be stored as a JSON array text (e.g. '["cat","work"]'). op is
-// one of "@>" (contains), "<@" (contained-by), "&&" (overlaps).
-func (dialect) ArrayOp(col, op, val string) (string, bool) {
+// column must be declared as JSON type and store a JSON array (e.g.
+// '["cat","work"]'). For any other column type the operator is unsupported
+// (ok=false) so the compiler raises PGRST127. op is one of "@>" (contains),
+// "<@" (contained-by), "&&" (overlaps).
+func (dialect) ArrayOp(col, op, val, colType string) (string, bool) {
+	if colType != "json" && colType != "jsonb" {
+		return "", false
+	}
 	switch op {
 	case "@>": // contains: every element of val appears in col
 		return "NOT EXISTS (SELECT 1 FROM json_each(" + val + ") AS f WHERE f.value NOT IN (SELECT value FROM json_each(" + col + ")))", true

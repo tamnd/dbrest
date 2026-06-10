@@ -193,7 +193,7 @@ func (Dialect) SessionRead(string) string { return "" }
 func (Dialect) SessionWrite(string) (string, bool) { return "", false }
 
 // ArrayOp returns false; MySQL has no native array types or containment operators.
-func (Dialect) ArrayOp(_, _, _ string) (string, bool) { return "", false }
+func (Dialect) ArrayOp(_, _, _, _ string) (string, bool) { return "", false }
 
 // ILike uses plain LIKE; MySQL's default utf8mb4_unicode_ci collation is CI.
 func (Dialect) ILike(col, val string) (string, bool) { return col + " LIKE " + val, true }

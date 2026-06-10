@@ -219,7 +219,7 @@ func (Dialect) SessionWrite(key string) (string, bool) {
 }
 
 // ArrayOp returns false; SQL Server has no array types or containment operators.
-func (Dialect) ArrayOp(_, _, _ string) (string, bool) { return "", false }
+func (Dialect) ArrayOp(_, _, _, _ string) (string, bool) { return "", false }
 
 // ILike uses plain LIKE; SQL Server's default collation is case-insensitive.
 func (Dialect) ILike(col, val string) (string, bool) { return col + " LIKE " + val, true }

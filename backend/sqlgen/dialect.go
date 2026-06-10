@@ -87,11 +87,13 @@ type Dialect interface {
 	BoolValue(v bool) string
 
 	// ArrayOp renders an array containment/overlap operator expression, or
-	// reports ok=false when the engine does not support array types (SQLite,
-	// MySQL, SQL Server). The compiler emits PGRST127 when ok=false.
-	// op is one of "@>", "<@", "&&"; col is the quoted column; val is the
-	// placeholder returned by bind().
-	ArrayOp(col, op, val string) (string, bool)
+	// reports ok=false when the engine does not support array types (MySQL, SQL
+	// Server) or when the column type does not support array semantics (SQLite
+	// requires a JSON-typed column for json_each). The compiler emits PGRST127
+	// when ok=false. op is one of "@>", "<@", "&&"; col is the quoted column;
+	// val is the placeholder returned by bind(); colType is the canonical
+	// column type resolved by the planner ("json", "text", "integer", …).
+	ArrayOp(col, op, val, colType string) (string, bool)
 
 	// ArrayLiteral converts a PostgREST array literal (PostgreSQL {a,b} syntax)
 	// to the engine's native format for use as a bound parameter. PostgreSQL
