@@ -192,8 +192,25 @@ func (Dialect) SessionRead(string) string { return "" }
 // SessionWrite reports ok=false: there is no engine setting to write.
 func (Dialect) SessionWrite(string) (string, bool) { return "", false }
 
-// ArrayOp returns false; MySQL has no native array types or containment operators.
-func (Dialect) ArrayOp(_, _, _, _ string) (string, bool) { return "", false }
+// ArrayOp renders a JSON array containment/overlap expression using MySQL's
+// JSON_CONTAINS and JSON_OVERLAPS functions (MySQL 8.0.17+). The column must be
+// declared as JSON type; for any other column type ok=false is returned so the
+// compiler raises PGRST127. colType is the canonical column type enriched by the
+// planner; op is one of "@>" (contains), "<@" (contained-by), "&&" (overlaps).
+func (Dialect) ArrayOp(col, op, val, colType string) (string, bool) {
+	if colType != "json" && colType != "jsonb" {
+		return "", false
+	}
+	switch op {
+	case "@>": // contains: col contains all elements of val
+		return "JSON_CONTAINS(" + col + ", " + val + ")", true
+	case "<@": // contained-by: val contains all elements of col
+		return "JSON_CONTAINS(" + val + ", " + col + ")", true
+	case "&&": // overlaps: at least one common element
+		return "JSON_OVERLAPS(" + col + ", " + val + ")", true
+	}
+	return "", false
+}
 
 // ILike uses plain LIKE; MySQL's default utf8mb4_unicode_ci collation is CI.
 func (Dialect) ILike(col, val string) (string, bool) { return col + " LIKE " + val, true }
@@ -207,6 +224,26 @@ func (Dialect) BoolValue(v bool) string {
 	return "0"
 }
 
-// ArrayLiteral returns the text unchanged; MySQL does not support arrays, so
-// ArrayOp returns false before this value is ever used.
-func (Dialect) ArrayLiteral(pgText string) string { return pgText }
+// ArrayLiteral converts a PostgreSQL {a,b} array literal to a JSON array
+// ["a","b"] so JSON_CONTAINS/JSON_OVERLAPS in ArrayOp can process it.
+func (Dialect) ArrayLiteral(pgText string) string {
+	s := strings.TrimSpace(pgText)
+	if len(s) < 2 || s[0] != '{' || s[len(s)-1] != '}' {
+		return pgText // already JSON or empty; pass through
+	}
+	inner := s[1 : len(s)-1]
+	if inner == "" {
+		return "[]"
+	}
+	parts := strings.Split(inner, ",")
+	quoted := make([]string, len(parts))
+	for i, p := range parts {
+		p = strings.TrimSpace(p)
+		if len(p) >= 2 && p[0] == '"' && p[len(p)-1] == '"' {
+			quoted[i] = p // already JSON-quoted
+		} else {
+			quoted[i] = `"` + strings.ReplaceAll(p, `"`, `\"`) + `"`
+		}
+	}
+	return "[" + strings.Join(quoted, ",") + "]"
+}
