@@ -654,10 +654,13 @@ func asAPIError(b backend.Backend, err error) *pgerr.APIError {
 // (insufficient_privilege) error to an anonymous request is 401 (authentication
 // required), not 403 (forbidden). An authenticated request that is denied
 // remains 403 so the caller knows to authenticate, not just retry.
+// The original PostgreSQL message is preserved to match PostgREST wire behavior.
 func mapExecError(b backend.Backend, err error, anonymous bool) *pgerr.APIError {
 	e := asAPIError(b, err)
 	if anonymous && e.Code == pgerr.CodeInsufficientPrivilege {
-		e = pgerr.ErrPermissionDenied("", anonymous)
+		lifted := *e
+		lifted.HTTPStatus = http.StatusUnauthorized
+		return &lifted
 	}
 	return e
 }
