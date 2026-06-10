@@ -110,7 +110,7 @@ func (s *rowStream) Values() ([]any, error) {
 					holders[i] = n != 0
 				}
 			case "JSON":
-				if str, ok := v.(string); ok {
+				if str, ok := v.(string); ok && json.Valid([]byte(str)) {
 					holders[i] = json.RawMessage(str)
 				}
 			}
