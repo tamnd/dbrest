@@ -36,75 +36,52 @@ func (b *Backend) Execute(ctx context.Context, plan *ir.Plan, rc *reqctx.Context
 	}
 }
 
-// executeRead compiles and runs the windowed read. The entire request is sent as
-// a single pgx.Batch: [BEGIN, session setup, count (if needed), query, ROLLBACK].
-// One network write to PostgreSQL covers all round trips, matching PostgREST's
-// hasql pipeline behaviour. Rows stream from within the open batch; Close drains
-// the trailing ROLLBACK item and releases the connection.
+// executeRead compiles and runs the windowed read in a read-only transaction.
+// Session setup (SET LOCAL ROLE, search_path, GUCs) is applied via applySession
+// before the main query is sent so the PostgreSQL planner sees the correct role
+// at parse time. Rows stream from within the open transaction; Close commits it.
+//
+// Note: a single-batch approach (BEGIN + session + query + ROLLBACK in one
+// pipeline) would let pgx pre-parse the main SELECT while the connection is still
+// authenticator (NOINHERIT, no schema USAGE), causing a 42501 error. applySession
+// completes its batch before the main query is issued, so Parse runs as the
+// request role, which has the required privileges.
 func (b *Backend) executeRead(ctx context.Context, plan *ir.Plan, rc *reqctx.Context) (backend.Result, error) {
-	conn, err := b.pool.Acquire(ctx)
+	tx, err := b.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return nil, b.MapError(err)
 	}
-	release := func() { conn.Release() }
+	rollback := func() { _ = tx.Rollback(ctx) }
 
-	// Build the single batch: BEGIN → session → [count] → query → ROLLBACK.
-	batch := &pgx.Batch{}
-	batch.Queue("BEGIN TRANSACTION READ ONLY")
-	sessionN := queueSessionItems(batch, b, rc)
+	if err := applySession(ctx, tx, b, rc); err != nil {
+		rollback()
+		return nil, b.MapError(err)
+	}
 
-	hasCount := plan.Query.Count != ir.CountNone
-	var cst *sqlgen.Statement
-	if hasCount {
-		var apiErr *pgerr.APIError
-		cst, apiErr = sqlgen.CompileCount(Dialect{}, plan.Query)
+	res := &streamResult{ctx: ctx, tx: tx, controls: rc.Controls()}
+
+	if plan.Query.Count != ir.CountNone {
+		cst, apiErr := sqlgen.CompileCount(Dialect{}, plan.Query)
 		if apiErr != nil {
-			release()
+			rollback()
 			return nil, apiErr
 		}
-		batch.Queue(cst.SQL, cst.Args...)
-	}
-
-	st, apiErr := sqlgen.CompileRead(Dialect{}, plan.Query)
-	if apiErr != nil {
-		release()
-		return nil, apiErr
-	}
-	batch.Queue(st.SQL, st.Args...)
-	batch.Queue("ROLLBACK")
-
-	br := conn.SendBatch(ctx, batch)
-
-	abort := func(e error) (backend.Result, error) {
-		_ = br.Close()
-		release()
-		return nil, e
-	}
-
-	// Drain BEGIN.
-	if _, err := br.Exec(); err != nil {
-		return abort(b.MapError(err))
-	}
-	// Drain session setup items.
-	for range sessionN {
-		if _, err := br.Exec(); err != nil {
-			return abort(b.MapError(err))
-		}
-	}
-
-	res := &batchStreamResult{ctx: ctx, conn: conn, br: br, controls: rc.Controls()}
-
-	if hasCount {
-		_ = cst // already queued
-		if err := br.QueryRow().Scan(&res.count); err != nil {
-			return abort(b.MapError(err))
+		if err := tx.QueryRow(ctx, cst.SQL, cst.Args...).Scan(&res.count); err != nil {
+			rollback()
+			return nil, b.MapError(err)
 		}
 		res.hasCount = true
 	}
 
-	rows, err := br.Query()
+	st, apiErr := sqlgen.CompileRead(Dialect{}, plan.Query)
+	if apiErr != nil {
+		rollback()
+		return nil, apiErr
+	}
+	rows, err := tx.Query(ctx, st.SQL, st.Args...)
 	if err != nil {
-		return abort(b.MapError(err))
+		rollback()
+		return nil, b.MapError(err)
 	}
 	res.rows = rows
 	res.cols = fieldNames(rows)
@@ -413,11 +390,15 @@ func fieldNames(rows pgx.Rows) []string {
 // in a read-only transaction with the full session setup (role + GUCs) so the
 // planner sees the same context as a real request.
 func (b *Backend) ExplainRead(ctx context.Context, p *ir.Plan, rc *reqctx.Context, analyze bool) ([]byte, error) {
-	conn, err := b.pool.Acquire(ctx)
+	tx, err := b.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return nil, b.MapError(err)
 	}
-	defer conn.Release()
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := applySession(ctx, tx, b, rc); err != nil {
+		return nil, b.MapError(err)
+	}
 
 	st, apiErr := sqlgen.CompileRead(Dialect{}, p.Query)
 	if apiErr != nil {
@@ -430,27 +411,7 @@ func (b *Backend) ExplainRead(ctx context.Context, p *ir.Plan, rc *reqctx.Contex
 	} else {
 		prefix = "EXPLAIN (FORMAT JSON) "
 	}
-	explainSQL := prefix + st.SQL
-
-	batch := &pgx.Batch{}
-	batch.Queue("BEGIN TRANSACTION READ ONLY")
-	sessionN := queueSessionItems(batch, b, rc)
-	batch.Queue(explainSQL, st.Args...)
-	batch.Queue("ROLLBACK")
-
-	br := conn.SendBatch(ctx, batch)
-	defer br.Close()
-
-	if _, err := br.Exec(); err != nil {
-		return nil, b.MapError(err)
-	}
-	for range sessionN {
-		if _, err := br.Exec(); err != nil {
-			return nil, b.MapError(err)
-		}
-	}
-
-	rows, err := br.Query()
+	rows, err := tx.Query(ctx, prefix+st.SQL, st.Args...)
 	if err != nil {
 		return nil, b.MapError(err)
 	}

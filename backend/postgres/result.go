@@ -8,7 +8,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/tamnd/dbrest/backend"
 	"github.com/tamnd/dbrest/reqctx"
@@ -75,64 +74,6 @@ func (s *streamRows) Close() error {
 		return err
 	}
 	return s.tx.Commit(s.ctx)
-}
-
-// batchStreamResult adapts an in-flight pgx.BatchResults to the backend.Result
-// contract for a read. The entire request (BEGIN + session setup + query +
-// ROLLBACK) was sent in one pgx.Batch network write; the caller has already
-// consumed the non-row items and positioned br at the query result. Streaming
-// rows through the open BatchResults and draining ROLLBACK at Close reduces the
-// read path to a single PostgreSQL round trip.
-type batchStreamResult struct {
-	ctx      context.Context
-	conn     *pgxpool.Conn
-	br       pgx.BatchResults
-	rows     pgx.Rows
-	cols     []string
-	controls *reqctx.ResponseControls
-	count    int64
-	hasCount bool
-}
-
-func (r *batchStreamResult) Body() io.Reader { return nil }
-func (r *batchStreamResult) Rows() backend.RowStream {
-	return &batchStreamRows{ctx: r.ctx, conn: r.conn, br: r.br, rows: r.rows, cols: r.cols}
-}
-func (r *batchStreamResult) Count() (int64, bool)                       { return r.count, r.hasCount }
-func (r *batchStreamResult) Affected() (int64, bool)                    { return 0, false }
-func (r *batchStreamResult) ResponseControls() *reqctx.ResponseControls { return r.controls }
-
-// batchStreamRows streams rows from within an open pgx.BatchResults. On Close
-// it drains the remaining ROLLBACK item, closes the batch, and releases the
-// connection back to the pool.
-type batchStreamRows struct {
-	ctx  context.Context
-	conn *pgxpool.Conn
-	br   pgx.BatchResults
-	rows pgx.Rows
-	cols []string
-}
-
-func (s *batchStreamRows) Columns() []string { return s.cols }
-func (s *batchStreamRows) Next() bool        { return s.rows.Next() }
-func (s *batchStreamRows) Err() error        { return s.rows.Err() }
-
-func (s *batchStreamRows) Values() ([]any, error) {
-	vals, err := s.rows.Values()
-	if err != nil {
-		return nil, err
-	}
-	return normalizeValues(vals, s.rows.FieldDescriptions()), nil
-}
-
-// Close drains the ROLLBACK batch item and releases the connection.
-func (s *batchStreamRows) Close() error {
-	s.rows.Close()
-	rowErr := s.rows.Err()
-	s.br.Exec() //nolint:errcheck // ROLLBACK; ignore error, it's cleanup
-	_ = s.br.Close()
-	s.conn.Release()
-	return rowErr
 }
 
 // bufResult holds the buffered outcome of a write or a function call. A write
