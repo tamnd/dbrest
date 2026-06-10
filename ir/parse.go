@@ -420,7 +420,14 @@ func buildInsert(objs []map[string]any, columnsParam string, header []string) ([
 	var cols []string
 	switch {
 	case columnsParam != "":
-		cols = splitComma(columnsParam)
+		raw := splitComma(columnsParam)
+		cols = make([]string, len(raw))
+		for i, c := range raw {
+			if len(c) >= 2 && c[0] == '"' && c[len(c)-1] == '"' {
+				c = c[1 : len(c)-1]
+			}
+			cols[i] = c
+		}
 	case header != nil:
 		cols = header
 	case len(objs) > 0:
@@ -473,6 +480,12 @@ func parseSelect(s string) ([]SelectItem, []Embed, *pgerr.APIError) {
 			}
 			items = append(items, EmbedRef{Index: len(embeds)})
 			embeds = append(embeds, emb)
+			continue
+		}
+		// PostgREST supports a bare "count" inside an embed select as a virtual
+		// aggregate that maps to count(*) in the JSON output.
+		if raw == "count" {
+			items = append(items, Aggregate{Func: AggCount})
 			continue
 		}
 		col, perr := parseColumnItem(raw)

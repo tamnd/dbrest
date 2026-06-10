@@ -333,18 +333,17 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity)
 	q.Singular = media == mediaObject
 
 	// Range: header overrides ?limit=&offset= and marks the request as a
-	// Range request so the server can return 206 Partial Content, matching
-	// PostgREST's behaviour: 206 only comes from a Range header (or from
-	// count=exact showing the window is partial).
-	if rangeUnit := r.Header.Get("Range-Unit"); rangeUnit == "items" {
-		if rangeHdr := r.Header.Get("Range"); rangeHdr != "" {
-			if off, lim, ok := parseRangeHeader(rangeHdr); ok {
-				q.Offset = &off
-				if lim >= 0 {
-					l := lim
-					q.Limit = &l
-					q.FromRange = true // bounded Range → eligible for 206
-				}
+	// Range request so the server can return 206 Partial Content. PostgREST
+	// accepts Range: 0-9 (item range) without requiring Range-Unit: items.
+	// Only treat Range as item pagination when it has no unit prefix (i.e.
+	// not "bytes=0-9" form), matching PostgREST's parsing behaviour.
+	if rangeHdr := r.Header.Get("Range"); rangeHdr != "" && !strings.Contains(rangeHdr, "=") {
+		if off, lim, ok := parseRangeHeader(rangeHdr); ok {
+			q.Offset = &off
+			if lim >= 0 {
+				l := lim
+				q.Limit = &l
+				q.FromRange = true // bounded Range → eligible for 206
 			}
 		}
 	}
@@ -464,6 +463,13 @@ func (s *Server) writeWrite(w http.ResponseWriter, r *http.Request, q *ir.Query,
 
 	representation := q.Write.Return == ir.ReturnRepresentation
 	if !representation {
+		// When count=exact was requested, include Content-Range: */<n> so the
+		// client knows how many rows were affected, matching PostgREST's wire.
+		if q.Count == ir.CountExact {
+			if n, ok := res.Affected(); ok {
+				w.Header().Set("Content-Range", fmt.Sprintf("*/%d", n))
+			}
+		}
 		w.WriteHeader(applyControls(w, ctrl, writeStatus(r.Method, q.Kind, false, ctrl)))
 		return
 	}
@@ -475,7 +481,16 @@ func (s *Server) writeWrite(w http.ResponseWriter, r *http.Request, q *ir.Query,
 	}
 	w.Header().Set("Content-Type", out.contentType)
 	if !q.Singular {
-		w.Header().Set("Content-Range", contentRange(0, out.nRows, 0, false))
+		// For writes with count=exact, include the total in Content-Range.
+		if q.Count == ir.CountExact {
+			if n, ok := res.Affected(); ok {
+				w.Header().Set("Content-Range", contentRange(0, out.nRows, n, true))
+			} else {
+				w.Header().Set("Content-Range", contentRange(0, out.nRows, 0, false))
+			}
+		} else {
+			w.Header().Set("Content-Range", contentRange(0, out.nRows, 0, false))
+		}
 	}
 	w.WriteHeader(applyControls(w, ctrl, writeStatus(r.Method, q.Kind, true, ctrl)))
 	if r.Method != http.MethodHead {

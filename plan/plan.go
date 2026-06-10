@@ -278,6 +278,9 @@ func validateSelect(rel *schema.Relation, items []ir.SelectItem) *pgerr.APIError
 			// Aggregates and embeds are checked by their subsystems; leave them.
 			continue
 		}
+		if isStarPath(col.Path) {
+			continue
+		}
 		if err := checkColumn(rel, col.Path); err != nil {
 			return err
 		}

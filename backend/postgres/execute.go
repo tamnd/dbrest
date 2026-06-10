@@ -328,7 +328,11 @@ func (b *Backend) compileNativeCall(c *ir.Call) (*sqlgen.Statement, *pgerr.APIEr
 		sb.WriteString(d.QuoteIdent(name))
 		sb.WriteString(" := ")
 		sb.WriteString(d.Placeholder(i + 1))
-		args = append(args, val.Text)
+		if val.JSON != nil {
+			args = append(args, val.JSON)
+		} else {
+			args = append(args, val.Text)
+		}
 		i++
 	}
 	sb.WriteString(")")

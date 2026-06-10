@@ -290,6 +290,10 @@ func (b *builder) embedObject(emb *ir.Embed, alias string) (string, *pgerr.APIEr
 				return "", err
 			}
 			pairs = append(pairs, Pair{Key: nested.OutKey, Value: b.d.Cast(sub, "json")})
+		case ir.Aggregate:
+			if v.Func == ir.AggCount && v.Arg == nil {
+				pairs = append(pairs, Pair{Key: "count", Value: "count(*)"})
+			}
 		default:
 			return "", pgerr.ErrUnsupported("aggregates in embedded resources", "sql")
 		}
