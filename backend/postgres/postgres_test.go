@@ -81,7 +81,7 @@ func TestStatusForSQLState(t *testing.T) {
 		{"25006", 405},
 		{"42883", 404},
 		{"42P01", 404},
-		{"42501", 403},
+		{"42501", 401}, // matches PostgREST: insufficient_privilege → 401
 		// PTxxx convention
 		{"PT403", 403},
 		{"PT201", 201},

@@ -2,6 +2,8 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
+	"strconv"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -36,75 +38,52 @@ func (b *Backend) Execute(ctx context.Context, plan *ir.Plan, rc *reqctx.Context
 	}
 }
 
-// executeRead compiles and runs the windowed read. The entire request is sent as
-// a single pgx.Batch: [BEGIN, session setup, count (if needed), query, ROLLBACK].
-// One network write to PostgreSQL covers all round trips, matching PostgREST's
-// hasql pipeline behaviour. Rows stream from within the open batch; Close drains
-// the trailing ROLLBACK item and releases the connection.
+// executeRead compiles and runs the windowed read in a read-only transaction.
+// Session setup (SET LOCAL ROLE, search_path, GUCs) is applied via applySession
+// before the main query is sent so the PostgreSQL planner sees the correct role
+// at parse time. Rows stream from within the open transaction; Close commits it.
+//
+// Note: a single-batch approach (BEGIN + session + query + ROLLBACK in one
+// pipeline) would let pgx pre-parse the main SELECT while the connection is still
+// authenticator (NOINHERIT, no schema USAGE), causing a 42501 error. applySession
+// completes its batch before the main query is issued, so Parse runs as the
+// request role, which has the required privileges.
 func (b *Backend) executeRead(ctx context.Context, plan *ir.Plan, rc *reqctx.Context) (backend.Result, error) {
-	conn, err := b.pool.Acquire(ctx)
+	tx, err := b.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return nil, b.MapError(err)
 	}
-	release := func() { conn.Release() }
+	rollback := func() { _ = tx.Rollback(ctx) }
 
-	// Build the single batch: BEGIN → session → [count] → query → ROLLBACK.
-	batch := &pgx.Batch{}
-	batch.Queue("BEGIN TRANSACTION READ ONLY")
-	sessionN := queueSessionItems(batch, b, rc)
+	if err := applySession(ctx, tx, b, rc); err != nil {
+		rollback()
+		return nil, b.MapError(err)
+	}
 
-	hasCount := plan.Query.Count != ir.CountNone
-	var cst *sqlgen.Statement
-	if hasCount {
-		var apiErr *pgerr.APIError
-		cst, apiErr = sqlgen.CompileCount(Dialect{}, plan.Query)
+	res := &streamResult{ctx: ctx, tx: tx, controls: rc.Controls()}
+
+	if plan.Query.Count != ir.CountNone {
+		cst, apiErr := sqlgen.CompileCount(Dialect{}, plan.Query)
 		if apiErr != nil {
-			release()
+			rollback()
 			return nil, apiErr
 		}
-		batch.Queue(cst.SQL, cst.Args...)
-	}
-
-	st, apiErr := sqlgen.CompileRead(Dialect{}, plan.Query)
-	if apiErr != nil {
-		release()
-		return nil, apiErr
-	}
-	batch.Queue(st.SQL, st.Args...)
-	batch.Queue("ROLLBACK")
-
-	br := conn.SendBatch(ctx, batch)
-
-	abort := func(e error) (backend.Result, error) {
-		_ = br.Close()
-		release()
-		return nil, e
-	}
-
-	// Drain BEGIN.
-	if _, err := br.Exec(); err != nil {
-		return abort(b.MapError(err))
-	}
-	// Drain session setup items.
-	for range sessionN {
-		if _, err := br.Exec(); err != nil {
-			return abort(b.MapError(err))
-		}
-	}
-
-	res := &batchStreamResult{ctx: ctx, conn: conn, br: br, controls: rc.Controls()}
-
-	if hasCount {
-		_ = cst // already queued
-		if err := br.QueryRow().Scan(&res.count); err != nil {
-			return abort(b.MapError(err))
+		if err := tx.QueryRow(ctx, cst.SQL, cst.Args...).Scan(&res.count); err != nil {
+			rollback()
+			return nil, b.MapError(err)
 		}
 		res.hasCount = true
 	}
 
-	rows, err := br.Query()
+	st, apiErr := sqlgen.CompileRead(Dialect{}, plan.Query)
+	if apiErr != nil {
+		rollback()
+		return nil, apiErr
+	}
+	rows, err := tx.Query(ctx, st.SQL, st.Args...)
 	if err != nil {
-		return abort(b.MapError(err))
+		rollback()
+		return nil, b.MapError(err)
 	}
 	res.rows = rows
 	res.cols = fieldNames(rows)
@@ -324,10 +303,11 @@ func (b *Backend) executeCallRead(ctx context.Context, plan *ir.Plan, rc *reqctx
 
 // compileNativeCall generates the PostgreSQL function-call SQL for the native
 // RPC path (NativeRPC=true), where there is no declared function registry. It
-// renders SELECT * FROM schema.fn(arg := $1, ...) using the search path's first
-// schema as the function schema. Arguments come from the call's parsed arg map;
-// they are bound as named parameters (fn_name := $N) which is how PostgREST
-// calls PG functions. When no args are supplied the call has an empty arg list.
+// renders SELECT * FROM schema.fn(arg := <literal>, ...) with values embedded
+// as SQL literals so PostgreSQL infers the parameter types from the function
+// signature and the call does not depend on pgx OID mapping. String values are
+// single-quote escaped; numeric JSON values are written as numeric literals;
+// booleans become TRUE/FALSE; null or absent values become NULL.
 func (b *Backend) compileNativeCall(c *ir.Call) (*sqlgen.Statement, *pgerr.APIError) {
 	schema := "public"
 	if len(b.searchPath) > 0 {
@@ -342,7 +322,6 @@ func (b *Backend) compileNativeCall(c *ir.Call) (*sqlgen.Statement, *pgerr.APIEr
 	sb.WriteString(d.QuoteIdent(c.Function.Name))
 	sb.WriteString("(")
 
-	args := make([]any, 0, len(c.Args))
 	i := 0
 	for name, val := range c.Args {
 		if i > 0 {
@@ -350,12 +329,51 @@ func (b *Backend) compileNativeCall(c *ir.Call) (*sqlgen.Statement, *pgerr.APIEr
 		}
 		sb.WriteString(d.QuoteIdent(name))
 		sb.WriteString(" := ")
-		sb.WriteString(d.Placeholder(i + 1))
-		args = append(args, val.Text)
+		appendNativeArg(&sb, val)
 		i++
 	}
 	sb.WriteString(")")
-	return &sqlgen.Statement{SQL: sb.String(), Args: args}, nil
+	return &sqlgen.Statement{SQL: sb.String()}, nil
+}
+
+// appendNativeArg writes one function argument as a safe SQL literal. Numbers
+// are written unquoted so PostgreSQL resolves their type from context; strings
+// use single-quote escaping; booleans are TRUE/FALSE; anything else (including
+// absent values) becomes NULL. Objects and arrays are JSON-quoted.
+func appendNativeArg(sb *strings.Builder, val ir.Value) {
+	if val.JSON != nil {
+		switch v := val.JSON.(type) {
+		case string:
+			sb.WriteString("'")
+			sb.WriteString(strings.ReplaceAll(v, "'", "''"))
+			sb.WriteString("'")
+		case json.Number:
+			// json.Number from dec.UseNumber() — write as-is; it is a valid SQL numeric literal.
+			sb.WriteString(v.String())
+		case float64:
+			sb.WriteString(strconv.FormatFloat(v, 'f', -1, 64))
+		case bool:
+			if v {
+				sb.WriteString("TRUE")
+			} else {
+				sb.WriteString("FALSE")
+			}
+		default:
+			// JSON object / array: pass as json literal.
+			enc, _ := json.Marshal(v)
+			sb.WriteString("'")
+			sb.WriteString(strings.ReplaceAll(string(enc), "'", "''"))
+			sb.WriteString("'::json")
+		}
+		return
+	}
+	if val.Text != "" {
+		sb.WriteString("'")
+		sb.WriteString(strings.ReplaceAll(val.Text, "'", "''"))
+		sb.WriteString("'")
+		return
+	}
+	sb.WriteString("NULL")
 }
 
 // compileWrite dispatches to the right compiler for the mutation kind.
@@ -405,6 +423,50 @@ func fieldNames(rows pgx.Rows) []string {
 		names[i] = d.Name
 	}
 	return names
+}
+
+// ExplainRead runs EXPLAIN (FORMAT JSON) on the read query and returns the raw
+// JSON plan from PostgreSQL. When analyze is true EXPLAIN ANALYZE is used
+// instead, which also executes the query and includes timing. The request runs
+// in a read-only transaction with the full session setup (role + GUCs) so the
+// planner sees the same context as a real request.
+func (b *Backend) ExplainRead(ctx context.Context, p *ir.Plan, rc *reqctx.Context, analyze bool) ([]byte, error) {
+	tx, err := b.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, b.MapError(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := applySession(ctx, tx, b, rc); err != nil {
+		return nil, b.MapError(err)
+	}
+
+	st, apiErr := sqlgen.CompileRead(Dialect{}, p.Query)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+
+	var prefix string
+	if analyze {
+		prefix = "EXPLAIN (ANALYZE, FORMAT JSON) "
+	} else {
+		prefix = "EXPLAIN (FORMAT JSON) "
+	}
+	rows, err := tx.Query(ctx, prefix+st.SQL, st.Args...)
+	if err != nil {
+		return nil, b.MapError(err)
+	}
+	defer rows.Close()
+	var plan []byte
+	for rows.Next() {
+		if err := rows.Scan(&plan); err != nil {
+			return nil, b.MapError(err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, b.MapError(err)
+	}
+	return plan, nil
 }
 
 // drainRows reads every row of a pgx cursor into memory, normalizing values so

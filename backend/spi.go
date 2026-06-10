@@ -60,6 +60,16 @@ type Result interface {
 	ResponseControls() *reqctx.ResponseControls
 }
 
+// Explainer is an optional backend capability for the vnd.pgrst.plan+json
+// Accept type. Backends that support EXPLAIN implement this interface;
+// the frontend type-asserts to it and falls back to 406 when absent.
+type Explainer interface {
+	// ExplainRead runs EXPLAIN on the read query and returns raw JSON from the
+	// engine's query planner. If analyze is true the engine also executes and
+	// times the query (EXPLAIN ANALYZE equivalent).
+	ExplainRead(ctx context.Context, p *ir.Plan, rc *reqctx.Context, analyze bool) ([]byte, error)
+}
+
 // RowStream is a forward-only cursor over result rows. The renderer drives it to
 // assemble the response body when the backend does not assemble JSON itself.
 type RowStream interface {

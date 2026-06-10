@@ -554,12 +554,20 @@ func (b *builder) writeCompare(c ir.Compare) *pgerr.APIError {
 			frag = col + " " + binaryOp(c.Op) + " " + b.bind(c.Value.Text)
 		}
 	case ir.OpGt, ir.OpGte, ir.OpLt, ir.OpLte, ir.OpLike:
-		frag = col + " " + binaryOp(c.Op) + " " + b.bind(c.Value.Text)
+		if c.Quant != ir.QNone {
+			frag, err = b.writeLikeQuantified(col, ir.OpLike, c.Quant, c.Value.List)
+		} else {
+			frag = col + " " + binaryOp(c.Op) + " " + b.bind(c.Value.Text)
+		}
 	case ir.OpILike:
-		var ok bool
-		frag, ok = b.d.ILike(col, b.bind(c.Value.Text))
-		if !ok {
-			return pgerr.ErrUnsupported("case-insensitive LIKE", "sql")
+		if c.Quant != ir.QNone {
+			frag, err = b.writeLikeQuantified(col, ir.OpILike, c.Quant, c.Value.List)
+		} else {
+			var ok bool
+			frag, ok = b.d.ILike(col, b.bind(c.Value.Text))
+			if !ok {
+				return pgerr.ErrUnsupported("case-insensitive LIKE", "sql")
+			}
 		}
 	case ir.OpIn:
 		frag, err = b.writeIn(col, c.Value.List)
@@ -646,6 +654,40 @@ func (b *builder) writeIn(col string, list []string) (string, *pgerr.APIError) {
 		parts[i] = b.bind(v)
 	}
 	return col + " IN (" + strings.Join(parts, ", ") + ")", nil
+}
+
+// writeLikeQuantified expands like(any)/{...} and like(all)/{...} into a
+// conjunction or disjunction of individual LIKE / ILIKE predicates. An empty
+// list generates a no-match literal (1 = 0) for ANY and always-match (1 = 1)
+// for ALL, consistent with SQL ANY/ALL semantics over an empty set.
+func (b *builder) writeLikeQuantified(col string, op ir.Op, q ir.Quant, list []string) (string, *pgerr.APIError) {
+	if len(list) == 0 {
+		if q == ir.QAny {
+			return "1 = 0", nil
+		}
+		return "1 = 1", nil
+	}
+	sep := " OR "
+	if q == ir.QAll {
+		sep = " AND "
+	}
+	parts := make([]string, len(list))
+	for i, pat := range list {
+		bound := b.bind(pat)
+		if op == ir.OpILike {
+			expr, ok := b.d.ILike(col, bound)
+			if !ok {
+				return "", pgerr.ErrUnsupported("case-insensitive LIKE", "sql")
+			}
+			parts[i] = expr
+		} else {
+			parts[i] = col + " LIKE " + bound
+		}
+	}
+	if len(parts) == 1 {
+		return parts[0], nil
+	}
+	return "(" + strings.Join(parts, sep) + ")", nil
 }
 
 func (b *builder) writeIs(col, text string) (string, *pgerr.APIError) {
