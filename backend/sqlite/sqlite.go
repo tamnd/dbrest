@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 
 	sqlitedrv "modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
@@ -66,6 +68,13 @@ type Backend struct {
 func Open(dsn string) (*Backend, error) {
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
+		return nil, err
+	}
+	// SQLite does not enforce FK constraints by default. Pin to one connection so
+	// the PRAGMA stays in effect for the lifetime of the pool.
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
+		db.Close()
 		return nil, err
 	}
 	if err := db.Ping(); err != nil {
@@ -357,9 +366,11 @@ func returningCols(q *ir.Query, rel *schema.Relation) []string {
 	return nil
 }
 
-// drain reads every row of a returning cursor into memory, normalizing []byte to
-// string so text columns render as JSON strings.
+// drain reads every row of a returning cursor into memory, applying the same
+// type coercions as rowStream.Values: []byte→string, BOOLEAN int64→bool,
+// JSON string→json.RawMessage.
 func drain(rows *sql.Rows, ncols int) ([][]any, error) {
+	colTypes, _ := rows.ColumnTypes()
 	var out [][]any
 	for rows.Next() {
 		holders := make([]any, ncols)
@@ -372,7 +383,20 @@ func drain(rows *sql.Rows, ncols int) ([][]any, error) {
 		}
 		for i, v := range holders {
 			if bs, ok := v.([]byte); ok {
-				holders[i] = string(bs)
+				v = string(bs)
+				holders[i] = v
+			}
+			if colTypes != nil && i < len(colTypes) {
+				switch strings.ToUpper(colTypes[i].DatabaseTypeName()) {
+				case "BOOLEAN", "BOOL":
+					if n, ok := v.(int64); ok {
+						holders[i] = n != 0
+					}
+				case "JSON":
+					if str, ok := v.(string); ok {
+						holders[i] = json.RawMessage(str)
+					}
+				}
 			}
 		}
 		out = append(out, holders)

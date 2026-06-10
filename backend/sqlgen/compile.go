@@ -457,8 +457,9 @@ func (b *builder) writeSelect(items []ir.SelectItem) *pgerr.APIError {
 		}
 		b.sb.WriteString(expr)
 		// Alias the output so the renderer sees the PostgREST key, not the raw
-		// column. Only needed when the key differs from the bare column name.
-		if name := col.Name(); name != "" && name != lastPath(col.Path) {
+		// column expression. Always alias when a cast is present (the expression
+		// differs from the bare column name) or when an explicit alias was set.
+		if name := col.Name(); name != "" && (name != lastPath(col.Path) || col.Cast != "") {
 			b.sb.WriteString(" AS ")
 			b.sb.WriteString(b.d.QuoteIdent(name))
 		}
