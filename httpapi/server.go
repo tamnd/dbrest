@@ -318,9 +318,10 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity)
 		return
 	}
 
-	media, ok := negotiate(r.Header.Values("Accept"))
+	acceptHdrs := r.Header.Values("Accept")
+	media, ok := negotiate(acceptHdrs)
 	if !ok {
-		writeError(w, pgerr.ErrNotAcceptable(strings.Join(r.Header.Values("Accept"), ", ")))
+		writeError(w, pgerr.ErrNotAcceptable(strings.Join(acceptHdrs, ", ")))
 		return
 	}
 
@@ -358,6 +359,24 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity)
 
 	if apiErr := s.authorize(rc, planned); apiErr != nil {
 		writeError(w, apiErr)
+		return
+	}
+
+	// vnd.pgrst.plan+json: return EXPLAIN JSON when the backend supports it.
+	if media == mediaPlan {
+		exp, supported := s.backend.(backend.Explainer)
+		if !supported {
+			writeError(w, pgerr.ErrNotAcceptable(mediaPlan))
+			return
+		}
+		planJSON, err := exp.ExplainRead(r.Context(), planned, rc, planAnalyze(acceptHdrs))
+		if err != nil {
+			writeError(w, mapExecError(s.backend, err, id.anonymous))
+			return
+		}
+		w.Header().Set("Content-Type", mediaPlan)
+		w.WriteHeader(http.StatusOK)
+		w.Write(planJSON)
 		return
 	}
 

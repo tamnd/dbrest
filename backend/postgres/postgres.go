@@ -199,8 +199,8 @@ func statusForSQLState(code string) int {
 		return 404
 	case "42P01": // undefined_table
 		return 404
-	case "42501": // insufficient_privilege
-		return 403
+	case "42501": // insufficient_privilege → 401 matching PostgREST
+		return 401
 	case "42P17": // infinite_recursion
 		return 500
 	}

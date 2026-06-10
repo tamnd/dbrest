@@ -407,6 +407,66 @@ func fieldNames(rows pgx.Rows) []string {
 	return names
 }
 
+// ExplainRead runs EXPLAIN (FORMAT JSON) on the read query and returns the raw
+// JSON plan from PostgreSQL. When analyze is true EXPLAIN ANALYZE is used
+// instead, which also executes the query and includes timing. The request runs
+// in a read-only transaction with the full session setup (role + GUCs) so the
+// planner sees the same context as a real request.
+func (b *Backend) ExplainRead(ctx context.Context, p *ir.Plan, rc *reqctx.Context, analyze bool) ([]byte, error) {
+	conn, err := b.pool.Acquire(ctx)
+	if err != nil {
+		return nil, b.MapError(err)
+	}
+	defer conn.Release()
+
+	st, apiErr := sqlgen.CompileRead(Dialect{}, p.Query)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+
+	var prefix string
+	if analyze {
+		prefix = "EXPLAIN (ANALYZE, FORMAT JSON) "
+	} else {
+		prefix = "EXPLAIN (FORMAT JSON) "
+	}
+	explainSQL := prefix + st.SQL
+
+	batch := &pgx.Batch{}
+	batch.Queue("BEGIN TRANSACTION READ ONLY")
+	sessionN := queueSessionItems(batch, b, rc)
+	batch.Queue(explainSQL, st.Args...)
+	batch.Queue("ROLLBACK")
+
+	br := conn.SendBatch(ctx, batch)
+	defer br.Close()
+
+	if _, err := br.Exec(); err != nil {
+		return nil, b.MapError(err)
+	}
+	for range sessionN {
+		if _, err := br.Exec(); err != nil {
+			return nil, b.MapError(err)
+		}
+	}
+
+	rows, err := br.Query()
+	if err != nil {
+		return nil, b.MapError(err)
+	}
+	defer rows.Close()
+	var plan []byte
+	for rows.Next() {
+		if err := rows.Scan(&plan); err != nil {
+			return nil, b.MapError(err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, b.MapError(err)
+	}
+	return plan, nil
+}
+
 // drainRows reads every row of a pgx cursor into memory, normalizing values so
 // json/jsonb, bytea, and date columns render correctly. The rows are closed by
 // drainRows; the caller must not close them again.

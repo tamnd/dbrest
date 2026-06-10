@@ -14,12 +14,13 @@ const (
 	mediaJSON   = "application/json"
 	mediaArray  = "application/vnd.pgrst.array+json"
 	mediaObject = "application/vnd.pgrst.object+json"
+	mediaPlan   = "application/vnd.pgrst.plan+json"
 	mediaCSV    = "text/csv"
 	mediaOctet  = "application/octet-stream"
 	mediaText   = "text/plain"
 )
 
-var supportedMedia = []string{mediaJSON, mediaArray, mediaObject, mediaCSV, mediaOctet, mediaText}
+var supportedMedia = []string{mediaJSON, mediaArray, mediaObject, mediaPlan, mediaCSV, mediaOctet, mediaText}
 
 // mediaRange is one parsed entry of an Accept header: a type/subtype pair, its
 // quality value, and its position in the header for stable tie-breaking.
@@ -60,6 +61,33 @@ func parseAccept(headers []string) []mediaRange {
 	}
 	sort.SliceStable(ranges, func(i, j int) bool { return ranges[i].q > ranges[j].q })
 	return ranges
+}
+
+// planAnalyze reports whether the Accept header for vnd.pgrst.plan+json carries
+// "options=analyze", which asks for EXPLAIN ANALYZE rather than plain EXPLAIN.
+func planAnalyze(headers []string) bool {
+	for _, h := range headers {
+		for part := range strings.SplitSeq(h, ",") {
+			part = strings.TrimSpace(part)
+			segs := strings.Split(part, ";")
+			typ, sub, ok := strings.Cut(strings.TrimSpace(segs[0]), "/")
+			if !ok {
+				continue
+			}
+			if strings.ToLower(typ)+"/"+strings.ToLower(sub) != "application/vnd.pgrst.plan+json" {
+				continue
+			}
+			for _, p := range segs[1:] {
+				p = strings.TrimSpace(p)
+				if v, ok := strings.CutPrefix(strings.ToLower(p), "options="); ok {
+					if strings.Contains(v, "analyze") {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
 }
 
 // negotiate picks the best supported response media type for the Accept header.
