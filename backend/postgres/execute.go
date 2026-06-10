@@ -347,6 +347,9 @@ func appendNativeArg(sb *strings.Builder, val ir.Value) {
 			sb.WriteString("'")
 			sb.WriteString(strings.ReplaceAll(v, "'", "''"))
 			sb.WriteString("'")
+		case json.Number:
+			// json.Number from dec.UseNumber() — write as-is; it is a valid SQL numeric literal.
+			sb.WriteString(v.String())
 		case float64:
 			sb.WriteString(strconv.FormatFloat(v, 'f', -1, 64))
 		case bool:
