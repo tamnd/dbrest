@@ -135,3 +135,9 @@ func (b *Backend) MapError(err error) *pgerr.APIError {
 	}
 	return pgerr.ErrInternal(err.Error())
 }
+
+func init() { backend.Register("mongodb", mongoDriver{}) }
+
+type mongoDriver struct{}
+
+func (mongoDriver) Open(dsn string) (backend.Backend, error) { return Open(dsn) }

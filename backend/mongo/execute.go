@@ -7,7 +7,6 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	mgodriver "go.mongodb.org/mongo-driver/v2/mongo"
-	mgoptions "go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/tamnd/dbrest/backend"
 	"github.com/tamnd/dbrest/ir"
@@ -139,7 +138,7 @@ func (b *Backend) executeUpdate(ctx context.Context, plan *ir.Plan, rc *reqctx.C
 	q := plan.Query
 	coll := b.db.Collection(q.Relation.Name)
 	colTypes := columnTypes(plan.Rel)
-	res := &bodyResult{controls: rc.Controls()}
+	res := &bodyResult{controls: rc.Controls(), rows: newDocRowStream(nil)}
 
 	filter := filterDoc(q.Where, colTypes)
 	setDoc := writePayloadToSetDoc(q.Write, plan.Rel)
@@ -157,9 +156,6 @@ func (b *Backend) executeUpdate(ctx context.Context, plan *ir.Plan, rc *reqctx.C
 		}
 		res.rows = rows
 	}
-	if res.rows == nil {
-		res.rows = newDocRowStream(nil)
-	}
 	return res, nil
 }
 
@@ -168,18 +164,17 @@ func (b *Backend) executeDelete(ctx context.Context, plan *ir.Plan, rc *reqctx.C
 	q := plan.Query
 	coll := b.db.Collection(q.Relation.Name)
 	colTypes := columnTypes(plan.Rel)
-	res := &bodyResult{controls: rc.Controls()}
+	res := &bodyResult{controls: rc.Controls(), rows: newDocRowStream(nil)}
 
 	filter := filterDoc(q.Where, colTypes)
 
-	var returnDocs []map[string]any
 	if q.Write != nil && q.Write.Return == ir.ReturnRepresentation {
 		// Capture rows before deleting.
-		var err error
-		returnDocs, err = b.findDocs(ctx, coll, filter, nil)
+		returnDocs, err := b.findDocs(ctx, coll, filter)
 		if err != nil {
 			return nil, err
 		}
+		res.rows = newDocRowStream(convertDocs(returnDocs))
 	}
 
 	out, err := coll.DeleteMany(ctx, filter)
@@ -187,31 +182,21 @@ func (b *Backend) executeDelete(ctx context.Context, plan *ir.Plan, rc *reqctx.C
 		return nil, b.MapError(err)
 	}
 	res.affected, res.hasAff = out.DeletedCount, true
-
-	if returnDocs != nil {
-		res.rows = newDocRowStream(convertDocs(returnDocs))
-	} else {
-		res.rows = newDocRowStream(nil)
-	}
 	return res, nil
 }
 
 // readForReturn re-queries after a write to produce the RETURNING row stream.
 func (b *Backend) readForReturn(ctx context.Context, coll *mgodriver.Collection, filter bson.D) (*docRowStream, error) {
-	docs, err := b.findDocs(ctx, coll, filter, nil)
+	docs, err := b.findDocs(ctx, coll, filter)
 	if err != nil {
 		return nil, err
 	}
 	return newDocRowStream(convertDocs(docs)), nil
 }
 
-// findDocs runs a find with the given filter and project, returning raw BSON maps.
-func (b *Backend) findDocs(ctx context.Context, coll *mgodriver.Collection, filter bson.D, project bson.D) ([]map[string]any, error) {
-	opts := mgoptions.Find()
-	if project != nil {
-		opts.SetProjection(project)
-	}
-	cur, err := coll.Find(ctx, filter, opts)
+// findDocs runs a find with the given filter, returning raw BSON maps.
+func (b *Backend) findDocs(ctx context.Context, coll *mgodriver.Collection, filter bson.D) ([]map[string]any, error) {
+	cur, err := coll.Find(ctx, filter)
 	if err != nil {
 		return nil, b.MapError(err)
 	}

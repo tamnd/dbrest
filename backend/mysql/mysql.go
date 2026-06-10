@@ -212,3 +212,9 @@ func buildBoolCols(rel *schema.Relation) map[string]bool {
 	}
 	return m
 }
+
+func init() { backend.Register("mysql", mysqlDriver{}) }
+
+type mysqlDriver struct{}
+
+func (mysqlDriver) Open(dsn string) (backend.Backend, error) { return Open(dsn) }

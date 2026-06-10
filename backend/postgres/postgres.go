@@ -244,3 +244,9 @@ func statusForSQLState(code string) int {
 	}
 	return 400
 }
+
+func init() { backend.Register("postgres", postgresDriver{}) }
+
+type postgresDriver struct{}
+
+func (postgresDriver) Open(dsn string) (backend.Backend, error) { return Open(dsn) }
