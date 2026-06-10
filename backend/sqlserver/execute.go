@@ -3,6 +3,8 @@ package sqlserver
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"strconv"
 	"strings"
 
 	"github.com/tamnd/dbrest/backend"
@@ -279,14 +281,26 @@ func (b *Backend) executeDelete(
 
 // executeCall runs a stored procedure or portable RPC function.
 func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Context) (backend.Result, error) {
-	st, apiErr := sqlgen.CompileCall(Dialect{}, plan.Call, plan.Func)
+	var st *sqlgen.Statement
+	var apiErr *pgerr.APIError
+	if plan.Func != nil {
+		// Portable registry function: the function body is a parameterised SQL
+		// statement whose :name placeholders are bound by CompileCall.
+		st, apiErr = sqlgen.CompileCall(Dialect{}, plan.Call, plan.Func)
+	} else {
+		// Native RPC (NativeRPC=true): no registry function — generate EXEC
+		// [schema].[name] @param = @pN from the call's argument map.
+		st, apiErr = b.compileNativeCall(plan.Call)
+	}
 	if apiErr != nil {
 		return nil, apiErr
 	}
 
 	if plan.ReadOnly {
 		res := &result{controls: rc.Controls()}
-		if plan.Call.Count != ir.CountNone {
+		// count=exact is only supported for portable registry functions; native
+		// stored procedures cannot be wrapped in SELECT count(*) in T-SQL.
+		if plan.Call.Count != ir.CountNone && plan.Func != nil {
 			cst, apiErr := sqlgen.CompileCallCount(Dialect{}, plan.Call, plan.Func)
 			if apiErr != nil {
 				return nil, apiErr
@@ -385,6 +399,57 @@ func returningCols(q *ir.Query, rel *schema.Relation) []string {
 		return rel.PrimaryKey
 	}
 	return nil
+}
+
+// compileNativeCall generates EXEC [schema].[name] @arg1 = @p1, @arg2 = @p2 for
+// the NativeRPC path (plan.Func == nil). SQL Server stored procedures accept
+// named parameters in any order, so the argument map can be emitted as-is.
+// Scalar stored procedures should SELECT the result in a column named after the
+// function (e.g. SELECT @a + @b AS [add]) so renderCall can detect scalar return
+// by seeing a single column whose name matches the function name.
+func (b *Backend) compileNativeCall(c *ir.Call) (*sqlgen.Statement, *pgerr.APIError) {
+	sch := b.schema
+	if sch == "" {
+		sch = "dbo"
+	}
+	d := Dialect{}
+	var sb strings.Builder
+	sb.WriteString("EXEC ")
+	sb.WriteString(d.QuoteIdent(sch))
+	sb.WriteString(".")
+	sb.WriteString(d.QuoteIdent(c.Function.Name))
+
+	args := make([]any, 0, len(c.Args))
+	i := 1
+	for name, val := range c.Args {
+		if i == 1 {
+			sb.WriteString(" ")
+		} else {
+			sb.WriteString(", ")
+		}
+		sb.WriteString("@" + name + " = @p" + strconv.Itoa(i))
+		// A POST arg has a decoded JSON value; a GET arg is raw text.
+		if val.JSON != nil {
+			args = append(args, nativeArgValue(val.JSON))
+		} else {
+			args = append(args, val.Text)
+		}
+		i++
+	}
+	return &sqlgen.Statement{SQL: sb.String(), Args: args}, nil
+}
+
+// nativeArgValue converts a decoded JSON argument value to a driver-ready type.
+// Scalars (string, float64, bool, nil) pass through; composite values are
+// re-encoded as JSON text so the stored procedure can receive them as NVARCHAR.
+func nativeArgValue(v any) any {
+	switch v.(type) {
+	case string, float64, bool, nil:
+		return v
+	default:
+		b, _ := json.Marshal(v)
+		return string(b)
+	}
 }
 
 // _ is a compile-time check that Backend implements backend.DB.
