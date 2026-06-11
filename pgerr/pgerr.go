@@ -26,6 +26,11 @@ type APIError struct {
 	Message string `json:"message"`
 	// Details is extra context, or null.
 	Details *string `json:"details"`
+	// RawDetails carries a details payload that is not a string: PostgREST's
+	// PGRST201 returns details as a JSON array of candidate relationship
+	// objects, which clients read to auto-disambiguate an embed. When set it
+	// takes precedence over Details in the rendered envelope.
+	RawDetails json.RawMessage `json:"-"`
 	// Hint is a suggested fix, or null.
 	Hint *string `json:"hint"`
 }
@@ -45,6 +50,18 @@ func (e *APIError) WithDetails(details string) *APIError {
 	return &c
 }
 
+// WithDetailsJSON returns a copy of e with details set to a non-string JSON
+// value, the shape PGRST201 uses for its candidate relationship array. v is
+// marshaled immediately; a value that cannot marshal leaves details unchanged
+// rather than corrupting the envelope.
+func (e *APIError) WithDetailsJSON(v any) *APIError {
+	c := *e
+	if b, err := json.Marshal(v); err == nil {
+		c.RawDetails = b
+	}
+	return &c
+}
+
 // WithHint returns a copy of e with hint set.
 func (e *APIError) WithHint(hint string) *APIError {
 	c := *e
@@ -60,20 +77,30 @@ func (e *APIError) WithMessage(msg string) *APIError {
 }
 
 // body is the exact JSON shape sent to the client. Keys are always present;
-// Details and Hint are encoded as null when nil because they are pointers.
+// details and hint are encoded as null when unset. details is raw so it can be
+// a string, null, or PGRST201's array of relationship candidates.
 type body struct {
-	Code    string  `json:"code"`
-	Message string  `json:"message"`
-	Details *string `json:"details"`
-	Hint    *string `json:"hint"`
+	Code    string          `json:"code"`
+	Message string          `json:"message"`
+	Details json.RawMessage `json:"details"`
+	Hint    *string         `json:"hint"`
 }
 
 // JSON returns the rendered envelope bytes for e.
 func (e *APIError) JSON() []byte {
+	details := json.RawMessage("null")
+	switch {
+	case e.RawDetails != nil:
+		details = e.RawDetails
+	case e.Details != nil:
+		if b, err := json.Marshal(*e.Details); err == nil {
+			details = b
+		}
+	}
 	b, _ := json.Marshal(body{
 		Code:    e.Code,
 		Message: e.Message,
-		Details: e.Details,
+		Details: details,
 		Hint:    e.Hint,
 	})
 	return b

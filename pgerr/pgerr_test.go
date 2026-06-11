@@ -45,6 +45,54 @@ func TestWithDetailsHintImmutable(t *testing.T) {
 	}
 }
 
+// PGRST201 returns details as a JSON array of candidate relationship objects;
+// the envelope must carry it as an array, not a quoted string, while string
+// details and null keep their existing encodings.
+func TestDetailsCanCarryNonStringJSON(t *testing.T) {
+	candidates := []map[string]string{{
+		"cardinality":  "many-to-one",
+		"embedding":    "orders with addresses",
+		"relationship": "billing using orders(billing_address_id) and addresses(id)",
+	}}
+	base := ErrAmbiguousEmbed("orders", "addresses")
+	e := base.WithDetailsJSON(candidates)
+	if base.RawDetails != nil {
+		t.Error("WithDetailsJSON mutated the receiver")
+	}
+
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(e.JSON(), &m); err != nil {
+		t.Fatalf("envelope not valid json: %v", err)
+	}
+	var got []map[string]string
+	if err := json.Unmarshal(m["details"], &got); err != nil {
+		t.Fatalf("details is not a JSON array: %v: %s", err, m["details"])
+	}
+	if len(got) != 1 || got[0]["embedding"] != "orders with addresses" {
+		t.Errorf("details round-trip = %v", got)
+	}
+
+	// A string details still renders as a JSON string.
+	var sm map[string]json.RawMessage
+	se := ErrParse("x").WithDetails("plain text")
+	if err := json.Unmarshal(se.JSON(), &sm); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if string(sm["details"]) != `"plain text"` {
+		t.Errorf("string details = %s, want %q", sm["details"], `"plain text"`)
+	}
+
+	// Raw details win over a previously set string.
+	both := se.WithDetailsJSON([]int{1, 2})
+	var bm map[string]json.RawMessage
+	if err := json.Unmarshal(both.JSON(), &bm); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if string(bm["details"]) != "[1,2]" {
+		t.Errorf("raw details = %s, want [1,2]", bm["details"])
+	}
+}
+
 func TestUnsupportedNamesFeatureAndBackend(t *testing.T) {
 	e := ErrUnsupported("range operator 'sl'", "mysql")
 	if e.HTTPStatus != http.StatusBadRequest {
