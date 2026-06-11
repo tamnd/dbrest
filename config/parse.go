@@ -14,17 +14,34 @@ import (
 // only consulted for a key we actually understand, so a typo in PGRST_DB_URY is
 // ignored rather than silently dropped into a catch-all map.
 var optionKeys = []string{
-	"db-backend", "db-uri", "db-schemas", "db-anon-role", "db-pre-request",
+	"db-backend", "db-uri", "db-schemas", "db-schema", "db-anon-role",
+	"db-pre-request", "pre-request",
 	"db-extra-search-path", "db-max-rows", "max-rows",
-	"jwt-secret", "jwt-aud", "jwt-role-claim-key", "jwk-set", "jwt-cache-max-entries",
-	"server-host", "server-port", "server-unix-socket",
+	"db-aggregates-enabled", "db-root-spec", "root-spec",
+	"db-tx-end", "db-hoisted-tx-settings",
+	"db-channel", "db-channel-enabled", "db-config", "db-pre-config",
+	"db-prepared-statements", "db-plan-enabled",
+	"jwt-secret", "jwt-secret-is-base64", "secret-is-base64", "jwt-aud",
+	"jwt-role-claim-key", "role-claim-key", "jwk-set", "jwt-cache-max-entries",
+	"server-host", "server-port", "server-unix-socket", "server-unix-socket-mode",
 	"admin-server-host", "admin-server-port",
 	"db-pool", "db-pool-acquisition-timeout",
-	"openapi-mode", "openapi-server-proxy-uri",
+	"db-pool-max-idletime", "db-pool-timeout", "db-pool-max-lifetime",
+	"db-pool-automatic-recovery",
+	"openapi-mode", "openapi-server-proxy-uri", "openapi-security-active",
 	"log-level", "log-query", "server-cors-allowed-origins",
+	"server-trace-header", "server-timing-enabled",
 	"declared-schema", "declared-relationships", "function-registry",
 	"policy-registry", "capability-overrides",
 }
+
+// appSettingsPrefix is the dynamic option namespace: any app.settings.<name>
+// key is accepted and carried to the backend as a transaction setting.
+const appSettingsPrefix = "app.settings."
+
+// appSettingsEnvPrefix is the env-suffix spelling of the same namespace:
+// PGRST_APP_SETTINGS_FOO maps to app.settings.foo.
+const appSettingsEnvPrefix = "APP_SETTINGS_"
 
 // envSuffix turns an option key into the variable suffix shared by both
 // prefixes: "db-uri" becomes "DB_URI", read as PGRST_DB_URI or DBREST_DB_URI.
@@ -32,42 +49,67 @@ func envSuffix(key string) string {
 	return strings.ToUpper(strings.ReplaceAll(key, "-", "_"))
 }
 
-// overlayEnv layers the environment over raw. For each known key it reads the
-// PGRST_ spelling first, then the DBREST_ spelling, so DBREST_ wins on a
-// conflict; either present overrides the file. environ is os.Environ() form.
-func overlayEnv(raw map[string]string, environ []string) {
+// overlayEnv layers the environment over raw and returns warnings for
+// namespaced variables that match no known option. For each known key it reads
+// the PGRST_ spelling first, then the DBREST_ spelling, so DBREST_ wins on a
+// conflict; either present overrides the file. The dynamic
+// PGRST_APP_SETTINGS_* / DBREST_APP_SETTINGS_* namespace maps to
+// app.settings.* keys with a lowercased name. environ is os.Environ() form.
+func overlayEnv(raw map[string]string, environ []string) []string {
 	env := map[string]string{}
 	for _, kv := range environ {
 		if k, v, ok := strings.Cut(kv, "="); ok {
 			env[k] = v
 		}
 	}
-	for _, key := range optionKeys {
-		suffix := envSuffix(key)
-		if v, ok := env["PGRST_"+suffix]; ok {
-			raw[key] = v
+	known := map[string]bool{}
+	for _, k := range optionKeys {
+		known[envSuffix(k)] = true
+	}
+	var warnings []string
+	for _, prefix := range []string{"PGRST_", "DBREST_"} {
+		for _, key := range optionKeys {
+			if v, ok := env[prefix+envSuffix(key)]; ok {
+				raw[key] = v
+			}
 		}
-		if v, ok := env["DBREST_"+suffix]; ok {
-			raw[key] = v
+		// The dynamic namespace and the unknown-suffix warnings need a scan
+		// over what is actually set, not over what we expect.
+		for name, v := range env {
+			suffix, ok := strings.CutPrefix(name, prefix)
+			if !ok {
+				continue
+			}
+			if setting, ok := strings.CutPrefix(suffix, appSettingsEnvPrefix); ok && setting != "" {
+				raw[appSettingsPrefix+strings.ToLower(setting)] = v
+				continue
+			}
+			if !known[suffix] {
+				warnings = append(warnings, fmt.Sprintf("ignoring %s: no option named %q", name, strings.ToLower(strings.ReplaceAll(suffix, "_", "-"))))
+			}
 		}
 	}
+	return warnings
 }
 
 // parseFile reads a PostgREST-style flat configuration file into a raw map. The
 // format is one "key = value" per line; values are bare, double-quoted, or
 // triple-quoted for multi-line strings; '#' begins a comment outside a quoted
-// value; blank lines are skipped. Unknown keys are an error, so a mistyped
-// option fails loudly at startup rather than being ignored.
-func parseFile(path string) (map[string]string, error) {
+// value; blank lines are skipped. An unknown key is kept out of the map and
+// reported as a warning, matching PostgREST, which ignores keys it does not
+// own; the same posture applies to unknown namespaced environment variables in
+// overlayEnv, so the two sources fail symmetrically.
+func parseFile(path string) (map[string]string, []string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("config: reading %s: %w", path, err)
+		return nil, nil, fmt.Errorf("config: reading %s: %w", path, err)
 	}
 	known := map[string]bool{}
 	for _, k := range optionKeys {
 		known[k] = true
 	}
 	raw := map[string]string{}
+	var warnings []string
 	lines := strings.Split(string(data), "\n")
 	for i := 0; i < len(lines); i++ {
 		line := strings.TrimSpace(stripComment(lines[i]))
@@ -76,25 +118,30 @@ func parseFile(path string) (map[string]string, error) {
 		}
 		rawKey, rawVal, ok := strings.Cut(line, "=")
 		if !ok {
-			return nil, fmt.Errorf("config: %s line %d: expected key = value", path, i+1)
+			return nil, nil, fmt.Errorf("config: %s line %d: expected key = value", path, i+1)
 		}
 		key := strings.TrimSpace(rawKey)
 		val := strings.TrimSpace(rawVal)
-		if !known[key] {
-			return nil, fmt.Errorf("config: %s line %d: unknown option %q", path, i+1, key)
+		if !known[key] && !strings.HasPrefix(key, appSettingsPrefix) {
+			warnings = append(warnings, fmt.Sprintf("%s line %d: ignoring unknown option %q", path, i+1, key))
+			key = ""
 		}
 		if strings.HasPrefix(val, `"""`) {
 			block, used, err := readTripleQuoted(lines, i, val)
 			if err != nil {
-				return nil, fmt.Errorf("config: %s line %d: %w", path, i+1, err)
+				return nil, nil, fmt.Errorf("config: %s line %d: %w", path, i+1, err)
 			}
-			raw[key] = block
+			if key != "" {
+				raw[key] = block
+			}
 			i = used
 			continue
 		}
-		raw[key] = unquote(val)
+		if key != "" {
+			raw[key] = unquote(val)
+		}
 	}
-	return raw, nil
+	return raw, warnings, nil
 }
 
 // stripComment removes a trailing '#' comment from a line, leaving '#' that sits
@@ -156,6 +203,19 @@ func splitList(v string) []string {
 	return out
 }
 
+// pickString reads the first present key among aliases as a string, falling
+// back to def when none is set. PostgREST keeps a handful of pre-rename
+// aliases (pre-request, root-spec, db-schema, role-claim-key) working; this is
+// the string side of that.
+func pickString(raw map[string]string, def string, keys ...string) string {
+	for _, key := range keys {
+		if v, ok := raw[key]; ok {
+			return v
+		}
+	}
+	return def
+}
+
 // pickInt reads the first present key among aliases as an integer, recording a
 // validation error on a malformed value and falling back to def.
 func pickInt(raw map[string]string, errs *[]string, def int, keys ...string) int {
@@ -174,19 +234,23 @@ func pickInt(raw map[string]string, errs *[]string, def int, keys ...string) int
 	return def
 }
 
-// pickBool reads key as a boolean (true/false, 1/0), recording a validation
-// error on a malformed value and falling back to def.
-func pickBool(raw map[string]string, errs *[]string, def bool, key string) bool {
-	v, ok := raw[key]
-	if !ok {
-		return def
+// pickBool reads the first present key among aliases as a boolean (true/false,
+// 1/0), recording a validation error on a malformed value and falling back to
+// def.
+func pickBool(raw map[string]string, errs *[]string, def bool, keys ...string) bool {
+	for _, key := range keys {
+		v, ok := raw[key]
+		if !ok {
+			continue
+		}
+		b, err := strconv.ParseBool(strings.TrimSpace(v))
+		if err != nil {
+			*errs = append(*errs, fmt.Sprintf("%s %q is not a boolean", key, v))
+			return def
+		}
+		return b
 	}
-	b, err := strconv.ParseBool(strings.TrimSpace(v))
-	if err != nil {
-		*errs = append(*errs, fmt.Sprintf("%s %q is not a boolean", key, v))
-		return def
-	}
-	return b
+	return def
 }
 
 // pickDuration reads key as a Go duration (for example "10s"), recording a

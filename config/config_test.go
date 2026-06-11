@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -111,10 +112,162 @@ reviews.film_id -> films.id
 	}
 }
 
-func TestUnknownOptionIsError(t *testing.T) {
+func TestUnknownFileOptionWarnsAndBoots(t *testing.T) {
+	// PostgREST ignores config keys it does not own, so a postgrest.conf
+	// carrying someone else's keys must boot. dbrest keeps a warning so the
+	// typo is visible.
 	path := writeConf(t, "db-uri = \"x\"\ndb-ury = \"typo\"")
-	if _, err := Load(path, nil); err == nil {
-		t.Fatal("expected error for unknown option")
+	c, err := Load(path, nil)
+	if err != nil {
+		t.Fatalf("unknown file option must not abort: %v", err)
+	}
+	if len(c.Warnings) == 0 || !strings.Contains(strings.Join(c.Warnings, "\n"), "db-ury") {
+		t.Errorf("expected a warning naming db-ury, got %q", c.Warnings)
+	}
+}
+
+func TestUnknownEnvKeyWarns(t *testing.T) {
+	// The env path matches the file path: an unrecognized PGRST-namespaced
+	// variable warns instead of being silently dropped.
+	c, err := Load("", []string{"PGRST_DB_URY=typo", "DBREST_DB_URI=file:real.db"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Warnings) == 0 || !strings.Contains(strings.Join(c.Warnings, "\n"), "PGRST_DB_URY") {
+		t.Errorf("expected a warning naming PGRST_DB_URY, got %q", c.Warnings)
+	}
+}
+
+func TestV14KeySetAccepted(t *testing.T) {
+	// Every documented v14 option a real postgrest.conf may carry must parse.
+	path := writeConf(t, `
+db-uri = "file:demo.db"
+app.settings.jwt_lifetime = "3600"
+app.settings.name = "demo"
+db-aggregates-enabled = true
+db-channel = "custom"
+db-channel-enabled = false
+db-config = false
+db-hoisted-tx-settings = "statement_timeout"
+db-plan-enabled = true
+db-pool-automatic-recovery = false
+db-pool-max-idletime = 60
+db-pool-max-lifetime = 600
+db-pre-config = "postgrest.pre_config"
+db-prepared-statements = false
+db-root-spec = "root"
+db-tx-end = "rollback-allow-override"
+jwt-secret-is-base64 = true
+openapi-security-active = true
+server-trace-header = "X-Request-Id"
+server-timing-enabled = true
+server-unix-socket-mode = "770"
+`)
+	c, err := Load(path, nil)
+	if err != nil {
+		t.Fatalf("v14 key set rejected: %v", err)
+	}
+	if c.AppSettings["jwt_lifetime"] != "3600" || c.AppSettings["name"] != "demo" {
+		t.Errorf("app.settings = %v", c.AppSettings)
+	}
+	if !c.AggregatesEnabled || !c.PlanEnabled || !c.OpenAPISecurityActive || !c.ServerTimingEnabled || !c.JWTSecretIsBase64 {
+		t.Error("boolean options did not parse")
+	}
+	if c.DBChannel != "custom" || c.DBChannelEnabled || c.DBConfig || c.DBPreparedStatements || c.DBPoolAutomaticRecovery {
+		t.Error("channel/config/pool options did not parse")
+	}
+	if c.DBPoolMaxIdleTime != 60 || c.DBPoolMaxLifetime != 600 {
+		t.Errorf("pool times = %d/%d", c.DBPoolMaxIdleTime, c.DBPoolMaxLifetime)
+	}
+	if c.TxEnd != "rollback-allow-override" {
+		t.Errorf("db-tx-end = %q", c.TxEnd)
+	}
+	if !slices.Equal(c.HoistedTxSettings, []string{"statement_timeout"}) {
+		t.Errorf("db-hoisted-tx-settings = %v", c.HoistedTxSettings)
+	}
+	if c.RootSpec != "root" || c.DBPreConfig != "postgrest.pre_config" {
+		t.Errorf("root-spec/pre-config = %q/%q", c.RootSpec, c.DBPreConfig)
+	}
+	if c.ServerTraceHeader != "X-Request-Id" || c.ServerUnixSocketMode != "770" {
+		t.Errorf("trace header/socket mode = %q/%q", c.ServerTraceHeader, c.ServerUnixSocketMode)
+	}
+}
+
+func TestV14Defaults(t *testing.T) {
+	c, err := FromMap(map[string]string{"db-uri": "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.DBChannel != "pgrst" || !c.DBChannelEnabled || !c.DBConfig || !c.DBPreparedStatements {
+		t.Error("channel/config defaults wrong")
+	}
+	if c.DBPoolMaxIdleTime != 30 || c.DBPoolMaxLifetime != 1800 || !c.DBPoolAutomaticRecovery {
+		t.Error("pool defaults wrong")
+	}
+	if c.TxEnd != "commit" || c.ServerUnixSocketMode != "660" {
+		t.Errorf("tx-end/socket-mode defaults = %q/%q", c.TxEnd, c.ServerUnixSocketMode)
+	}
+	if c.PlanEnabled || c.AggregatesEnabled || c.ServerTimingEnabled || c.OpenAPISecurityActive || c.JWTSecretIsBase64 {
+		t.Error("boolean defaults should be false")
+	}
+	if !slices.Equal(c.HoistedTxSettings, []string{"statement_timeout", "plan_filter.statement_cost_limit", "default_transaction_isolation"}) {
+		t.Errorf("hoisted settings default = %v", c.HoistedTxSettings)
+	}
+}
+
+func TestV14Aliases(t *testing.T) {
+	c, err := FromMap(map[string]string{
+		"db-uri": "x", "pre-request": "fn", "root-spec": "rs",
+		"db-schema": "api", "role-claim-key": ".r",
+		"secret-is-base64": "true", "db-pool-timeout": "55",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.PreRequest != "fn" || c.RootSpec != "rs" || c.JWTRoleClaimKey != ".r" {
+		t.Errorf("string aliases = %q/%q/%q", c.PreRequest, c.RootSpec, c.JWTRoleClaimKey)
+	}
+	if !slices.Equal(c.Schemas, []string{"api"}) {
+		t.Errorf("db-schema alias = %v", c.Schemas)
+	}
+	if !c.JWTSecretIsBase64 || c.DBPoolMaxIdleTime != 55 {
+		t.Error("secret-is-base64 or db-pool-timeout alias did not parse")
+	}
+}
+
+func TestAppSettingsFromEnv(t *testing.T) {
+	c, err := Load("", []string{
+		"DBREST_DB_URI=x",
+		"PGRST_APP_SETTINGS_JWT_LIFETIME=1800",
+		"DBREST_APP_SETTINGS_LOCAL=yes",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AppSettings["jwt_lifetime"] != "1800" || c.AppSettings["local"] != "yes" {
+		t.Errorf("app settings from env = %v", c.AppSettings)
+	}
+}
+
+func TestBadTxEndAndSocketMode(t *testing.T) {
+	if _, err := FromMap(map[string]string{"db-uri": "x", "db-tx-end": "explode"}); err == nil {
+		t.Error("expected error for bad db-tx-end")
+	}
+	if _, err := FromMap(map[string]string{"db-uri": "x", "server-unix-socket-mode": "555"}); err == nil {
+		t.Error("expected error for socket mode below 600")
+	}
+	if _, err := FromMap(map[string]string{"db-uri": "x", "server-unix-socket-mode": "9x"}); err == nil {
+		t.Error("expected error for non-octal socket mode")
+	}
+}
+
+func TestUnenforcedOptionWarns(t *testing.T) {
+	c, err := FromMap(map[string]string{"db-uri": "x", "db-tx-end": "rollback"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(c.Warnings, "\n"), "db-tx-end") {
+		t.Errorf("expected an unenforced warning for db-tx-end, got %q", c.Warnings)
 	}
 }
 

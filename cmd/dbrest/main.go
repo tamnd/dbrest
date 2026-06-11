@@ -41,6 +41,9 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	for _, w := range cfg.Warnings {
+		log.Printf("dbrest: warning: %s", w)
+	}
 
 	be, err := openBackend(cfg)
 	if err != nil {

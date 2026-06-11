@@ -14,6 +14,7 @@ package config
 import (
 	"fmt"
 	"maps"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -51,6 +52,12 @@ var knownLogLevels = map[string]bool{
 	"crit": true, "error": true, "warn": true, "info": true, "debug": true,
 }
 
+// Transaction termination modes (db-tx-end).
+var knownTxEnds = map[string]bool{
+	"commit": true, "commit-allow-override": true,
+	"rollback": true, "rollback-allow-override": true,
+}
+
 // Config is the resolved option set. Fields are grouped by the spec's sections.
 // A zero value is not valid; build one through Load, which applies defaults and
 // validates.
@@ -60,38 +67,69 @@ type Config struct {
 	DBURI   string
 
 	// Exposed surface (section 3).
-	Schemas         []string
-	AnonRole        string
-	PreRequest      string
-	ExtraSearchPath []string
-	MaxRows         int // 0 means no cap
+	Schemas           []string
+	AnonRole          string
+	PreRequest        string
+	ExtraSearchPath   []string
+	MaxRows           int // 0 means no cap
+	AggregatesEnabled bool
+	RootSpec          string
+
+	// Transaction behavior.
+	TxEnd             string // commit / commit-allow-override / rollback / rollback-allow-override
+	HoistedTxSettings []string
+
+	// Application settings forwarded to the backend as transaction settings
+	// (the app.settings.* namespace). Keys are stored without the prefix.
+	AppSettings map[string]string
 
 	// Auth, a frontend concern identical on every backend (spec 13).
 	JWTSecret          string
+	JWTSecretIsBase64  bool
 	JWTAud             string
 	JWTRoleClaimKey    string
 	JWKSet             string
 	JWTCacheMaxEntries int
 
 	// Servers (section 5).
-	ServerHost       string
-	ServerPort       int
-	ServerUnixSocket string
-	AdminServerHost  string
-	AdminServerPort  int // 0 disables the admin server
+	ServerHost           string
+	ServerPort           int
+	ServerUnixSocket     string
+	ServerUnixSocketMode string
+	AdminServerHost      string
+	AdminServerPort      int // 0 disables the admin server
 
 	// Pooling and limits (section 7).
 	DBPool                   int
 	DBPoolAcquisitionTimeout time.Duration
+	DBPoolMaxIdleTime        int // seconds
+	DBPoolMaxLifetime        int // seconds
+	DBPoolAutomaticRecovery  bool
+
+	// Reload and in-database configuration.
+	DBChannel            string
+	DBChannelEnabled     bool
+	DBConfig             bool
+	DBPreConfig          string
+	DBPreparedStatements bool
 
 	// OpenAPI (spec 19).
 	OpenAPIMode           string
 	OpenAPIServerProxyURI string
+	OpenAPISecurityActive bool
 
 	// Observability and CORS (section 8).
-	LogLevel           string
-	LogQuery           bool
-	CORSAllowedOrigins []string
+	LogLevel            string
+	LogQuery            bool
+	CORSAllowedOrigins  []string
+	PlanEnabled         bool
+	ServerTraceHeader   string
+	ServerTimingEnabled bool
+
+	// Warnings collected while loading: accepted-but-unenforced options,
+	// unknown keys, and risky postures. The command logs them at startup;
+	// none of them is fatal.
+	Warnings []string
 
 	// dbrest-specific declared registries (section 4). Carried as raw text here;
 	// each is parsed by the subsystem that consumes it (introspection, RPC,
@@ -117,6 +155,19 @@ func defaults() *Config {
 		DBPool:             10,
 		OpenAPIMode:        OpenAPIFollowPrivileges,
 		LogLevel:           "error",
+		TxEnd:              "commit",
+		HoistedTxSettings: []string{
+			"statement_timeout", "plan_filter.statement_cost_limit",
+			"default_transaction_isolation",
+		},
+		DBChannel:               "pgrst",
+		DBChannelEnabled:        true,
+		DBConfig:                true,
+		DBPreparedStatements:    true,
+		DBPoolMaxIdleTime:       30,
+		DBPoolMaxLifetime:       1800,
+		DBPoolAutomaticRecovery: true,
+		ServerUnixSocketMode:    "660",
 	}
 }
 
@@ -126,15 +177,22 @@ func defaults() *Config {
 // the PGRST_* and DBREST_* spellings are read, with DBREST_* winning.
 func Load(path string, environ []string) (*Config, error) {
 	raw := map[string]string{}
+	var warnings []string
 	if path != "" {
-		fileRaw, err := parseFile(path)
+		fileRaw, fileWarnings, err := parseFile(path)
 		if err != nil {
 			return nil, err
 		}
+		warnings = append(warnings, fileWarnings...)
 		maps.Copy(raw, fileRaw)
 	}
-	overlayEnv(raw, environ)
-	return fromRaw(raw)
+	warnings = append(warnings, overlayEnv(raw, environ)...)
+	c, err := fromRaw(raw)
+	if err != nil {
+		return nil, err
+	}
+	c.Warnings = append(warnings, c.Warnings...)
+	return c, nil
 }
 
 // FromMap builds a Config from an already-merged option map, applying defaults
@@ -157,29 +215,46 @@ func fromRaw(raw map[string]string) (*Config, error) {
 	if v, ok := get("db-uri"); ok {
 		c.DBURI = v
 	}
-	if v, ok := get("db-schemas"); ok {
-		c.Schemas = splitList(v)
+	for _, key := range []string{"db-schemas", "db-schema"} {
+		if v, ok := get(key); ok {
+			c.Schemas = splitList(v)
+			break
+		}
 	}
 	if v, ok := get("db-anon-role"); ok {
 		c.AnonRole = v
 	}
-	if v, ok := get("db-pre-request"); ok {
-		c.PreRequest = v
-	}
+	c.PreRequest = pickString(raw, c.PreRequest, "db-pre-request", "pre-request")
 	if v, ok := get("db-extra-search-path"); ok {
 		c.ExtraSearchPath = splitList(v)
 	}
 	c.MaxRows = pickInt(raw, &errs, c.MaxRows, "db-max-rows", "max-rows")
+	c.AggregatesEnabled = pickBool(raw, &errs, c.AggregatesEnabled, "db-aggregates-enabled")
+	c.RootSpec = pickString(raw, c.RootSpec, "db-root-spec", "root-spec")
+
+	if v, ok := get("db-tx-end"); ok {
+		c.TxEnd = strings.ToLower(strings.TrimSpace(v))
+	}
+	if v, ok := get("db-hoisted-tx-settings"); ok {
+		c.HoistedTxSettings = splitList(v)
+	}
+	for key, v := range raw {
+		if name, ok := strings.CutPrefix(key, "app.settings."); ok && name != "" {
+			if c.AppSettings == nil {
+				c.AppSettings = map[string]string{}
+			}
+			c.AppSettings[name] = v
+		}
+	}
 
 	if v, ok := get("jwt-secret"); ok {
 		c.JWTSecret = v
 	}
+	c.JWTSecretIsBase64 = pickBool(raw, &errs, c.JWTSecretIsBase64, "jwt-secret-is-base64", "secret-is-base64")
 	if v, ok := get("jwt-aud"); ok {
 		c.JWTAud = v
 	}
-	if v, ok := get("jwt-role-claim-key"); ok {
-		c.JWTRoleClaimKey = v
-	}
+	c.JWTRoleClaimKey = pickString(raw, c.JWTRoleClaimKey, "jwt-role-claim-key", "role-claim-key")
 	if v, ok := get("jwk-set"); ok {
 		c.JWKSet = v
 	}
@@ -192,6 +267,9 @@ func fromRaw(raw map[string]string) (*Config, error) {
 	if v, ok := get("server-unix-socket"); ok {
 		c.ServerUnixSocket = v
 	}
+	if v, ok := get("server-unix-socket-mode"); ok {
+		c.ServerUnixSocketMode = strings.TrimSpace(v)
+	}
 	if v, ok := get("admin-server-host"); ok {
 		c.AdminServerHost = v
 	}
@@ -199,6 +277,19 @@ func fromRaw(raw map[string]string) (*Config, error) {
 
 	c.DBPool = pickInt(raw, &errs, c.DBPool, "db-pool")
 	c.DBPoolAcquisitionTimeout = pickDuration(raw, &errs, c.DBPoolAcquisitionTimeout, "db-pool-acquisition-timeout")
+	c.DBPoolMaxIdleTime = pickInt(raw, &errs, c.DBPoolMaxIdleTime, "db-pool-max-idletime", "db-pool-timeout")
+	c.DBPoolMaxLifetime = pickInt(raw, &errs, c.DBPoolMaxLifetime, "db-pool-max-lifetime")
+	c.DBPoolAutomaticRecovery = pickBool(raw, &errs, c.DBPoolAutomaticRecovery, "db-pool-automatic-recovery")
+
+	if v, ok := get("db-channel"); ok {
+		c.DBChannel = v
+	}
+	c.DBChannelEnabled = pickBool(raw, &errs, c.DBChannelEnabled, "db-channel-enabled")
+	c.DBConfig = pickBool(raw, &errs, c.DBConfig, "db-config")
+	if v, ok := get("db-pre-config"); ok {
+		c.DBPreConfig = v
+	}
+	c.DBPreparedStatements = pickBool(raw, &errs, c.DBPreparedStatements, "db-prepared-statements")
 
 	if v, ok := get("openapi-mode"); ok {
 		c.OpenAPIMode = strings.ToLower(strings.TrimSpace(v))
@@ -206,6 +297,7 @@ func fromRaw(raw map[string]string) (*Config, error) {
 	if v, ok := get("openapi-server-proxy-uri"); ok {
 		c.OpenAPIServerProxyURI = strings.TrimSpace(v)
 	}
+	c.OpenAPISecurityActive = pickBool(raw, &errs, c.OpenAPISecurityActive, "openapi-security-active")
 
 	if v, ok := get("log-level"); ok {
 		c.LogLevel = strings.ToLower(strings.TrimSpace(v))
@@ -214,6 +306,13 @@ func fromRaw(raw map[string]string) (*Config, error) {
 	if v, ok := get("server-cors-allowed-origins"); ok {
 		c.CORSAllowedOrigins = splitList(v)
 	}
+	c.PlanEnabled = pickBool(raw, &errs, c.PlanEnabled, "db-plan-enabled")
+	if v, ok := get("server-trace-header"); ok {
+		c.ServerTraceHeader = v
+	}
+	c.ServerTimingEnabled = pickBool(raw, &errs, c.ServerTimingEnabled, "server-timing-enabled")
+
+	c.Warnings = append(c.Warnings, unenforcedWarnings(raw)...)
 
 	c.DeclaredSchema = raw["declared-schema"]
 	c.DeclaredRelationships = raw["declared-relationships"]
@@ -256,6 +355,39 @@ func (c *Config) validate(errs *[]string) {
 	if c.JWTCacheMaxEntries < 0 {
 		*errs = append(*errs, "jwt-cache-max-entries must not be negative")
 	}
+	if !knownTxEnds[c.TxEnd] {
+		*errs = append(*errs, fmt.Sprintf("db-tx-end %q is not one of commit/commit-allow-override/rollback/rollback-allow-override", c.TxEnd))
+	}
+	if mode, err := strconv.ParseUint(c.ServerUnixSocketMode, 8, 32); err != nil {
+		*errs = append(*errs, fmt.Sprintf("server-unix-socket-mode %q is not an octal", c.ServerUnixSocketMode))
+	} else if mode < 0o600 || mode > 0o777 {
+		*errs = append(*errs, fmt.Sprintf("server-unix-socket-mode %q needs to be between 600 and 777", c.ServerUnixSocketMode))
+	}
+}
+
+// unenforcedOptions are options dbrest parses for PostgREST compatibility but
+// whose behavior has not landed yet. Setting one is accepted with a warning so
+// a working postgrest.conf boots, but the operator is told the knob does not
+// turn anything yet. An entry leaves this list when its subsystem ships.
+var unenforcedOptions = []string{
+	"db-aggregates-enabled", "db-channel", "db-channel-enabled", "db-config",
+	"db-hoisted-tx-settings", "db-pool-automatic-recovery",
+	"db-pool-max-idletime", "db-pool-max-lifetime", "db-pre-config",
+	"db-prepared-statements", "db-root-spec", "root-spec", "db-tx-end",
+	"jwt-secret-is-base64", "secret-is-base64", "openapi-security-active",
+	"server-trace-header", "server-timing-enabled",
+}
+
+// unenforcedWarnings returns one warning per explicitly set option that parses
+// but is not yet enforced.
+func unenforcedWarnings(raw map[string]string) []string {
+	var out []string
+	for _, key := range unenforcedOptions {
+		if _, ok := raw[key]; ok {
+			out = append(out, fmt.Sprintf("option %s is accepted but not enforced yet", key))
+		}
+	}
+	return out
 }
 
 // ServerAddr is the API listen address in host:port form.
