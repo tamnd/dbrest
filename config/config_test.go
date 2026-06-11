@@ -589,3 +589,38 @@ func TestListenSpecs(t *testing.T) {
 		}
 	}
 }
+
+// TestSchemasDefaultFollowsBackend pins the engine-aware db-schemas default:
+// public on postgres, main on sqlite, the backend's own default elsewhere,
+// with an explicit value always winning and an explicitly empty one rejected.
+func TestSchemasDefaultFollowsBackend(t *testing.T) {
+	cases := []struct {
+		backend string
+		want    string
+	}{
+		{"postgres", "public"},
+		{"sqlite", "main"},
+		{"mysql", ""},
+	}
+	for _, tc := range cases {
+		c, err := FromMap(map[string]string{"db-uri": "x", "db-backend": tc.backend})
+		if err != nil {
+			t.Fatalf("%s: %v", tc.backend, err)
+		}
+		if len(c.Schemas) != 1 || c.Schemas[0] != tc.want {
+			t.Errorf("%s: schemas = %v, want [%q]", tc.backend, c.Schemas, tc.want)
+		}
+	}
+
+	c, err := FromMap(map[string]string{"db-uri": "x", "db-backend": "postgres", "db-schemas": "api,private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Schemas) != 2 || c.Schemas[0] != "api" {
+		t.Errorf("explicit schemas lost: %v", c.Schemas)
+	}
+
+	if _, err := FromMap(map[string]string{"db-uri": "x", "db-schemas": ""}); err == nil {
+		t.Error("explicitly empty db-schemas should be rejected")
+	}
+}

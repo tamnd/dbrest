@@ -144,12 +144,27 @@ type Config struct {
 	CapabilityOverrides   string
 }
 
+// defaultSchemas is the exposed-schema default for an unset db-schemas: the
+// engine's natural namespace rather than a hardcoded value. PostgreSQL gets
+// upstream's "public", SQLite its main database; the engines whose default
+// namespace is the connected database itself ("" lets the backend decide) get
+// the empty marker.
+func defaultSchemas(backendName string) []string {
+	switch backendName {
+	case BackendPostgres:
+		return []string{"public"}
+	case BackendSQLite:
+		return []string{"main"}
+	default:
+		return []string{""}
+	}
+}
+
 // defaults returns a Config carrying the unambiguous PostgREST defaults, before
 // the file and environment are layered on.
 func defaults() *Config {
 	return &Config{
 		Backend:            BackendSQLite,
-		Schemas:            []string{""},
 		JWTRoleClaimKey:    ".role",
 		JWTCacheMaxEntries: 1000,
 		ServerHost:         "!4",
@@ -229,11 +244,16 @@ func fromRaw(raw map[string]string) (*Config, error) {
 			c.DBURI = strings.TrimSpace(string(data))
 		}
 	}
+	schemasSet := false
 	for _, key := range []string{"db-schemas", "db-schema"} {
 		if v, ok := get(key); ok {
 			c.Schemas = splitList(v)
+			schemasSet = true
 			break
 		}
+	}
+	if !schemasSet {
+		c.Schemas = defaultSchemas(c.Backend)
 	}
 	if v, ok := get("db-anon-role"); ok {
 		c.AnonRole = v
@@ -382,6 +402,9 @@ func (c *Config) validate(errs *[]string) {
 	}
 	if c.JWTCacheMaxEntries < 0 {
 		*errs = append(*errs, "jwt-cache-max-entries must not be negative")
+	}
+	if len(c.Schemas) == 0 {
+		*errs = append(*errs, "db-schemas must name at least one schema")
 	}
 	if !knownTxEnds[c.TxEnd] {
 		*errs = append(*errs, fmt.Sprintf("db-tx-end %q is not one of commit/commit-allow-override/rollback/rollback-allow-override", c.TxEnd))
