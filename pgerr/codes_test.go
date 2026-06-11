@@ -31,6 +31,10 @@ func TestConstructorStatusAndCode(t *testing.T) {
 		{"no-relationship", ErrNoRelationship("films", "actors"), http.StatusBadRequest, CodeNoRelationship},
 		{"ambiguous-embed", ErrAmbiguousEmbed("films", "actors"), http.StatusMultipleChoices, CodeAmbiguousEmbed},
 		{"no-function", ErrNoFunction("add"), http.StatusNotFound, CodeNoFunction},
+		{"ambiguous-function", ErrAmbiguousFunction([]string{"api.add(a => integer)", "api.add(a => text)"}), http.StatusMultipleChoices, CodeAmbiguousFunc},
+		{"invalid-path", ErrInvalidPath(), http.StatusNotFound, CodeInvalidPath},
+		{"guc-headers", ErrInvalidResponseHeaders(), http.StatusInternalServerError, CodeGucHeaders},
+		{"guc-status", ErrInvalidResponseStatus(), http.StatusInternalServerError, CodeGucStatus},
 		{"method-not-allowed", ErrMethodNotAllowed(""), http.StatusMethodNotAllowed, CodeMethodNotAllowed},
 		{"invalid-rpc-method", ErrInvalidRPCMethod("DELETE"), http.StatusMethodNotAllowed, CodeMethodNotAllowed},
 		{"read-only-txn", ErrReadOnlyTransaction("UPDATE"), http.StatusMethodNotAllowed, CodeReadOnlyTransaction},
@@ -176,6 +180,22 @@ func TestRPCMethodMessages(t *testing.T) {
 	}
 	if got, want := ErrReadOnlyTransaction("UPDATE").Message, "cannot execute UPDATE in a read-only transaction"; got != want {
 		t.Errorf("25006 message = %q, want %q", got, want)
+	}
+}
+
+// PGRST203 spells the surviving overloads into the message and tells the
+// client how to break the tie; PGRST125's message is pinned to the live text.
+func TestAmbiguousFunctionAndInvalidPath(t *testing.T) {
+	e := ErrAmbiguousFunction([]string{"api.add(a => integer)", "api.add(a => text)"})
+	want := "Could not choose the best candidate function between: api.add(a => integer), api.add(a => text)"
+	if e.Message != want {
+		t.Errorf("PGRST203 message = %q, want %q", e.Message, want)
+	}
+	if e.Hint == nil || !strings.Contains(*e.Hint, "function overloading can be resolved") {
+		t.Errorf("PGRST203 hint = %v, want the renaming suggestion", e.Hint)
+	}
+	if got, want := ErrInvalidPath().Message, "Invalid path specified in request URL"; got != want {
+		t.Errorf("PGRST125 message = %q, want %q", got, want)
 	}
 }
 

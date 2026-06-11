@@ -3,6 +3,7 @@ package pgerr
 import (
 	"fmt"
 	"net/http"
+	"strings"
 )
 
 // The PGRST code families (spec 18-errors.md, section "The PGRST code families"):
@@ -20,10 +21,14 @@ const (
 	CodeInvalidBody      = "PGRST102" // 400 invalid request body
 	CodeRangeUnsatisfied = "PGRST103" // 416 requested range not satisfiable
 	CodeMediaType        = "PGRST107" // 406 Accept negotiation failed
+	CodeGucHeaders       = "PGRST111" // 500 invalid response.headers from a function
+	CodeGucStatus        = "PGRST112" // 500 invalid response.status from a function
 	CodeSingularZeroMany = "PGRST116" // 406 singular requested, zero or many rows
+	CodeInvalidPath      = "PGRST125" // 404 invalid path in request URL
 	CodeNoRelationship   = "PGRST200" // 400 relationship not found
 	CodeAmbiguousEmbed   = "PGRST201" // 300 embedding ambiguous
 	CodeNoFunction       = "PGRST202" // 404 no function matches name/args
+	CodeAmbiguousFunc    = "PGRST203" // 300 overloaded function call ambiguous
 	CodeUnknownColumn    = "PGRST204" // 400 column in write payload not found
 	CodeUnknownTable     = "PGRST205" // 404 table or view not found / not exposed
 	CodeJWTExpired       = "PGRST301" // 401 JWT expired
@@ -132,6 +137,42 @@ func ErrAmbiguousEmbed(parent, target string) *APIError {
 func ErrNoFunction(name string) *APIError {
 	return New(http.StatusNotFound, CodeNoFunction,
 		fmt.Sprintf("Could not find the function '%s' in the schema cache", name))
+}
+
+// ErrAmbiguousFunction is raised when more than one overload of a function
+// survives argument matching, PostgREST's PGRST203 with a 300. candidates are
+// the surviving signatures, schema-qualified with their parameter lists
+// ("api.add(a => integer, b => integer)"), spelled into the message the way
+// upstream does.
+func ErrAmbiguousFunction(candidates []string) *APIError {
+	e := New(http.StatusMultipleChoices, CodeAmbiguousFunc,
+		"Could not choose the best candidate function between: "+strings.Join(candidates, ", "))
+	return e.WithHint("Try renaming the parameters or the function itself in the database so function overloading can be resolved")
+}
+
+// ErrInvalidPath is raised for a request path PostgREST has no route for: more
+// than one segment after the relation, or extra segments after /rpc/<fn>. It is
+// v14's PGRST125, a 404 with this exact message (verified live), distinct from
+// the PGRST205 an unknown relation gets.
+func ErrInvalidPath() *APIError {
+	return New(http.StatusNotFound, CodeInvalidPath,
+		"Invalid path specified in request URL")
+}
+
+// ErrInvalidResponseHeaders is raised when a function sets response.headers to
+// something other than an array of one-key string objects. PostgREST returns
+// PGRST111 at 500 rather than forwarding junk headers; the message is
+// upstream's.
+func ErrInvalidResponseHeaders() *APIError {
+	return New(http.StatusInternalServerError, CodeGucHeaders,
+		"response.headers guc must be a JSON array composed of objects with a single key and a string value")
+}
+
+// ErrInvalidResponseStatus is raised when a function sets response.status to
+// anything that is not a valid status code; PostgREST's PGRST112 at 500.
+func ErrInvalidResponseStatus() *APIError {
+	return New(http.StatusInternalServerError, CodeGucStatus,
+		"response.status guc must be a valid status code")
 }
 
 // ErrMethodNotAllowed is a 405 PGRST101 with a caller-supplied message. Prefer
