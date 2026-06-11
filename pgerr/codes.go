@@ -89,11 +89,27 @@ func ErrUnknownTable(name string) *APIError {
 		fmt.Sprintf("Could not find the table '%s' in the schema cache", name))
 }
 
-// ErrUnknownColumn is raised when a column named in a payload or select is not
-// found on the target relation.
+// ErrUnknownColumn is raised when a column named in a write payload or the
+// columns= parameter is not found on the target relation. PostgREST reserves
+// PGRST204 for those two; a column referenced by select, a filter, or order
+// reaches PostgreSQL instead and surfaces as 42703 (ErrUndefinedColumn).
 func ErrUnknownColumn(col string) *APIError {
 	return New(http.StatusBadRequest, CodeUnknownColumn,
 		fmt.Sprintf("Could not find the '%s' column in the schema cache", col))
+}
+
+// CodeUndefinedColumn is PostgreSQL's undefined_column. In PostgREST an unknown
+// column in select, a filter, or order is not caught by the schema cache; it
+// reaches the server and comes back as this SQLSTATE with a 400.
+const CodeUndefinedColumn = "42703"
+
+// ErrUndefinedColumn mirrors PostgreSQL's own message for a reference to a
+// column that does not exist; column is the relation-qualified name the query
+// used ("todos.nope"). Callers add the server's "Perhaps you meant to reference
+// the column ..." suggestion with WithHint when a near-miss exists.
+func ErrUndefinedColumn(column string) *APIError {
+	return New(http.StatusBadRequest, CodeUndefinedColumn,
+		fmt.Sprintf("column %s does not exist", column))
 }
 
 // ErrNoRelationship is raised when an embed names a resource the schema model

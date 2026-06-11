@@ -27,6 +27,7 @@ func TestConstructorStatusAndCode(t *testing.T) {
 		{"unsupported-media", ErrUnsupportedMediaType("text/yaml"), http.StatusBadRequest, CodeInvalidBody},
 		{"unknown-table", ErrUnknownTable("films"), http.StatusNotFound, CodeUnknownTable},
 		{"unknown-column", ErrUnknownColumn("titel"), http.StatusBadRequest, CodeUnknownColumn},
+		{"undefined-column", ErrUndefinedColumn("todos.nope"), http.StatusBadRequest, CodeUndefinedColumn},
 		{"no-relationship", ErrNoRelationship("films", "actors"), http.StatusBadRequest, CodeNoRelationship},
 		{"ambiguous-embed", ErrAmbiguousEmbed("films", "actors"), http.StatusMultipleChoices, CodeAmbiguousEmbed},
 		{"no-function", ErrNoFunction("add"), http.StatusNotFound, CodeNoFunction},
@@ -132,6 +133,15 @@ func TestInvalidInputTypeSpelling(t *testing.T) {
 		if got != want {
 			t.Errorf("ErrInvalidInput(%q) message = %q, want %q", canonical, got, want)
 		}
+	}
+}
+
+// 42703 carries PostgreSQL's own message shape: the qualified column, no
+// quotes, exactly as a live v14 forwards it.
+func TestUndefinedColumnMessage(t *testing.T) {
+	got := ErrUndefinedColumn("todos.nope").Message
+	if want := "column todos.nope does not exist"; got != want {
+		t.Errorf("message = %q, want %q", got, want)
 	}
 }
 
