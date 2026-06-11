@@ -17,8 +17,9 @@ import (
 const (
 	CodeParse            = "PGRST100" // 400 query-string parse error
 	CodeMethodNotAllowed = "PGRST101" // 405 method not allowed (GET on a volatile fn)
+	CodeInvalidBody      = "PGRST102" // 400 invalid request body
 	CodeRangeUnsatisfied = "PGRST103" // 416 requested range not satisfiable
-	CodeMediaType        = "PGRST107" // 406/415 media type not negotiable
+	CodeMediaType        = "PGRST107" // 406 Accept negotiation failed
 	CodeSingularZeroMany = "PGRST116" // 406 singular requested, zero or many rows
 	CodeNoRelationship   = "PGRST200" // 400 relationship not found
 	CodeAmbiguousEmbed   = "PGRST201" // 300 embedding ambiguous
@@ -34,6 +35,17 @@ const (
 // ErrParse is a query-string syntax error (bad operator, malformed logic tree).
 func ErrParse(msg string) *APIError {
 	return New(http.StatusBadRequest, CodeParse, msg)
+}
+
+// ErrInvalidBody is an invalid request body (PostgREST's PGRST102, HTTP 400):
+// an empty or malformed JSON or CSV payload, or a bulk insert whose objects do
+// not all share the same key set ("All object keys must match"). An empty msg
+// falls back to PostgREST's generic JSON-body message.
+func ErrInvalidBody(msg string) *APIError {
+	if msg == "" {
+		msg = "Empty or invalid json"
+	}
+	return New(http.StatusBadRequest, CodeInvalidBody, msg)
 }
 
 // ErrSingularZeroMany is raised when a singular response was requested but zero
@@ -59,11 +71,14 @@ func ErrNotAcceptable(offered string) *APIError {
 }
 
 // ErrUnsupportedMediaType is raised when a write or RPC body arrives with a
-// Content-Type no parser handles. It is PGRST107 with a 415, the request-side
-// twin of ErrNotAcceptable.
+// Content-Type no parser handles. The published v14 error table still shows a
+// stale PGRST107/415 row for this, but live v14 answers 400 PGRST102
+// "Content-Type not acceptable: <mime>" (verified against a running PostgREST
+// by compat/errors_v14_test.go), so the wire behavior wins: PGRST107 stays
+// reserved for failed Accept negotiation (ErrNotAcceptable, 406).
 func ErrUnsupportedMediaType(contentType string) *APIError {
-	return New(http.StatusUnsupportedMediaType, CodeMediaType,
-		fmt.Sprintf("Content-Type not supported: '%s'", contentType))
+	return New(http.StatusBadRequest, CodeInvalidBody,
+		fmt.Sprintf("Content-Type not acceptable: %s", contentType))
 }
 
 // ErrUnknownTable is raised when a table or view is not in the schema model

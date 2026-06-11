@@ -97,8 +97,8 @@ func TestParseWriteUpdateFormBody(t *testing.T) {
 
 func TestParseWriteUnsupportedMediaType(t *testing.T) {
 	_, err := ParseWrite(Insert, "films", "", nil, "text/yaml", []byte("title: X"))
-	if err == nil || err.Code != "PGRST107" {
-		t.Fatalf("insert with unknown media type err = %v, want PGRST107", err)
+	if err == nil || err.Code != "PGRST102" {
+		t.Fatalf("insert with unknown media type err = %v, want PGRST102", err)
 	}
 }
 
@@ -106,8 +106,8 @@ func TestParseWriteUnsupportedMediaType(t *testing.T) {
 // unsupported media type rather than silently parsed.
 func TestParseWriteUpdateCSVRejected(t *testing.T) {
 	_, err := ParseWrite(Update, "films", "id=eq.1", nil, "text/csv", []byte("rating\nPG\n"))
-	if err == nil || err.Code != "PGRST107" {
-		t.Fatalf("update with CSV err = %v, want PGRST107", err)
+	if err == nil || err.Code != "PGRST102" {
+		t.Fatalf("update with CSV err = %v, want PGRST102", err)
 	}
 }
 

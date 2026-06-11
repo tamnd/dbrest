@@ -20,10 +20,11 @@ func TestConstructorStatusAndCode(t *testing.T) {
 		code   string
 	}{
 		{"parse", ErrParse("bad operator"), http.StatusBadRequest, CodeParse},
+		{"invalid-body", ErrInvalidBody(""), http.StatusBadRequest, CodeInvalidBody},
 		{"singular", ErrSingularZeroMany(), http.StatusNotAcceptable, CodeSingularZeroMany},
 		{"range", ErrRangeNotSatisfiable(), http.StatusRequestedRangeNotSatisfiable, CodeRangeUnsatisfied},
 		{"not-acceptable", ErrNotAcceptable("text/csv"), http.StatusNotAcceptable, CodeMediaType},
-		{"unsupported-media", ErrUnsupportedMediaType("text/yaml"), http.StatusUnsupportedMediaType, CodeMediaType},
+		{"unsupported-media", ErrUnsupportedMediaType("text/yaml"), http.StatusBadRequest, CodeInvalidBody},
 		{"unknown-table", ErrUnknownTable("films"), http.StatusNotFound, CodeUnknownTable},
 		{"unknown-column", ErrUnknownColumn("titel"), http.StatusBadRequest, CodeUnknownColumn},
 		{"no-relationship", ErrNoRelationship("films", "actors"), http.StatusBadRequest, CodeNoRelationship},
@@ -91,6 +92,26 @@ func TestEmptyMessageDefaults(t *testing.T) {
 	}
 	if got := ErrJWTInvalid("custom").Message; got != "custom" {
 		t.Errorf("ErrJWTInvalid override = %q, want custom", got)
+	}
+}
+
+// PGRST102 is the v14 code for every request-body failure. The default message
+// is PostgREST's generic JSON-body text; a specific parser failure overrides it.
+func TestInvalidBodyMessages(t *testing.T) {
+	if got := ErrInvalidBody("").Message; got != "Empty or invalid json" {
+		t.Errorf("default message = %q, want %q", got, "Empty or invalid json")
+	}
+	if got := ErrInvalidBody("All object keys must match").Message; got != "All object keys must match" {
+		t.Errorf("override message = %q", got)
+	}
+}
+
+// The request-side media type error carries PostgREST's exact message shape,
+// naming the offending Content-Type.
+func TestUnsupportedMediaTypeMessage(t *testing.T) {
+	got := ErrUnsupportedMediaType("application/yaml").Message
+	if want := "Content-Type not acceptable: application/yaml"; got != want {
+		t.Errorf("message = %q, want %q", got, want)
 	}
 }
 
