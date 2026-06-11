@@ -174,9 +174,9 @@ func (v *Verifier) Authenticate(authHeader string) (*Result, *pgerr.APIError) {
 
 	if v.cache != nil {
 		if claims, hit := v.cache.get(raw); hit {
-			// A cached entry never extends a token's life: the time claims are
-			// re-checked against the live clock on every request (spec 13).
-			if apiErr := v.checkTime(claims); apiErr != nil {
+			// A cached entry never extends a token's life: the claims are
+			// re-validated against the live clock on every request (spec 13).
+			if apiErr := v.validateClaims(claims); apiErr != nil {
 				return nil, apiErr
 			}
 			return v.resolve(claims)
@@ -205,16 +205,18 @@ func (v *Verifier) verify(raw string) (map[string]any, *pgerr.APIError) {
 		return nil, apiErr
 	}
 	claims := jwt.MapClaims{}
+	// Claims validation is done by validateClaims below, not by the library:
+	// PostgREST's rules differ (an absent or empty aud passes, iat is checked,
+	// and the type errors carry their own PGRST303 messages).
 	opts := []jwt.ParserOption{
 		jwt.WithValidMethods(v.validMethods),
-		jwt.WithLeeway(v.skew),
-		jwt.WithTimeFunc(v.now),
-	}
-	if v.audience != "" {
-		opts = append(opts, jwt.WithAudience(v.audience))
+		jwt.WithoutClaimsValidation(),
 	}
 	if _, err := jwt.NewParser(opts...).ParseWithClaims(raw, claims, v.keyfunc); err != nil {
 		return nil, mapJWTError(err)
+	}
+	if apiErr := v.validateClaims(claims); apiErr != nil {
+		return nil, apiErr
 	}
 	return map[string]any(claims), nil
 }
@@ -325,22 +327,84 @@ func methodMatchesKey(method jwt.SigningMethod, key any) bool {
 	return false
 }
 
-// checkTime re-validates the exp and nbf claims against the live clock with the
-// configured skew. It runs on a cache hit so a cached verification can never
-// resurrect an expired token.
-func (v *Verifier) checkTime(claims map[string]any) *pgerr.APIError {
-	now := v.now()
-	if exp, ok := numClaim(claims, "exp"); ok {
-		if now.After(time.Unix(exp, 0).Add(v.skew)) {
+// validateClaims applies PostgREST's claim checks in its order: exp, nbf, iat,
+// then aud, each with the 30 second skew. An absent or null claim passes; a
+// present claim of the wrong type is its own PGRST303 error. It runs on every
+// request, including cache hits, so a cached verification can never resurrect
+// an expired token.
+func (v *Verifier) validateClaims(claims map[string]any) *pgerr.APIError {
+	now := v.now().Unix()
+	skew := int64(v.skew / time.Second)
+
+	if val, ok := presentClaim(claims, "exp"); ok {
+		exp, isNum := claimNumber(val)
+		if !isNum {
+			return pgerr.ErrJWTClaims("The JWT 'exp' claim must be a number")
+		}
+		if now-skew > exp {
 			return pgerr.ErrJWTClaims("JWT expired")
 		}
 	}
-	if nbf, ok := numClaim(claims, "nbf"); ok {
-		if now.Before(time.Unix(nbf, 0).Add(-v.skew)) {
+	if val, ok := presentClaim(claims, "nbf"); ok {
+		nbf, isNum := claimNumber(val)
+		if !isNum {
+			return pgerr.ErrJWTClaims("The JWT 'nbf' claim must be a number")
+		}
+		if now+skew < nbf {
 			return pgerr.ErrJWTClaims("JWT not yet valid")
 		}
 	}
+	if val, ok := presentClaim(claims, "iat"); ok {
+		iat, isNum := claimNumber(val)
+		if !isNum {
+			return pgerr.ErrJWTClaims("The JWT 'iat' claim must be a number")
+		}
+		if now+skew < iat {
+			return pgerr.ErrJWTClaims("JWT issued at future")
+		}
+	}
+	if val, ok := presentClaim(claims, "aud"); ok {
+		if apiErr := v.checkAud(val); apiErr != nil {
+			return apiErr
+		}
+	}
 	return nil
+}
+
+// checkAud validates the aud claim the PostgREST way: a string must match the
+// configured audience, an array passes when empty or when any element matches,
+// and anything else is a type error. With no jwt-aud configured every audience
+// matches.
+func (v *Verifier) checkAud(val any) *pgerr.APIError {
+	switch aud := val.(type) {
+	case string:
+		if !v.audMatches(aud) {
+			return pgerr.ErrJWTClaims("JWT not in audience")
+		}
+	case []any:
+		matched := len(aud) == 0
+		for _, el := range aud {
+			s, isStr := el.(string)
+			if !isStr {
+				return pgerr.ErrJWTClaims("The JWT 'aud' claim must be a string or an array of strings")
+			}
+			if v.audMatches(s) {
+				matched = true
+			}
+		}
+		if !matched {
+			return pgerr.ErrJWTClaims("JWT not in audience")
+		}
+	default:
+		return pgerr.ErrJWTClaims("The JWT 'aud' claim must be a string or an array of strings")
+	}
+	return nil
+}
+
+// audMatches reports whether a token audience satisfies the configured jwt-aud.
+// An unset jwt-aud accepts every audience.
+func (v *Verifier) audMatches(aud string) bool {
+	return v.audience == "" || v.audience == aud
 }
 
 // resolve reads the role from the claims and applies the anon fallback and the
@@ -464,10 +528,21 @@ func roleFromClaims(claims map[string]any, path []jsPathExp) string {
 	return ""
 }
 
-// numClaim reads a numeric claim as a Unix-seconds int64, handling the float64
-// and json.Number forms a decoded claim set can carry.
-func numClaim(claims map[string]any, name string) (int64, bool) {
-	switch t := claims[name].(type) {
+// presentClaim reports a claim's value when it is present and non-null. An
+// absent or null claim is skipped by every check, as upstream.
+func presentClaim(claims map[string]any, name string) (any, bool) {
+	val, ok := claims[name]
+	if !ok || val == nil {
+		return nil, false
+	}
+	return val, true
+}
+
+// claimNumber reads a numeric claim value as Unix seconds, handling the
+// float64 and json.Number forms a decoded claim set can carry. A non-number is
+// reported false and becomes the claim's PGRST303 type error.
+func claimNumber(val any) (int64, bool) {
+	switch t := val.(type) {
 	case float64:
 		return int64(t), true
 	case int64:
@@ -475,6 +550,9 @@ func numClaim(claims map[string]any, name string) (int64, bool) {
 	case json.Number:
 		if n, err := t.Int64(); err == nil {
 			return n, true
+		}
+		if f, err := t.Float64(); err == nil {
+			return int64(f), true
 		}
 	}
 	return 0, false

@@ -230,6 +230,32 @@ func TestAudienceEnforced(t *testing.T) {
 	}
 }
 
+func TestTokenWithoutAudAccepted(t *testing.T) {
+	// "If the aud key is not present ... allowed for all audiences": a token
+	// with no aud claim passes even when jwt-aud is configured.
+	v := hmacVerifier(t, Config{Audience: testAud})
+	tok := signHS(t, jwt.MapClaims{"role": "web_user"})
+	res, err := v.Authenticate("Bearer " + tok)
+	if err != nil {
+		t.Fatalf("a token without aud must verify: %v", err)
+	}
+	if res.Role != "web_user" {
+		t.Fatalf("role = %q", res.Role)
+	}
+}
+
+func TestFutureIssuedAtIs303(t *testing.T) {
+	v := hmacVerifier(t, Config{})
+	tok := signHS(t, jwt.MapClaims{
+		"role": "web_user",
+		"iat":  clockNow.Add(time.Hour).Unix(),
+	})
+	_, err := v.Authenticate("Bearer " + tok)
+	if err == nil || err.Code != "PGRST303" || err.Message != "JWT issued at future" {
+		t.Fatalf("want PGRST303 JWT issued at future, got %v", err)
+	}
+}
+
 func TestNestedRoleClaim(t *testing.T) {
 	v := hmacVerifier(t, Config{RoleClaimKey: ".app_metadata.role"})
 	tok := signHS(t, jwt.MapClaims{

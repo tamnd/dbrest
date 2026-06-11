@@ -110,3 +110,30 @@ func TestV14AuthErrorSurface(t *testing.T) {
 			token: good, wantStatus: 200},
 	})
 }
+
+// The claim validation surface (item 03.5): iat is validated with skew, type
+// errors carry their own PGRST303 messages, and a token without aud (or with a
+// foreign aud, since neither stack configures jwt-aud) is accepted.
+func TestV14ClaimValidation(t *testing.T) {
+	iatFuture := mintHS(t, jwt.MapClaims{
+		"role": "web_user",
+		"iat":  time.Now().Add(time.Hour).Unix(),
+	})
+	expString := mintHS(t, jwt.MapClaims{"role": "web_user", "exp": "soon"})
+	iatString := mintHS(t, jwt.MapClaims{"role": "web_user", "iat": "x"})
+	foreignAud := mintHS(t, jwt.MapClaims{"role": "web_user", "aud": "other"})
+	emptyAud := mintHS(t, jwt.MapClaims{"role": "web_user", "aud": []string{}})
+
+	runAuthCases(t, []authCase{
+		{name: "future iat is 401 PGRST303", method: http.MethodGet, path: "/todos",
+			token: iatFuture, wantStatus: 401},
+		{name: "non-number exp is a type error", method: http.MethodGet, path: "/todos",
+			token: expString, wantStatus: 401},
+		{name: "non-number iat is a type error", method: http.MethodGet, path: "/todos",
+			token: iatString, wantStatus: 401},
+		{name: "foreign aud passes with no jwt-aud configured", method: http.MethodGet, path: "/todos",
+			token: foreignAud, wantStatus: 200},
+		{name: "empty aud array passes", method: http.MethodGet, path: "/todos",
+			token: emptyAud, wantStatus: 200},
+	})
+}
