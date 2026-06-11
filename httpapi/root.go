@@ -35,10 +35,10 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request, id identity,
 	}
 
 	opts := openapi.Options{
-		Host:         r.Host,
-		Schemes:      []string{requestScheme(r)},
-		JWT:          s.verifier != nil,
-		ActiveSchema: activeSchema,
+		Host:           r.Host,
+		Schemes:        []string{requestScheme(r)},
+		SecurityActive: s.openapiSecurity,
+		ActiveSchema:   activeSchema,
 	}
 	if s.openapiProxy != "" {
 		applyProxyURI(&opts, s.openapiProxy)

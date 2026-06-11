@@ -46,12 +46,11 @@ type Options struct {
 	// everything, the ignore-privileges mode.
 	Visibility func(rel *schema.Relation) Actions
 
-	// JWT advertises a bearer security scheme in securityDefinitions when true,
-	// matching a server with JWT auth configured (spec 13).
-	JWT bool
-	// SecurityActive attaches the security requirement to every operation, the
-	// PostgREST openapi-security-active setting (spec 20). With JWT defined but
-	// this false, the scheme is described but not enforced, PostgREST's default.
+	// SecurityActive is the PostgREST openapi-security-active setting (spec
+	// 20): when true the document carries the JWT securityDefinitions block
+	// and a document-level security requirement; when false (the default)
+	// neither is emitted, exactly as v14 behaves regardless of whether JWT
+	// auth is configured.
 	SecurityActive bool
 }
 
@@ -108,14 +107,12 @@ func build(model *schema.Model, fns rpc.Registry, caps backend.Capabilities, opt
 	}
 
 	ops := advertisedTokens(caps)
-	var security []map[string][]string
-	if opts.JWT {
+	if opts.SecurityActive {
 		doc.SecurityDefinitions = map[string]*securityScheme{
-			"JWT": {Type: "apiKey", Name: "Authorization", In: "header"},
+			"JWT": {Type: "apiKey", Name: "Authorization", In: "header",
+				Description: `Add the token prepending "Bearer " (without quotes) to it`},
 		}
-		if opts.SecurityActive {
-			security = []map[string][]string{{"JWT": {}}}
-		}
+		doc.Security = []map[string][]string{{"JWT": {}}}
 	}
 
 	for _, rel := range model.RelationsIn(opts.ActiveSchema) {
@@ -131,12 +128,12 @@ func build(model *schema.Model, fns rpc.Registry, caps backend.Capabilities, opt
 		if !acts.any() {
 			continue
 		}
-		doc.Paths["/"+rel.Name] = relationPath(rel, ops, security, acts)
+		doc.Paths["/"+rel.Name] = relationPath(rel, ops, acts)
 		doc.Definitions[rel.Name] = relationDefinition(rel)
 	}
 	if fns != nil {
 		for _, fn := range fns.List() {
-			doc.Paths["/rpc/"+fn.Name] = functionPath(fn, security)
+			doc.Paths["/rpc/"+fn.Name] = functionPath(fn)
 		}
 	}
 	return doc
@@ -148,7 +145,7 @@ func build(model *schema.Model, fns rpc.Registry, caps backend.Capabilities, opt
 // requesting role may not perform. Each operation lists the reserved
 // parameters it honors plus one query parameter per column for horizontal
 // filtering.
-func relationPath(rel *schema.Relation, ops string, security []map[string][]string, acts Actions) *pathItem {
+func relationPath(rel *schema.Relation, ops string, acts Actions) *pathItem {
 	filters := columnParams(rel, ops)
 	p := &pathItem{}
 	if acts.Get {
@@ -156,7 +153,6 @@ func relationPath(rel *schema.Relation, ops string, security []map[string][]stri
 			Tags:       []string{rel.Name},
 			Parameters: concat(refs("select", "order", "limit", "offset", "rangeHeader", "preferRead"), filters),
 			Responses:  okResponses("200", "OK"),
-			Security:   security,
 		}
 	}
 	if rel.Kind == schema.KindTable {
@@ -166,7 +162,6 @@ func relationPath(rel *schema.Relation, ops string, security []map[string][]stri
 				Tags:       []string{rel.Name},
 				Parameters: concat(refs("select", "columns", "on_conflict", "preferWrite"), []*parameter{bodyParam(rel.Name, bodyRef)}),
 				Responses:  okResponses("201", "Created"),
-				Security:   security,
 			}
 		}
 		if acts.Patch {
@@ -174,7 +169,6 @@ func relationPath(rel *schema.Relation, ops string, security []map[string][]stri
 				Tags:       []string{rel.Name},
 				Parameters: concat(refs("select", "columns", "preferWrite"), filters, []*parameter{bodyParam(rel.Name, bodyRef)}),
 				Responses:  okResponses("204", "No Content"),
-				Security:   security,
 			}
 		}
 		if acts.Delete {
@@ -182,7 +176,6 @@ func relationPath(rel *schema.Relation, ops string, security []map[string][]stri
 				Tags:       []string{rel.Name},
 				Parameters: concat(refs("preferWrite"), filters),
 				Responses:  okResponses("204", "No Content"),
-				Security:   security,
 			}
 		}
 	}
@@ -215,21 +208,19 @@ func relationDefinition(rel *schema.Relation) *schemaObject {
 // functionPath emits the /rpc/<fn> path. A read-only function (stable or
 // immutable) is callable by GET with its arguments as query parameters and by
 // POST with a body schema; a volatile function is POST only. See spec 12.
-func functionPath(fn *rpc.Function, security []map[string][]string) *pathItem {
+func functionPath(fn *rpc.Function) *pathItem {
 	p := &pathItem{}
 	if fn.Volatility.ReadOnly() {
 		p.Get = &operation{
 			Tags:       []string{fn.Name},
 			Parameters: functionQueryParams(fn),
 			Responses:  okResponses("200", "OK"),
-			Security:   security,
 		}
 	}
 	p.Post = &operation{
 		Tags:       []string{fn.Name},
 		Parameters: []*parameter{{In: "body", Name: "args", Required: len(fn.Required()) > 0, Schema: functionBodySchema(fn)}},
 		Responses:  okResponses("200", "OK"),
-		Security:   security,
 	}
 	return p
 }

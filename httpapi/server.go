@@ -38,8 +38,9 @@ type Server struct {
 	role         string
 	verifier     *auth.Verifier
 	authz        *authz.Registry
-	openapiMode  string
-	openapiProxy string
+	openapiMode     string
+	openapiProxy    string
+	openapiSecurity bool
 }
 
 // NewServer builds a Server over a backend, its introspected model, and the
@@ -54,10 +55,13 @@ func NewServer(b backend.Backend, model *schema.Model, searchPath []string) *Ser
 // modes leave it on. proxyURI, when set, is the externally visible base URL the
 // document advertises (the openapi-server-proxy-uri option), overriding the
 // host and scheme the request arrived on so a document served behind a reverse
-// proxy points at the public address. See spec 20.
-func (s *Server) SetOpenAPI(mode, proxyURI string) {
+// proxy points at the public address. securityActive is the
+// openapi-security-active option: it attaches the JWT security requirement to
+// every operation rather than just describing the scheme. See spec 20.
+func (s *Server) SetOpenAPI(mode, proxyURI string, securityActive bool) {
 	s.openapiMode = mode
 	s.openapiProxy = proxyURI
+	s.openapiSecurity = securityActive
 }
 
 // SetDefaultRole overrides the static role used for unauthenticated requests

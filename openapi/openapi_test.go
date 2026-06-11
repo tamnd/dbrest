@@ -202,28 +202,44 @@ func TestRegexOmittedWhenUnsupported(t *testing.T) {
 	}
 }
 
-func TestSecurityDefinitionsWhenJWT(t *testing.T) {
-	doc := decode(t, filmsModel(), nil, sqliteCaps(), Options{JWT: true})
+func TestSecurityInactiveOmitsDefinitions(t *testing.T) {
+	// PostgREST's default: with openapi-security-active off the document has
+	// neither securityDefinitions nor a security requirement, even with JWT
+	// auth configured on the server.
+	doc := decode(t, filmsModel(), nil, sqliteCaps(), Options{})
+	if _, ok := doc["securityDefinitions"]; ok {
+		t.Error("securityDefinitions should be absent when security is inactive")
+	}
+	if _, ok := doc["security"]; ok {
+		t.Error("security should be absent when security is inactive")
+	}
+}
+
+func TestSecurityActiveEmitsJWTScheme(t *testing.T) {
+	doc := decode(t, filmsModel(), nil, sqliteCaps(), Options{SecurityActive: true})
 	sd, ok := doc["securityDefinitions"].(map[string]any)
 	if !ok {
-		t.Fatal("no securityDefinitions with JWT enabled")
+		t.Fatal("no securityDefinitions with security active")
 	}
 	jwt := sd["JWT"].(map[string]any)
 	if jwt["type"] != "apiKey" || jwt["name"] != "Authorization" || jwt["in"] != "header" {
 		t.Errorf("JWT scheme = %v", jwt)
 	}
-	// Default: the scheme is defined but not attached to operations.
+	if jwt["description"] != `Add the token prepending "Bearer " (without quotes) to it` {
+		t.Errorf("JWT description = %v", jwt["description"])
+	}
+	// The requirement is document-level, the way v14 attaches it.
+	sec, ok := doc["security"].([]any)
+	if !ok || len(sec) != 1 {
+		t.Fatalf("security = %v, want one document-level requirement", doc["security"])
+	}
+	if _, ok := sec[0].(map[string]any)["JWT"]; !ok {
+		t.Errorf("security requirement = %v, want JWT", sec[0])
+	}
+	// Operations carry no per-operation security in v14.
 	get := doc["paths"].(map[string]any)["/films"].(map[string]any)["get"].(map[string]any)
 	if _, attached := get["security"]; attached {
-		t.Error("security should not be attached to operations by default")
-	}
-}
-
-func TestSecurityActiveAttachesRequirement(t *testing.T) {
-	doc := decode(t, filmsModel(), nil, sqliteCaps(), Options{JWT: true, SecurityActive: true})
-	get := doc["paths"].(map[string]any)["/films"].(map[string]any)["get"].(map[string]any)
-	if _, attached := get["security"]; !attached {
-		t.Error("security should be attached when SecurityActive is set")
+		t.Error("security should not be attached per operation")
 	}
 }
 

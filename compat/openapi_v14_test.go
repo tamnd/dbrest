@@ -216,3 +216,25 @@ func TestDottedPathDoesNotEscapeSchema(t *testing.T) {
 		}
 	})
 }
+
+// TestRootSecurityInactiveByDefault pins the default openapi-security-active
+// shape: with it off the document carries neither securityDefinitions nor a
+// security requirement, even though both servers authenticate JWTs.
+func TestRootSecurityInactiveByDefault(t *testing.T) {
+	onBoth(t, func(t *testing.T, base string) {
+		res := doRequest(t, base, compatCase{method: "GET", path: "/"})
+		if res.status != http.StatusOK {
+			t.Fatalf("status = %d, want 200", res.status)
+		}
+		var doc map[string]json.RawMessage
+		if err := json.Unmarshal(res.body, &doc); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if _, ok := doc["securityDefinitions"]; ok {
+			t.Error("securityDefinitions should be absent by default")
+		}
+		if _, ok := doc["security"]; ok {
+			t.Error("security should be absent by default")
+		}
+	})
+}

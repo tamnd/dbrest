@@ -17,6 +17,7 @@ type document struct {
 	Definitions         map[string]*schemaObject   `json:"definitions"`
 	Parameters          map[string]*parameter      `json:"parameters,omitempty"`
 	SecurityDefinitions map[string]*securityScheme `json:"securityDefinitions,omitempty"`
+	Security            []map[string][]string      `json:"security,omitempty"`
 }
 
 type info struct {
@@ -32,11 +33,10 @@ type pathItem struct {
 }
 
 type operation struct {
-	Tags       []string              `json:"tags,omitempty"`
-	Summary    string                `json:"summary,omitempty"`
-	Parameters []*parameter          `json:"parameters,omitempty"`
-	Responses  map[string]*response  `json:"responses"`
-	Security   []map[string][]string `json:"security,omitempty"`
+	Tags       []string             `json:"tags,omitempty"`
+	Summary    string               `json:"summary,omitempty"`
+	Parameters []*parameter         `json:"parameters,omitempty"`
+	Responses  map[string]*response `json:"responses"`
 }
 
 type parameter struct {
@@ -68,7 +68,8 @@ type propertySchema struct {
 }
 
 type securityScheme struct {
-	Type string `json:"type"`
-	Name string `json:"name"`
-	In   string `json:"in"`
+	Type        string `json:"type"`
+	Name        string `json:"name"`
+	In          string `json:"in"`
+	Description string `json:"description,omitempty"`
 }

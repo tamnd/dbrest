@@ -20,7 +20,7 @@ var optionKeys = []string{
 	"server-host", "server-port", "server-unix-socket",
 	"admin-server-host", "admin-server-port",
 	"db-pool", "db-pool-acquisition-timeout",
-	"openapi-mode", "openapi-server-proxy-uri",
+	"openapi-mode", "openapi-server-proxy-uri", "openapi-security-active",
 	"log-level", "log-query", "server-cors-allowed-origins",
 	"declared-schema", "declared-relationships", "function-registry",
 	"policy-registry", "capability-overrides",

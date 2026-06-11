@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/tamnd/dbrest/auth"
 	"github.com/tamnd/dbrest/authz"
 	"github.com/tamnd/dbrest/config"
 )
@@ -100,7 +101,7 @@ func TestRootNegotiatesAccept(t *testing.T) {
 // TestRootDisabledIs404 checks openapi-mode=disabled turns the root off.
 func TestRootDisabledIs404(t *testing.T) {
 	srv := newServer(t)
-	srv.SetOpenAPI(config.OpenAPIDisabled, "")
+	srv.SetOpenAPI(config.OpenAPIDisabled, "", false)
 	resp := do(t, srv, http.MethodGet, "/", nil)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", resp.StatusCode)
@@ -115,7 +116,7 @@ func TestRootFollowPrivilegesFiltersDocument(t *testing.T) {
 		{Role: "web_user", Relation: "films", Action: authz.Select},
 		{Role: "web_user", Relation: "films", Action: authz.Insert},
 	}, nil)
-	srv.SetOpenAPI(config.OpenAPIFollowPrivileges, "")
+	srv.SetOpenAPI(config.OpenAPIFollowPrivileges, "", false)
 
 	// The authenticated role sees films with exactly its granted operations.
 	resp := do(t, srv, http.MethodGet, "/", map[string]string{
@@ -164,7 +165,7 @@ func TestRootFollowPrivilegesFiltersDocument(t *testing.T) {
 // the full document even for a role with no grants.
 func TestRootIgnorePrivilegesEmitsAll(t *testing.T) {
 	srv := authzServer(t, nil, nil)
-	srv.SetOpenAPI(config.OpenAPIIgnorePrivileges, "")
+	srv.SetOpenAPI(config.OpenAPIIgnorePrivileges, "", false)
 	resp := do(t, srv, http.MethodGet, "/", nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
@@ -180,11 +181,64 @@ func TestRootIgnorePrivilegesEmitsAll(t *testing.T) {
 	}
 }
 
+// TestRootSecurityActive checks openapi-security-active emits the JWT scheme
+// and a document-level security requirement, the way PostgREST v14 shapes it;
+// off (the default) the document carries neither, even with JWT configured.
+func TestRootSecurityActive(t *testing.T) {
+	srv := authServer(t, auth.Config{})
+	srv.SetOpenAPI(config.OpenAPIIgnorePrivileges, "", true)
+	resp := do(t, srv, http.MethodGet, "/", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var doc struct {
+		SecurityDefinitions map[string]map[string]any `json:"securityDefinitions"`
+		Security            []map[string][]any        `json:"security"`
+		Paths               map[string]map[string]struct {
+			Security []map[string][]any `json:"security"`
+		} `json:"paths"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	jwt, ok := doc.SecurityDefinitions["JWT"]
+	if !ok {
+		t.Fatal("securityDefinitions missing the JWT scheme")
+	}
+	if jwt["type"] != "apiKey" || jwt["name"] != "Authorization" || jwt["in"] != "header" {
+		t.Errorf("JWT scheme = %v", jwt)
+	}
+	if len(doc.Security) != 1 {
+		t.Fatalf("security = %v, want one document-level requirement", doc.Security)
+	}
+	if _, ok := doc.Security[0]["JWT"]; !ok {
+		t.Errorf("security requirement = %v, want JWT", doc.Security[0])
+	}
+	// v14 attaches the requirement at the document, never per operation.
+	if sec := doc.Paths["/films"]["get"].Security; len(sec) != 0 {
+		t.Errorf("get security = %v, want none per operation", sec)
+	}
+
+	// Off (the default): no securityDefinitions and no requirement at all.
+	srv.SetOpenAPI(config.OpenAPIIgnorePrivileges, "", false)
+	resp = do(t, srv, http.MethodGet, "/", nil)
+	doc.SecurityDefinitions, doc.Security, doc.Paths = nil, nil, nil
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(doc.SecurityDefinitions) != 0 {
+		t.Errorf("securityDefinitions = %v, want none when inactive", doc.SecurityDefinitions)
+	}
+	if len(doc.Security) != 0 {
+		t.Errorf("security = %v, want none when inactive", doc.Security)
+	}
+}
+
 // TestRootProxyURIRewritesHost checks openapi-server-proxy-uri overrides the
 // host, scheme, and base path the document advertises.
 func TestRootProxyURIRewritesHost(t *testing.T) {
 	srv := newServer(t)
-	srv.SetOpenAPI(config.OpenAPIFollowPrivileges, "https://api.example.com/v1")
+	srv.SetOpenAPI(config.OpenAPIFollowPrivileges, "https://api.example.com/v1", false)
 	resp := do(t, srv, http.MethodGet, "/", nil)
 	var doc map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {

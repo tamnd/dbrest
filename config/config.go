@@ -87,6 +87,7 @@ type Config struct {
 	// OpenAPI (spec 19).
 	OpenAPIMode           string
 	OpenAPIServerProxyURI string
+	OpenAPISecurityActive bool
 
 	// Observability and CORS (section 8).
 	LogLevel           string
@@ -206,6 +207,7 @@ func fromRaw(raw map[string]string) (*Config, error) {
 	if v, ok := get("openapi-server-proxy-uri"); ok {
 		c.OpenAPIServerProxyURI = strings.TrimSpace(v)
 	}
+	c.OpenAPISecurityActive = pickBool(raw, &errs, c.OpenAPISecurityActive, "openapi-security-active")
 
 	if v, ok := get("log-level"); ok {
 		c.LogLevel = strings.ToLower(strings.TrimSpace(v))
