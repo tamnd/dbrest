@@ -45,6 +45,11 @@ func TestConstructorStatusAndCode(t *testing.T) {
 		{"rls-violation", ErrRLSViolation("films"), http.StatusForbidden, CodeInsufficientPrivilege},
 		{"internal", ErrInternal("boom"), http.StatusInternalServerError, CodeInternal},
 	}
+	// The internal code is pinned to its literal: clients and monitors match the
+	// documented PGRSTX00, so a private spelling would never match anything.
+	if CodeInternal != "PGRSTX00" {
+		t.Errorf("CodeInternal = %q, want PGRSTX00", CodeInternal)
+	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			if c.err.HTTPStatus != c.status {

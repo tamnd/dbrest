@@ -29,7 +29,7 @@ const (
 	CodeJWTExpired       = "PGRST301" // 401 JWT expired
 	CodeJWTInvalid       = "PGRST302" // 401 JWT malformed/bad signature/alg/nbf/aud
 	CodeUnsupported      = "PGRST127" // 400 feature not implemented on this backend
-	CodeInternal         = "PGRSTXX0" // 500 internal error (XX family rendered as 500)
+	CodeInternal         = "PGRSTX00" // 500 internal error (upstream group X has only X00)
 )
 
 // ErrParse is a query-string syntax error (bad operator, malformed logic tree).
