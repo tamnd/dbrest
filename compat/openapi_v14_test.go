@@ -166,6 +166,43 @@ func pathKeys(m map[string]json.RawMessage) []string {
 	return out
 }
 
+// ── 06.2 root content negotiation and charset ──────────────────────────────
+
+func TestRootContentTypeCharset(t *testing.T) {
+	onBoth(t, func(t *testing.T, base string) {
+		for _, accept := range []string{"", "application/json", "application/openapi+json", "*/*"} {
+			c := compatCase{method: "GET", path: "/"}
+			if accept != "" {
+				c.headers = map[string]string{"Accept": accept}
+			}
+			res := doRequest(t, base, c)
+			if res.status != http.StatusOK {
+				t.Fatalf("Accept %q: status = %d, want 200", accept, res.status)
+			}
+			if ct := res.header.Get("Content-Type"); ct != "application/openapi+json; charset=utf-8" {
+				t.Errorf("Accept %q: Content-Type = %q, want application/openapi+json; charset=utf-8", accept, ct)
+			}
+		}
+	})
+}
+
+func TestRootUnacceptableAcceptIs406(t *testing.T) {
+	onBoth(t, func(t *testing.T, base string) {
+		res := doRequest(t, base, compatCase{method: "GET", path: "/",
+			headers: map[string]string{"Accept": "text/csv"}})
+		if res.status != http.StatusNotAcceptable {
+			t.Fatalf("status = %d, want 406\n%s", res.status, res.body)
+		}
+		e := decodeErr(t, res.body)
+		if e.Code != "PGRST107" {
+			t.Errorf("code = %q, want PGRST107", e.Code)
+		}
+		if e.Message != "None of these media types are available: text/csv" {
+			t.Errorf("message = %q, want the requested type echoed", e.Message)
+		}
+	})
+}
+
 // A path segment is a bare name inside the active schema, never a qualified
 // reference into another one.
 func TestDottedPathDoesNotEscapeSchema(t *testing.T) {

@@ -17,8 +17,8 @@ func TestRootServesOpenAPI(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	if ct := resp.Header.Get("Content-Type"); ct != "application/openapi+json" {
-		t.Errorf("Content-Type = %q, want application/openapi+json", ct)
+	if ct := resp.Header.Get("Content-Type"); ct != "application/openapi+json; charset=utf-8" {
+		t.Errorf("Content-Type = %q, want application/openapi+json; charset=utf-8", ct)
 	}
 	var doc map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
@@ -50,12 +50,49 @@ func TestRootHeadHasNoBody(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	if ct := resp.Header.Get("Content-Type"); ct != "application/openapi+json" {
+	if ct := resp.Header.Get("Content-Type"); ct != "application/openapi+json; charset=utf-8" {
 		t.Errorf("Content-Type = %q", ct)
 	}
 	buf := make([]byte, 1)
 	if n, _ := resp.Body.Read(buf); n != 0 {
 		t.Error("HEAD / should have no body")
+	}
+}
+
+// TestRootNegotiatesAccept pins the root's Accept handling: openapi+json,
+// plain json, and wildcards are served; anything else is 406 PGRST107 with
+// the requested types echoed in q-descending order, parameters stripped.
+func TestRootNegotiatesAccept(t *testing.T) {
+	srv := newServer(t)
+	for _, accept := range []string{
+		"application/openapi+json",
+		"application/json",
+		"*/*",
+		"application/*",
+		"application/json;q=0.5, text/html", // one acceptable type suffices
+	} {
+		resp := do(t, srv, http.MethodGet, "/", map[string]string{"Accept": accept})
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("Accept %q: status = %d, want 200", accept, resp.StatusCode)
+		}
+	}
+
+	resp := do(t, srv, http.MethodGet, "/", map[string]string{"Accept": "text/csv;q=0.3, application/xml"})
+	if resp.StatusCode != http.StatusNotAcceptable {
+		t.Fatalf("status = %d, want 406", resp.StatusCode)
+	}
+	var e struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&e); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if e.Code != "PGRST107" {
+		t.Errorf("code = %q, want PGRST107", e.Code)
+	}
+	if e.Message != "None of these media types are available: application/xml, text/csv" {
+		t.Errorf("message = %q, want q-ordered type list", e.Message)
 	}
 }
 

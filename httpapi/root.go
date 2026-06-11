@@ -26,6 +26,10 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request, activeSchema
 		writeError(w, pgerr.New(http.StatusNotFound, "", "openapi is disabled"))
 		return
 	}
+	if !rootAcceptable(r.Header.Values("Accept")) {
+		writeError(w, pgerr.ErrNotAcceptable(acceptedList(r.Header.Values("Accept"))))
+		return
+	}
 
 	opts := openapi.Options{
 		Host:         r.Host,
@@ -42,11 +46,45 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request, activeSchema
 		return
 	}
 
-	w.Header().Set("Content-Type", openapi.MediaType)
+	w.Header().Set("Content-Type", openapi.MediaType+"; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	if r.Method != http.MethodHead {
 		w.Write(body)
 	}
+}
+
+// rootAcceptable reports whether the Accept header admits the root document.
+// The root produces application/openapi+json and application/json only; an
+// absent header or a wildcard range accepts it, anything else is the caller's
+// 406 PGRST107 (PostgREST root negotiation).
+func rootAcceptable(accept []string) bool {
+	ranges := parseAccept(accept)
+	if len(ranges) == 0 {
+		return true
+	}
+	for _, mr := range ranges {
+		if mr.q <= 0 {
+			continue
+		}
+		if mr.typ == "*" && mr.sub == "*" {
+			return true
+		}
+		if mr.typ == "application" && (mr.sub == "*" || mr.sub == "openapi+json" || mr.sub == "json") {
+			return true
+		}
+	}
+	return false
+}
+
+// acceptedList renders the requested media types for the PGRST107 message the
+// way PostgREST does: parameters stripped, ordered by descending quality.
+func acceptedList(accept []string) string {
+	ranges := parseAccept(accept)
+	parts := make([]string, len(ranges))
+	for i, mr := range ranges {
+		parts[i] = mr.typ + "/" + mr.sub
+	}
+	return strings.Join(parts, ", ")
 }
 
 // requestScheme reports the URL scheme the client reached the server with,
