@@ -243,7 +243,33 @@ const (
 	CodeCheckViolation      = "23514" // 400 fails a CHECK constraint
 )
 
-// ErrUniqueViolation is a duplicate-key conflict (PostgreSQL 23505).
+// ErrConstraintViolation surfaces a backend's integrity-constraint error with
+// the engine's text carried through verbatim, the way PostgREST forwards
+// PostgreSQL's: message names the constraint ("duplicate key value violates
+// unique constraint \"todos_pkey\"") and detail carries the key ("Key (id)=(1)
+// already exists."). Clients parse both, so pgerr contributes only the status:
+// a key that conflicts with an existing row (23505, 23503) is a 409, the rest
+// of class 23 is a 400. Drivers whose engine reports structure instead of
+// PG-shaped text synthesize the message before calling this; the fixed-message
+// constructors below predate it and are being migrated.
+func ErrConstraintViolation(sqlstate, message, detail, hint string) *APIError {
+	status := http.StatusBadRequest
+	if sqlstate == CodeUniqueViolation || sqlstate == CodeForeignKeyViolation {
+		status = http.StatusConflict
+	}
+	e := New(status, sqlstate, message)
+	if detail != "" {
+		e = e.WithDetails(detail)
+	}
+	if hint != "" {
+		e = e.WithHint(hint)
+	}
+	return e
+}
+
+// ErrUniqueViolation is a duplicate-key conflict (PostgreSQL 23505). It
+// rewrites the message to a fixed canonical one, dropping the constraint name
+// clients parse; driver call sites are migrating to ErrConstraintViolation.
 func ErrUniqueViolation(detail string) *APIError {
 	return New(http.StatusConflict, CodeUniqueViolation,
 		"duplicate key value violates unique constraint").WithDetails(detail)

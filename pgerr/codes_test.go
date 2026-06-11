@@ -41,6 +41,10 @@ func TestConstructorStatusAndCode(t *testing.T) {
 		{"unsupported", ErrUnsupported("the sl operator", "mysql"), http.StatusBadRequest, CodeUnsupported},
 		{"fts-unavailable", ErrFullTextUnavailable("body", "sqlite"), http.StatusBadRequest, CodeUnsupported},
 		{"unique", ErrUniqueViolation("Key (id)=(1) already exists"), http.StatusConflict, CodeUniqueViolation},
+		{"constraint-unique", ErrConstraintViolation("23505", "m", "", ""), http.StatusConflict, CodeUniqueViolation},
+		{"constraint-fk", ErrConstraintViolation("23503", "m", "", ""), http.StatusConflict, CodeForeignKeyViolation},
+		{"constraint-not-null", ErrConstraintViolation("23502", "m", "", ""), http.StatusBadRequest, CodeNotNullViolation},
+		{"constraint-check", ErrConstraintViolation("23514", "m", "", ""), http.StatusBadRequest, CodeCheckViolation},
 		{"not-null", ErrNotNullViolation("column title"), http.StatusBadRequest, CodeNotNullViolation},
 		{"foreign-key", ErrForeignKeyViolation("Key (dir)=(9) is not present"), http.StatusConflict, CodeForeignKeyViolation},
 		{"check", ErrCheckViolation("rating must be positive"), http.StatusBadRequest, CodeCheckViolation},
@@ -161,6 +165,24 @@ func TestInvalidInputTypeSpelling(t *testing.T) {
 		if got != want {
 			t.Errorf("ErrInvalidInput(%q) message = %q, want %q", canonical, got, want)
 		}
+	}
+}
+
+// A constraint violation carries the engine's text through untouched: the
+// message keeps its constraint name and the detail its key, the parts clients
+// parse out of a live PostgREST response.
+func TestConstraintViolationPassesTextThrough(t *testing.T) {
+	e := ErrConstraintViolation("23505",
+		`duplicate key value violates unique constraint "todos_pkey"`,
+		"Key (id)=(1) already exists.", "")
+	if e.Message != `duplicate key value violates unique constraint "todos_pkey"` {
+		t.Errorf("message = %q", e.Message)
+	}
+	if e.Details == nil || *e.Details != "Key (id)=(1) already exists." {
+		t.Errorf("details = %v", e.Details)
+	}
+	if e.Hint != nil {
+		t.Errorf("hint = %v, want null when the engine gave none", e.Hint)
 	}
 }
 
