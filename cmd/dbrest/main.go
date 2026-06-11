@@ -62,6 +62,7 @@ func run() error {
 	srv.SetDefaultRole(cfg.AnonRole)
 	srv.SetOpenAPI(cfg.OpenAPIMode, cfg.OpenAPIServerProxyURI)
 	srv.SetCORSAllowedOrigins(cfg.CORSAllowedOrigins)
+	srv.SetMaxRows(cfg.MaxRows)
 	if err := attachAuth(srv, cfg); err != nil {
 		return err
 	}

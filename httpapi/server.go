@@ -41,6 +41,7 @@ type Server struct {
 	openapiMode  string
 	openapiProxy string
 	corsOrigins  []string // server-cors-allowed-origins; empty means any
+	maxRows      int      // db-max-rows; 0 means no cap
 }
 
 // NewServer builds a Server over a backend, its introspected model, and the
@@ -69,6 +70,29 @@ func (s *Server) SetDefaultRole(role string) {
 	if role != "" {
 		s.role = role
 	}
+}
+
+// SetMaxRows applies the db-max-rows option: a hard cap on the rows any read
+// or RPC response may return, enforced as an implicit LIMIT at plan time. Zero
+// means no cap. Mutation representations are exempt, matching PostgREST v10+.
+func (s *Server) SetMaxRows(n int) { s.maxRows = n }
+
+// MaxRows reports the configured db-max-rows cap (0 when uncapped). The
+// count=estimated logic uses it as the exactness threshold.
+func (s *Server) MaxRows() int { return s.maxRows }
+
+// capLimit lowers *limit to the db-max-rows cap, installing the cap as the
+// limit when the client did not ask for one. It returns the (possibly
+// replaced) pointer so callers can assign it back into the query.
+func (s *Server) capLimit(limit *int) *int {
+	if s.maxRows <= 0 {
+		return limit
+	}
+	if limit == nil || *limit > s.maxRows {
+		capped := s.maxRows
+		return &capped
+	}
+	return limit
 }
 
 // SetCORSAllowedOrigins restricts cross-origin requests to the given origin
@@ -339,6 +363,8 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 		return
 	}
 	call.Singular = media == mediaObject
+	// db-max-rows caps an RPC response like a read (an implicit LIMIT).
+	call.Limit = s.capLimit(call.Limit)
 
 	var planned *ir.Plan
 	if s.backend.Capabilities().NativeRPC {
@@ -437,6 +463,13 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity)
 			}
 		}
 	}
+
+	// db-max-rows is a hard cap on every read: the effective window is
+	// min(requested limit, max-rows), applied before planning so Content-Range
+	// and the 200/206 decision see the limit that actually ran. Mutation
+	// representations are exempt (PostgREST v10+), so this stays off the
+	// write path.
+	q.Limit = s.capLimit(q.Limit)
 
 	planned, apiErr := plan.Read(s.model, q, s.searchPath)
 	if apiErr != nil {
