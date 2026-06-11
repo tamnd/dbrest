@@ -41,8 +41,13 @@ type Config struct {
 	// Empty derives the set from the configured keys. "none" is never accepted and
 	// is rejected if listed explicitly.
 	AllowedAlgs []string
-	// Secret is the shared HMAC secret. When set it must be at least 32 bytes.
+	// Secret is the jwt-secret value. As in PostgREST it is read three ways: a
+	// JWK Set JSON, a single JWK JSON, or a plain text HMAC secret (which must
+	// be at least 32 bytes).
 	Secret []byte
+	// JWKSet is an explicit JWK Set (or single JWK) JSON. Unlike Secret it has
+	// no text fallback: an unparseable value is a startup error.
+	JWKSet string
 	// PublicKeyPEM is a PEM-encoded RSA or ECDSA public key (the static key source
 	// for the asymmetric families).
 	PublicKeyPEM string
@@ -82,9 +87,7 @@ type Result struct {
 // itself.
 type Verifier struct {
 	validMethods []string
-	hmac         []byte
-	rsa          *rsa.PublicKey
-	ecdsa        *ecdsa.PublicKey
+	keys         []verKey
 	hasKeys      bool
 
 	audience    string
@@ -122,18 +125,25 @@ func NewVerifier(cfg Config) (*Verifier, error) {
 	v.roleKeyPath = roleKey
 
 	if len(cfg.Secret) > 0 {
-		if len(cfg.Secret) < minHMACSecret {
-			return nil, errors.New("jwt-secret must be at least 32 characters")
+		keys, err := parseSecretKeys(cfg.Secret)
+		if err != nil {
+			return nil, err
 		}
-		v.hmac = cfg.Secret
-		v.hasKeys = true
+		v.keys = append(v.keys, keys...)
+	}
+	if cfg.JWKSet != "" {
+		keys, err := parseJWKSet(cfg.JWKSet)
+		if err != nil {
+			return nil, fmt.Errorf("jwk-set: %w", err)
+		}
+		v.keys = append(v.keys, keys...)
 	}
 	if cfg.PublicKeyPEM != "" {
 		if err := v.loadPublicKey(cfg.PublicKeyPEM); err != nil {
 			return nil, err
 		}
-		v.hasKeys = true
 	}
+	v.hasKeys = len(v.keys) > 0
 
 	methods, err := v.resolveMethods(cfg.AllowedAlgs)
 	if err != nil {
@@ -267,30 +277,52 @@ func mapJWTError(err error) *pgerr.APIError {
 	}
 }
 
-// keyfunc returns the verification key for the token's algorithm family. The
-// allowed-methods parser option already blocks a disallowed alg before this runs,
-// so the algorithm-confusion swap (an RS token verified against an HMAC secret)
+// keyfunc selects the verification keys for a token. A kid header narrows the
+// set to the keys carrying that kid; a kid-less token tries every key of the
+// right family in turn, as the upstream jose library does. The allowed-methods
+// parser option already blocks a disallowed alg before this runs, so the
+// algorithm-confusion swap (an RS token verified against an HMAC secret)
 // cannot reach a key of the wrong family.
 func (v *Verifier) keyfunc(t *jwt.Token) (any, error) {
-	switch t.Method.(type) {
-	case *jwt.SigningMethodHMAC:
-		if v.hmac == nil {
-			return nil, errors.New("no HMAC key configured")
+	kid, _ := t.Header["kid"].(string)
+	set := jwt.VerificationKeySet{}
+	for _, k := range v.keys {
+		if kid != "" && k.kid != kid {
+			continue
 		}
-		return v.hmac, nil
-	case *jwt.SigningMethodRSA:
-		if v.rsa == nil {
-			return nil, errors.New("no RSA key configured")
+		if k.alg != "" && k.alg != t.Method.Alg() {
+			continue
 		}
-		return v.rsa, nil
-	case *jwt.SigningMethodECDSA:
-		if v.ecdsa == nil {
-			return nil, errors.New("no ECDSA key configured")
+		if !methodMatchesKey(t.Method, k.key) {
+			continue
 		}
-		return v.ecdsa, nil
-	default:
-		return nil, errors.New("unsupported signing method")
+		set.Keys = append(set.Keys, k.key)
 	}
+	switch len(set.Keys) {
+	case 0:
+		return nil, errors.New("no suitable key was found to decode the JWT")
+	case 1:
+		return set.Keys[0], nil
+	default:
+		return set, nil
+	}
+}
+
+// methodMatchesKey reports whether a verification key belongs to the family of
+// a signing method.
+func methodMatchesKey(method jwt.SigningMethod, key any) bool {
+	switch method.(type) {
+	case *jwt.SigningMethodHMAC:
+		_, ok := key.([]byte)
+		return ok
+	case *jwt.SigningMethodRSA, *jwt.SigningMethodRSAPSS:
+		_, ok := key.(*rsa.PublicKey)
+		return ok
+	case *jwt.SigningMethodECDSA:
+		_, ok := key.(*ecdsa.PublicKey)
+		return ok
+	}
+	return false
 }
 
 // checkTime re-validates the exp and nbf claims against the live clock with the
@@ -364,10 +396,8 @@ func (v *Verifier) loadPublicKey(pemText string) error {
 		return errors.New("jwt public key is not a valid PKIX key")
 	}
 	switch k := key.(type) {
-	case *rsa.PublicKey:
-		v.rsa = k
-	case *ecdsa.PublicKey:
-		v.ecdsa = k
+	case *rsa.PublicKey, *ecdsa.PublicKey:
+		v.keys = append(v.keys, verKey{key: k})
 	default:
 		return errors.New("jwt public key is neither RSA nor ECDSA")
 	}
@@ -385,14 +415,25 @@ func (v *Verifier) resolveMethods(allowed []string) ([]string, error) {
 		}
 		return allowed, nil
 	}
+	var hmac, rsaKey, ecdsaKey bool
+	for _, k := range v.keys {
+		switch k.key.(type) {
+		case []byte:
+			hmac = true
+		case *rsa.PublicKey:
+			rsaKey = true
+		case *ecdsa.PublicKey:
+			ecdsaKey = true
+		}
+	}
 	var methods []string
-	if v.hmac != nil {
+	if hmac {
 		methods = append(methods, "HS256", "HS384", "HS512")
 	}
-	if v.rsa != nil {
-		methods = append(methods, "RS256", "RS384", "RS512")
+	if rsaKey {
+		methods = append(methods, "RS256", "RS384", "RS512", "PS256", "PS384", "PS512")
 	}
-	if v.ecdsa != nil {
+	if ecdsaKey {
 		methods = append(methods, "ES256", "ES384", "ES512")
 	}
 	return methods, nil
