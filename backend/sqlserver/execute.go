@@ -333,7 +333,7 @@ func (b *Backend) executeUpsert(
 
 	// When any conflict column is an IDENTITY column and the user provided
 	// an explicit value, SQL Server requires IDENTITY_INSERT to be ON.
-	needIdentityInsert := rel != nil && hasIdentityConflictCol(rel, conflictCols)
+	needIdentityInsert := rel != nil && hasIdentityConflictCol(rel, conflictCols, w.Columns)
 	if needIdentityInsert {
 		if _, err := tx.ExecContext(ctx, "SET IDENTITY_INSERT "+tableName+" ON"); err != nil {
 			return err
@@ -371,11 +371,17 @@ func (b *Backend) executeUpsert(
 	return nil
 }
 
-// hasIdentityConflictCol reports whether any of the conflict target columns is
-// an identity column in rel.
-func hasIdentityConflictCol(rel *schema.Relation, conflictCols []string) bool {
+// hasIdentityConflictCol reports whether any conflict column is an identity
+// column AND is present in payloadCols (the user provided an explicit value).
+// When IDENTITY_INSERT is ON, SQL Server requires an explicit value, so we only
+// enable it when the identity column is actually in the payload.
+func hasIdentityConflictCol(rel *schema.Relation, conflictCols, payloadCols []string) bool {
+	payload := make(map[string]bool, len(payloadCols))
+	for _, c := range payloadCols {
+		payload[c] = true
+	}
 	for _, c := range conflictCols {
-		if col, ok := rel.Column(c); ok && col.Identity {
+		if col, ok := rel.Column(c); ok && col.Identity && payload[c] {
 			return true
 		}
 	}
