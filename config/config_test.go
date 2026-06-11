@@ -412,3 +412,32 @@ func TestAdminHostDefaultsToServerHost(t *testing.T) {
 		t.Errorf("admin-server-host = %q, explicit value lost", c.AdminServerHost)
 	}
 }
+
+// TestMergeReloadable checks the SIGUSR2 merge: runtime options follow the new
+// config, boot-time options stay put and are reported.
+func TestMergeReloadable(t *testing.T) {
+	old, err := FromMap(map[string]string{"db-uri": "file:a.db", "db-max-rows": "100", "server-port": "3000"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := FromMap(map[string]string{"db-uri": "file:b.db", "db-max-rows": "50", "server-port": "4000", "db-anon-role": "web_anon"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged, kept := old.MergeReloadable(next)
+	if merged.MaxRows != 50 || merged.AnonRole != "web_anon" {
+		t.Errorf("reloadable fields not applied: max-rows=%d anon=%q", merged.MaxRows, merged.AnonRole)
+	}
+	if merged.DBURI != "file:a.db" || merged.ServerPort != 3000 {
+		t.Errorf("boot-time fields changed: db-uri=%q port=%d", merged.DBURI, merged.ServerPort)
+	}
+	joined := strings.Join(kept, "\n")
+	for _, name := range []string{"db-uri", "server-port"} {
+		if !strings.Contains(joined, name) {
+			t.Errorf("expected a kept-value message for %s, got %q", name, kept)
+		}
+	}
+	if strings.Contains(joined, "db-max-rows") {
+		t.Errorf("db-max-rows is reloadable, should not be reported: %q", kept)
+	}
+}

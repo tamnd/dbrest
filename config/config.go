@@ -397,6 +397,53 @@ func unenforcedWarnings(raw map[string]string) []string {
 	return out
 }
 
+// MergeReloadable layers a freshly loaded configuration over the running one,
+// the way PostgREST applies a SIGUSR2 reload: every option takes its new value
+// except the ones fixed at boot (the connection, the pool, the listeners, and
+// the function registry wired at backend open). The returned messages name
+// each boot-time option whose new value had to be ignored, one log line per
+// option.
+func (c *Config) MergeReloadable(next *Config) (*Config, []string) {
+	merged := *next
+	var kept []string
+	note := func(name string, changed bool) {
+		if changed {
+			kept = append(kept, fmt.Sprintf("%s changed but cannot be reloaded; keeping the boot value", name))
+		}
+	}
+
+	note("db-backend", merged.Backend != c.Backend)
+	merged.Backend = c.Backend
+	note("db-uri", merged.DBURI != c.DBURI)
+	merged.DBURI = c.DBURI
+	note("db-pool", merged.DBPool != c.DBPool)
+	merged.DBPool = c.DBPool
+	note("db-pool-acquisition-timeout", merged.DBPoolAcquisitionTimeout != c.DBPoolAcquisitionTimeout)
+	merged.DBPoolAcquisitionTimeout = c.DBPoolAcquisitionTimeout
+	note("db-pool-max-idletime", merged.DBPoolMaxIdleTime != c.DBPoolMaxIdleTime)
+	merged.DBPoolMaxIdleTime = c.DBPoolMaxIdleTime
+	note("db-pool-max-lifetime", merged.DBPoolMaxLifetime != c.DBPoolMaxLifetime)
+	merged.DBPoolMaxLifetime = c.DBPoolMaxLifetime
+	note("db-pool-automatic-recovery", merged.DBPoolAutomaticRecovery != c.DBPoolAutomaticRecovery)
+	merged.DBPoolAutomaticRecovery = c.DBPoolAutomaticRecovery
+	note("server-host", merged.ServerHost != c.ServerHost)
+	merged.ServerHost = c.ServerHost
+	note("server-port", merged.ServerPort != c.ServerPort)
+	merged.ServerPort = c.ServerPort
+	note("server-unix-socket", merged.ServerUnixSocket != c.ServerUnixSocket)
+	merged.ServerUnixSocket = c.ServerUnixSocket
+	note("server-unix-socket-mode", merged.ServerUnixSocketMode != c.ServerUnixSocketMode)
+	merged.ServerUnixSocketMode = c.ServerUnixSocketMode
+	note("admin-server-host", merged.AdminServerHost != c.AdminServerHost)
+	merged.AdminServerHost = c.AdminServerHost
+	note("admin-server-port", merged.AdminServerPort != c.AdminServerPort)
+	merged.AdminServerPort = c.AdminServerPort
+	note("function-registry", merged.FunctionRegistry != c.FunctionRegistry)
+	merged.FunctionRegistry = c.FunctionRegistry
+
+	return &merged, kept
+}
+
 // ServerAddr is the API listen address in host:port form.
 func (c *Config) ServerAddr() string {
 	return fmt.Sprintf("%s:%d", c.ServerHost, c.ServerPort)

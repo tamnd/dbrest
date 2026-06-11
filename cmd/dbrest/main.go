@@ -25,7 +25,6 @@ import (
 	"github.com/tamnd/dbrest/config"
 	"github.com/tamnd/dbrest/httpapi"
 	"github.com/tamnd/dbrest/rpc"
-	"github.com/tamnd/dbrest/schema"
 )
 
 func main() {
@@ -56,30 +55,18 @@ func run() error {
 	defer func() { _ = be.Close() }()
 
 	metrics := adminapi.NewMetrics(cfg.DBPool)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	started := time.Now()
-	model, err := be.Introspect(ctx)
-	cancel()
-	metrics.ObserveSchemaCacheLoad(time.Since(started), err)
-	if err != nil {
+	a := &app{cfgPath: configPath, be: be, cfg: cfg, metrics: metrics}
+	if err := a.reloadSchema(); err != nil {
 		return fmt.Errorf("introspect: %w", err)
 	}
-
-	srv := httpapi.NewServer(be, model, cfg.Schemas)
-	srv.SetDefaultRole(cfg.AnonRole)
-	srv.SetOpenAPI(cfg.OpenAPIMode, cfg.OpenAPIServerProxyURI)
-	srv.SetCORSAllowedOrigins(cfg.CORSAllowedOrigins)
-	srv.SetMaxRows(cfg.MaxRows)
-	if err := attachAuth(srv, cfg); err != nil {
-		return err
-	}
+	a.watchSignals()
 
 	if cfg.AdminEnabled() {
-		startAdmin(cfg, be, model, metrics)
+		startAdmin(cfg, be, a, metrics)
 	}
 
-	log.Printf("dbrest listening on %s (backend %s, %d relations)", cfg.ServerAddr(), cfg.Backend, model.Len())
-	if err := http.ListenAndServe(cfg.ServerAddr(), srv); err != nil {
+	log.Printf("dbrest listening on %s (backend %s, %d relations)", cfg.ServerAddr(), cfg.Backend, a.Model().Len())
+	if err := http.ListenAndServe(cfg.ServerAddr(), a); err != nil {
 		return fmt.Errorf("serve: %w", err)
 	}
 	return nil
@@ -88,7 +75,7 @@ func run() error {
 // startAdmin runs the admin listener (admin-server-port) next to the API: the
 // /live and /ready probes, the /schema_cache dump, and /metrics. The liveness
 // check dials the API socket the way PostgREST's admin server does.
-func startAdmin(cfg *config.Config, be backend.Backend, model *schema.Model, metrics *adminapi.Metrics) {
+func startAdmin(cfg *config.Config, be backend.Backend, a *app, metrics *adminapi.Metrics) {
 	apiAddr := probeAddr(cfg.ServerHost, cfg.ServerPort)
 	admin := &adminapi.Server{
 		Live: func(ctx context.Context) error {
@@ -108,7 +95,7 @@ func startAdmin(cfg *config.Config, be backend.Backend, model *schema.Model, met
 			return nil
 		},
 		SchemaCache: func() ([]byte, error) {
-			return json.Marshal(map[string]any{"relations": model.Relations()})
+			return json.Marshal(map[string]any{"relations": a.Model().Relations()})
 		},
 		Metrics: metrics,
 	}
