@@ -6,8 +6,11 @@ import (
 	"strings"
 
 	"github.com/tamnd/dbrest/config"
+	"github.com/tamnd/dbrest/ir"
 	"github.com/tamnd/dbrest/openapi"
 	"github.com/tamnd/dbrest/pgerr"
+	"github.com/tamnd/dbrest/reqctx"
+	"github.com/tamnd/dbrest/schema"
 )
 
 // handleRoot serves the self-describing OpenAPI document at GET /. The document
@@ -15,7 +18,7 @@ import (
 // backend's declared capabilities, so it describes exactly what this server can
 // serve and never promises an operator the next request would reject. HEAD
 // returns the headers with no body. See spec 19.
-func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request, activeSchema string) {
+func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request, id identity, activeSchema string) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		writeError(w, pgerr.ErrUnsupported(r.Method+" requests on the root", "dbrest"))
 		return
@@ -39,6 +42,21 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request, activeSchema
 	}
 	if s.openapiProxy != "" {
 		applyProxyURI(&opts, s.openapiProxy)
+	}
+	if s.openapiMode == config.OpenAPIFollowPrivileges && s.authz != nil {
+		// follow-privileges scopes the document to what the requesting role may
+		// actually do, so an anonymous caller cannot enumerate relations it
+		// cannot touch. The answers come from the same gate that authorizes a
+		// real request; ignore-privileges leaves Visibility nil and emits all.
+		rc := buildContext(r, id, activeSchema)
+		opts.Visibility = func(rel *schema.Relation) openapi.Actions {
+			return openapi.Actions{
+				Get:    s.probeAction(rc, rel.Name, ir.Read),
+				Post:   s.probeAction(rc, rel.Name, ir.Insert),
+				Patch:  s.probeAction(rc, rel.Name, ir.Update),
+				Delete: s.probeAction(rc, rel.Name, ir.Delete),
+			}
+		}
 	}
 	body, err := openapi.Generate(s.model, s.backend.Functions(), s.backend.Capabilities(), opts)
 	if err != nil {
@@ -85,6 +103,18 @@ func acceptedList(accept []string) string {
 		parts[i] = mr.typ + "/" + mr.sub
 	}
 	return strings.Join(parts, ", ")
+}
+
+// probeAction asks the authorization gate whether the role could perform one
+// kind of query on a relation, by authorizing a minimal throwaway plan. Using
+// the real gate keeps the document's answer identical to what a request would
+// get; the probe plan is discarded, so the gate's mutations never escape.
+func (s *Server) probeAction(rc *reqctx.Context, rel string, kind ir.QueryKind) bool {
+	q := &ir.Query{Kind: kind, Relation: ir.Ref{Name: rel}}
+	if kind != ir.Read {
+		q.Write = &ir.WriteSpec{}
+	}
+	return s.authz.Authorize(rc, &ir.Plan{Query: q}) == nil
 }
 
 // requestScheme reports the URL scheme the client reached the server with,

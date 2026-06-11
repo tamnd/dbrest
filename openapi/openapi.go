@@ -39,6 +39,13 @@ type Options struct {
 	// document per schema and same-named relations never collide on a path key.
 	ActiveSchema string
 
+	// Visibility filters the document for openapi-mode=follow-privileges: it
+	// answers which operations the requesting role may perform on a relation,
+	// and a relation with none is dropped from paths and definitions, so an
+	// anonymous caller cannot enumerate what it cannot touch. Nil emits
+	// everything, the ignore-privileges mode.
+	Visibility func(rel *schema.Relation) Actions
+
 	// JWT advertises a bearer security scheme in securityDefinitions when true,
 	// matching a server with JWT auth configured (spec 13).
 	JWT bool
@@ -47,6 +54,17 @@ type Options struct {
 	// this false, the scheme is described but not enforced, PostgREST's default.
 	SecurityActive bool
 }
+
+// Actions is the operation set a role holds on one relation, the visibility
+// answer follow-privileges filters the document with.
+type Actions struct {
+	Get, Post, Patch, Delete bool
+}
+
+// AllActions marks every operation visible, the ignore-privileges answer.
+var AllActions = Actions{Get: true, Post: true, Patch: true, Delete: true}
+
+func (a Actions) any() bool { return a.Get || a.Post || a.Patch || a.Delete }
 
 func (o Options) withDefaults() Options {
 	if o.Title == "" {
@@ -101,7 +119,19 @@ func build(model *schema.Model, fns rpc.Registry, caps backend.Capabilities, opt
 	}
 
 	for _, rel := range model.RelationsIn(opts.ActiveSchema) {
-		doc.Paths["/"+rel.Name] = relationPath(rel, ops, security)
+		acts := AllActions
+		if opts.Visibility != nil {
+			acts = opts.Visibility(rel)
+		}
+		if rel.Kind == schema.KindView {
+			// A view path carries only get; a write-only grant leaves nothing
+			// to describe.
+			acts.Post, acts.Patch, acts.Delete = false, false, false
+		}
+		if !acts.any() {
+			continue
+		}
+		doc.Paths["/"+rel.Name] = relationPath(rel, ops, security, acts)
 		doc.Definitions[rel.Name] = relationDefinition(rel)
 	}
 	if fns != nil {
@@ -114,36 +144,46 @@ func build(model *schema.Model, fns rpc.Registry, caps backend.Capabilities, opt
 
 // relationPath emits the operations a relation supports. A base table gets the
 // full read/write set; a view gets get only (updatable views land with the
-// model flags that mark them so). Each operation lists the reserved parameters
-// it honors plus one query parameter per column for horizontal filtering.
-func relationPath(rel *schema.Relation, ops string, security []map[string][]string) *pathItem {
+// model flags that mark them so). The acts set drops any operation the
+// requesting role may not perform. Each operation lists the reserved
+// parameters it honors plus one query parameter per column for horizontal
+// filtering.
+func relationPath(rel *schema.Relation, ops string, security []map[string][]string, acts Actions) *pathItem {
 	filters := columnParams(rel, ops)
-	get := &operation{
-		Tags:       []string{rel.Name},
-		Parameters: concat(refs("select", "order", "limit", "offset", "rangeHeader", "preferRead"), filters),
-		Responses:  okResponses("200", "OK"),
-		Security:   security,
+	p := &pathItem{}
+	if acts.Get {
+		p.Get = &operation{
+			Tags:       []string{rel.Name},
+			Parameters: concat(refs("select", "order", "limit", "offset", "rangeHeader", "preferRead"), filters),
+			Responses:  okResponses("200", "OK"),
+			Security:   security,
+		}
 	}
-	p := &pathItem{Get: get}
 	if rel.Kind == schema.KindTable {
 		bodyRef := "#/definitions/" + rel.Name
-		p.Post = &operation{
-			Tags:       []string{rel.Name},
-			Parameters: concat(refs("select", "columns", "on_conflict", "preferWrite"), []*parameter{bodyParam(rel.Name, bodyRef)}),
-			Responses:  okResponses("201", "Created"),
-			Security:   security,
+		if acts.Post {
+			p.Post = &operation{
+				Tags:       []string{rel.Name},
+				Parameters: concat(refs("select", "columns", "on_conflict", "preferWrite"), []*parameter{bodyParam(rel.Name, bodyRef)}),
+				Responses:  okResponses("201", "Created"),
+				Security:   security,
+			}
 		}
-		p.Patch = &operation{
-			Tags:       []string{rel.Name},
-			Parameters: concat(refs("select", "columns", "preferWrite"), filters, []*parameter{bodyParam(rel.Name, bodyRef)}),
-			Responses:  okResponses("204", "No Content"),
-			Security:   security,
+		if acts.Patch {
+			p.Patch = &operation{
+				Tags:       []string{rel.Name},
+				Parameters: concat(refs("select", "columns", "preferWrite"), filters, []*parameter{bodyParam(rel.Name, bodyRef)}),
+				Responses:  okResponses("204", "No Content"),
+				Security:   security,
+			}
 		}
-		p.Delete = &operation{
-			Tags:       []string{rel.Name},
-			Parameters: concat(refs("preferWrite"), filters),
-			Responses:  okResponses("204", "No Content"),
-			Security:   security,
+		if acts.Delete {
+			p.Delete = &operation{
+				Tags:       []string{rel.Name},
+				Parameters: concat(refs("preferWrite"), filters),
+				Responses:  okResponses("204", "No Content"),
+				Security:   security,
+			}
 		}
 	}
 	return p

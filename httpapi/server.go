@@ -217,7 +217,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/" {
-		s.handleRoot(w, r, activeSchema)
+		s.handleRoot(w, r, id, activeSchema)
 		return
 	}
 	switch r.Method {

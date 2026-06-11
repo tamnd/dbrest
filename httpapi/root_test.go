@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/tamnd/dbrest/authz"
 	"github.com/tamnd/dbrest/config"
 )
 
@@ -103,6 +104,79 @@ func TestRootDisabledIs404(t *testing.T) {
 	resp := do(t, srv, http.MethodGet, "/", nil)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestRootFollowPrivilegesFiltersDocument checks the default openapi-mode:
+// the document only describes the relations and operations the requesting
+// role can access, so anon and an authenticated role see different documents.
+func TestRootFollowPrivilegesFiltersDocument(t *testing.T) {
+	srv := authzServer(t, []authz.Grant{
+		{Role: "web_user", Relation: "films", Action: authz.Select},
+		{Role: "web_user", Relation: "films", Action: authz.Insert},
+	}, nil)
+	srv.SetOpenAPI(config.OpenAPIFollowPrivileges, "")
+
+	// The authenticated role sees films with exactly its granted operations.
+	resp := do(t, srv, http.MethodGet, "/", map[string]string{
+		"Authorization": "Bearer " + userToken(t, "web_user", "alice"),
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var doc struct {
+		Paths       map[string]map[string]any `json:"paths"`
+		Definitions map[string]any            `json:"definitions"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	films, ok := doc.Paths["/films"]
+	if !ok {
+		t.Fatal("granted role should see /films")
+	}
+	for _, op := range []string{"get", "post"} {
+		if _, ok := films[op]; !ok {
+			t.Errorf("/films missing granted operation %s", op)
+		}
+	}
+	for _, op := range []string{"patch", "delete"} {
+		if _, ok := films[op]; ok {
+			t.Errorf("/films advertises ungranted operation %s", op)
+		}
+	}
+
+	// Anon holds no grants: the document is empty, not an enumeration.
+	resp = do(t, srv, http.MethodGet, "/", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("anon status = %d, want 200", resp.StatusCode)
+	}
+	doc.Paths, doc.Definitions = nil, nil
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(doc.Paths) != 0 || len(doc.Definitions) != 0 {
+		t.Errorf("anon sees paths %v definitions %v, want none", doc.Paths, doc.Definitions)
+	}
+}
+
+// TestRootIgnorePrivilegesEmitsAll checks openapi-mode=ignore-privileges keeps
+// the full document even for a role with no grants.
+func TestRootIgnorePrivilegesEmitsAll(t *testing.T) {
+	srv := authzServer(t, nil, nil)
+	srv.SetOpenAPI(config.OpenAPIIgnorePrivileges, "")
+	resp := do(t, srv, http.MethodGet, "/", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var doc struct {
+		Paths map[string]any `json:"paths"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, ok := doc.Paths["/films"]; !ok {
+		t.Error("ignore-privileges should still describe /films")
 	}
 }
 
