@@ -168,7 +168,12 @@ func (b *builder) writeEmbed(emb *ir.Embed, parentAlias string) *pgerr.APIError 
 		if err := b.writeEmbedFilter(emb, alias); err != nil {
 			return err
 		}
-		b.sb.WriteString(" LIMIT 1)")
+		lim := 1
+		if lo := b.d.LimitOffset(&lim, nil, false); lo != "" {
+			b.sb.WriteString(" ")
+			b.sb.WriteString(lo)
+		}
+		b.sb.WriteString(")")
 		return nil
 	}
 

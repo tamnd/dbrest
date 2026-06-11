@@ -147,11 +147,17 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 // The compiler emits: INSERT INTO [t] ([c1],[c2]) VALUES (@p1,@p2)
 // The data plane rewrites to: INSERT INTO [t] ([c1],[c2]) OUTPUT INSERTED.[c1],... VALUES (@p1,@p2)
 // by injecting the OUTPUT fragment before the " VALUES " marker.
+// Upsert (on_conflict) is routed to executeUpsert instead of the single-statement
+// compiler, which returns errUpsertMultiStatement.
 func (b *Backend) executeInsert(
 	ctx context.Context, tx *sql.Tx,
 	q *ir.Query, returning []string, rel *schema.Relation,
 	res *writeResult,
 ) error {
+	if q.Kind == ir.Upsert {
+		return b.executeUpsert(ctx, tx, q, returning, res)
+	}
+
 	st, apiErr := sqlgen.CompileInsert(Dialect{}, q, nil)
 	if apiErr != nil {
 		return apiErr
@@ -186,6 +192,173 @@ func (b *Backend) executeInsert(
 	}
 	n, _ := out.RowsAffected()
 	res.affected, res.hasAff = n, true
+	return nil
+}
+
+// executeUpsert implements the SQL Server multi-statement upsert pattern:
+// for each row emit UPDATE … WHERE pk=@pN; IF @@ROWCOUNT=0 INSERT …
+// inside the request transaction. Named @pN placeholders let each value be
+// referenced by both the UPDATE and the INSERT within the same batch.
+//
+// After the batch, when returning columns are requested, the upserted rows are
+// read back via SELECT … WHERE (pk1=@q1 AND pk2=@q2) OR …
+func (b *Backend) executeUpsert(
+	ctx context.Context, tx *sql.Tx,
+	q *ir.Query, returning []string,
+	res *writeResult,
+) error {
+	w := q.Write
+	if len(w.Rows) == 0 {
+		res.affected, res.hasAff = 0, true
+		return nil
+	}
+
+	d := Dialect{}
+	sch := q.Relation.Schema
+	if sch == "" {
+		sch = b.schema
+		if sch == "" {
+			sch = "dbo"
+		}
+	}
+	tableName := d.QuoteIdent(sch) + "." + d.QuoteIdent(q.Relation.Name)
+
+	conflictCols := w.Conflict.Target
+	conflictSet := make(map[string]bool, len(conflictCols))
+	for _, c := range conflictCols {
+		conflictSet[c] = true
+	}
+	nonConflictCols := make([]string, 0, len(w.Columns))
+	for _, c := range w.Columns {
+		if !conflictSet[c] {
+			nonConflictCols = append(nonConflictCols, c)
+		}
+	}
+
+	var batchSQL strings.Builder
+	batchRaw := []any{} // raw values; wrapped by namedArgs() as p1, p2, ...
+	argN := 0
+	bind := func(v any) string {
+		argN++
+		batchRaw = append(batchRaw, v)
+		return "@p" + strconv.Itoa(argN)
+	}
+
+	for _, row := range w.Rows {
+		// Bind each column value once; named placeholders can be reused.
+		colP := make(map[string]string, len(w.Columns))
+		for _, c := range w.Columns {
+			colP[c] = bind(sqlgen.WriteArg(row[c]))
+		}
+
+		if len(nonConflictCols) > 0 {
+			// UPDATE … SET non-pk cols WHERE pk cols
+			batchSQL.WriteString("UPDATE ")
+			batchSQL.WriteString(tableName)
+			batchSQL.WriteString(" WITH (UPDLOCK,HOLDLOCK) SET ")
+			for i, c := range nonConflictCols {
+				if i > 0 {
+					batchSQL.WriteString(",")
+				}
+				batchSQL.WriteString(d.QuoteIdent(c) + "=" + colP[c])
+			}
+			batchSQL.WriteString(" WHERE ")
+			for i, c := range conflictCols {
+				if i > 0 {
+					batchSQL.WriteString(" AND ")
+				}
+				batchSQL.WriteString(d.QuoteIdent(c) + "=" + colP[c])
+			}
+			batchSQL.WriteString("; IF @@ROWCOUNT=0 ")
+		} else {
+			// No non-conflict columns: row is pk-only; insert if absent.
+			batchSQL.WriteString("IF NOT EXISTS(SELECT 1 FROM ")
+			batchSQL.WriteString(tableName)
+			batchSQL.WriteString(" WITH (UPDLOCK,HOLDLOCK) WHERE ")
+			for i, c := range conflictCols {
+				if i > 0 {
+					batchSQL.WriteString(" AND ")
+				}
+				batchSQL.WriteString(d.QuoteIdent(c) + "=" + colP[c])
+			}
+			batchSQL.WriteString(") ")
+		}
+
+		batchSQL.WriteString("INSERT INTO ")
+		batchSQL.WriteString(tableName)
+		batchSQL.WriteString("(")
+		for i, c := range w.Columns {
+			if i > 0 {
+				batchSQL.WriteString(",")
+			}
+			batchSQL.WriteString(d.QuoteIdent(c))
+		}
+		batchSQL.WriteString(") VALUES(")
+		for i, c := range w.Columns {
+			if i > 0 {
+				batchSQL.WriteString(",")
+			}
+			batchSQL.WriteString(colP[c])
+		}
+		batchSQL.WriteString(");")
+	}
+
+	if _, err := tx.ExecContext(ctx, batchSQL.String(), namedArgs(batchRaw)...); err != nil {
+		return err
+	}
+	res.affected, res.hasAff = int64(len(w.Rows)), true
+
+	if len(returning) == 0 {
+		return nil
+	}
+
+	// SELECT the upserted rows back by their conflict key values.
+	var selSQL strings.Builder
+	selSQL.WriteString("SELECT ")
+	for i, c := range returning {
+		if i > 0 {
+			selSQL.WriteString(",")
+		}
+		selSQL.WriteString(d.QuoteIdent(c))
+	}
+	selSQL.WriteString(" FROM ")
+	selSQL.WriteString(tableName)
+	selSQL.WriteString(" WHERE ")
+	selRaw := []any{}
+	selN := 0
+	for ri, row := range w.Rows {
+		if ri > 0 {
+			selSQL.WriteString(" OR ")
+		}
+		selSQL.WriteString("(")
+		for ci, c := range conflictCols {
+			if ci > 0 {
+				selSQL.WriteString(" AND ")
+			}
+			selN++
+			selSQL.WriteString(d.QuoteIdent(c) + "=@p" + strconv.Itoa(selN))
+			selRaw = append(selRaw, sqlgen.WriteArg(row[c]))
+		}
+		selSQL.WriteString(")")
+	}
+
+	rows, err := tx.QueryContext(ctx, selSQL.String(), namedArgs(selRaw)...)
+	if err != nil {
+		return err
+	}
+	cols, err := rows.Columns()
+	if err != nil {
+		rows.Close()
+		return err
+	}
+	jsonIdx, timeIdx := buildColMaps(rows, nil)
+	buf, err := drain(rows, cols, jsonIdx, timeIdx)
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	res.cols, res.rows = cols, buf
+	res.affected, res.hasAff = int64(len(buf)), true
 	return nil
 }
 

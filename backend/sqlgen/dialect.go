@@ -86,6 +86,12 @@ type Dialect interface {
 	// BoolValue renders a boolean literal.
 	BoolValue(v bool) string
 
+	// IsBool renders "col IS TRUE" or "col IS FALSE" in the engine's syntax.
+	// Engines that restrict IS to NULL/UNKNOWN (SQL Server) return ok=true with
+	// a = expression; engines that support IS <bool> return ok=false to fall back
+	// to "col IS <BoolValue(v)>".
+	IsBool(col string, v bool) (string, bool)
+
 	// ArrayOp renders an array containment/overlap operator expression, or
 	// reports ok=false when the engine does not support array types (MySQL, SQL
 	// Server) or when the column type does not support array semantics (SQLite

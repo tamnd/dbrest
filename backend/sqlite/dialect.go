@@ -193,6 +193,10 @@ func (dialect) ArrayOp(col, op, val, colType string) (string, bool) {
 // ILike uses plain LIKE which is case-insensitive for ASCII in SQLite.
 func (dialect) ILike(col, val string) (string, bool) { return col + " LIKE " + val, true }
 
+// IsBool falls back to the generic "IS 1"/"IS 0" form; SQLite's IS operator is
+// a NULL-safe equality that works with any value.
+func (dialect) IsBool(string, bool) (string, bool) { return "", false }
+
 // BoolValue renders a boolean as 1/0; SQLite has no native boolean.
 func (dialect) BoolValue(v bool) string {
 	if v {

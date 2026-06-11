@@ -700,8 +700,14 @@ func (b *builder) writeIs(col, text string) (string, *pgerr.APIError) {
 	case "not_null":
 		return col + " IS NOT NULL", nil
 	case "true":
+		if frag, ok := b.d.IsBool(col, true); ok {
+			return frag, nil
+		}
 		return col + " IS " + b.d.BoolValue(true), nil
 	case "false":
+		if frag, ok := b.d.IsBool(col, false); ok {
+			return frag, nil
+		}
 		return col + " IS " + b.d.BoolValue(false), nil
 	default:
 		return "", pgerr.ErrParse("unknown is value " + text)
