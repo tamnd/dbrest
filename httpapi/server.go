@@ -40,6 +40,7 @@ type Server struct {
 	authz        *authz.Registry
 	openapiMode  string
 	openapiProxy string
+	corsOrigins  []string // server-cors-allowed-origins; empty means any
 }
 
 // NewServer builds a Server over a backend, its introspected model, and the
@@ -69,6 +70,11 @@ func (s *Server) SetDefaultRole(role string) {
 		s.role = role
 	}
 }
+
+// SetCORSAllowedOrigins restricts cross-origin requests to the given origin
+// list (the server-cors-allowed-origins option). With an empty list the server
+// keeps the PostgREST default: any origin is accepted.
+func (s *Server) SetCORSAllowedOrigins(origins []string) { s.corsOrigins = origins }
 
 // SetVerifier attaches a JWT verifier. Once set, the role and claims of each
 // request come from its bearer token (spec 13), and a bad token is rejected
@@ -170,6 +176,9 @@ func (s *Server) authenticate(r *http.Request) (identity, *pgerr.APIError) {
 // PATCH updates; PUT upserts; DELETE deletes. RPC and OpenAPI arrive with their
 // subsystems; an unhandled method gets an honest error.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.serveCORS(w, r) {
+		return
+	}
 	id, apiErr := s.authenticate(r)
 	if apiErr != nil {
 		writeError(w, apiErr)
@@ -197,6 +206,87 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, pgerr.ErrUnsupported(r.Method+" requests", "dbrest"))
 	}
+}
+
+// corsExposedHeaders is the Access-Control-Expose-Headers value PostgREST
+// returns on every cross-origin request.
+const corsExposedHeaders = "Content-Encoding, Content-Location, Content-Range, Content-Type, " +
+	"Date, Location, Server, Transfer-Encoding, Range-Unit"
+
+// corsAllowedMethods is the Access-Control-Allow-Methods value PostgREST
+// returns on a preflight.
+const corsAllowedMethods = "GET, POST, PATCH, PUT, DELETE, OPTIONS, HEAD"
+
+// serveCORS answers CORS the way PostgREST v14 does and reports whether the
+// request was fully handled (a preflight). A request without an Origin header
+// is untouched. With server-cors-allowed-origins unset any origin is accepted
+// with Access-Control-Allow-Origin: *; with the option set, a listed origin is
+// reflected with Access-Control-Allow-Credentials: true and an unlisted one
+// falls through to normal handling with no CORS headers (the browser enforces
+// the denial). A preflight (OPTIONS with Access-Control-Request-Method) is
+// answered directly with the allowed methods, the requested headers, and a
+// one-day max age, before authentication and routing.
+func (s *Server) serveCORS(w http.ResponseWriter, r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return false
+	}
+	allowOrigin := "*"
+	credentials := false
+	if len(s.corsOrigins) > 0 {
+		found := false
+		for _, o := range s.corsOrigins {
+			if o == origin {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+		allowOrigin = origin
+		credentials = true
+	}
+
+	h := w.Header()
+	h.Set("Access-Control-Allow-Origin", allowOrigin)
+	if credentials {
+		h.Set("Access-Control-Allow-Credentials", "true")
+	}
+
+	if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+		h.Set("Access-Control-Allow-Methods", corsAllowedMethods)
+		h.Set("Access-Control-Allow-Headers", corsAllowedHeaders(r.Header.Get("Access-Control-Request-Headers")))
+		h.Set("Access-Control-Max-Age", "86400")
+		w.WriteHeader(http.StatusOK)
+		return true
+	}
+
+	h.Set("Access-Control-Expose-Headers", corsExposedHeaders)
+	return false
+}
+
+// corsAllowedHeaders builds the preflight Access-Control-Allow-Headers value:
+// Authorization, then the headers the client asked for, then the simple
+// headers, deduplicated case-insensitively. The order matches PostgREST.
+func corsAllowedHeaders(requested string) string {
+	out := []string{"Authorization"}
+	seen := map[string]bool{"authorization": true}
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[strings.ToLower(name)] {
+			return
+		}
+		seen[strings.ToLower(name)] = true
+		out = append(out, name)
+	}
+	for _, name := range strings.Split(requested, ",") {
+		add(name)
+	}
+	for _, name := range []string{"Accept", "Accept-Language", "Content-Language"} {
+		add(name)
+	}
+	return strings.Join(out, ", ")
 }
 
 // rpcName extracts the function name from an /rpc/<fn> path, reporting false for
