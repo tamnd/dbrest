@@ -441,3 +441,37 @@ func TestMergeReloadable(t *testing.T) {
 		t.Errorf("db-max-rows is reloadable, should not be reported: %q", kept)
 	}
 }
+
+// TestDumpRoundTrips pins the --dump-config format: the output is valid
+// config-file syntax and loads back to the same resolved values.
+func TestDumpRoundTrips(t *testing.T) {
+	first, err := FromMap(map[string]string{
+		"db-uri":              "file:dump.db",
+		"db-schemas":          "public,api",
+		"db-anon-role":        "web_anon",
+		"db-max-rows":         "500",
+		"db-tx-end":           "rollback",
+		"app.settings.tenant": "acme",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := writeConf(t, first.Dump())
+	second, err := Load(path, nil)
+	if err != nil {
+		t.Fatalf("dump output does not load: %v", err)
+	}
+	if second.DBURI != first.DBURI || second.AnonRole != first.AnonRole ||
+		second.MaxRows != first.MaxRows || second.TxEnd != first.TxEnd {
+		t.Errorf("round trip drifted: %+v vs %+v", second, first)
+	}
+	if len(second.Schemas) != 2 || second.Schemas[0] != "public" {
+		t.Errorf("schemas drifted: %v", second.Schemas)
+	}
+	if second.AppSettings["tenant"] != "acme" {
+		t.Errorf("app settings drifted: %v", second.AppSettings)
+	}
+	if second.Dump() != first.Dump() {
+		t.Error("Dump is not a fixed point of Load(Dump)")
+	}
+}

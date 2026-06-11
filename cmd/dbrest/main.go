@@ -36,9 +36,36 @@ func main() {
 // run holds the real entry point so deferred cleanup (closing the backend) runs
 // on every exit path; main only translates a returned error into a fatal log.
 func run() error {
-	var configPath string
+	var (
+		configPath  string
+		showVersion bool
+		example     bool
+		dumpConfig  bool
+		dumpSchema  bool
+		ready       bool
+	)
 	flag.StringVar(&configPath, "config", "", "path to the configuration file (env-only if omitted)")
+	flag.BoolVar(&showVersion, "version", false, "print the version and exit")
+	flag.BoolVar(&showVersion, "v", false, "print the version and exit (shorthand)")
+	flag.BoolVar(&example, "example", false, "print an example configuration file and exit")
+	flag.BoolVar(&example, "e", false, "print an example configuration file and exit (shorthand)")
+	flag.BoolVar(&dumpConfig, "dump-config", false, "print the resolved configuration and exit")
+	flag.BoolVar(&dumpSchema, "dump-schema", false, "print the schema cache as JSON and exit")
+	flag.BoolVar(&ready, "ready", false, "probe a running instance's admin /ready and exit 0 or 1")
 	flag.Parse()
+
+	configPath, err := resolveConfigPath(configPath, flag.Args())
+	if err != nil {
+		return err
+	}
+	if showVersion {
+		fmt.Println("dbrest " + versionString())
+		return nil
+	}
+	if example {
+		fmt.Print(exampleConfig)
+		return nil
+	}
 
 	cfg, err := config.Load(configPath, os.Environ())
 	if err != nil {
@@ -48,11 +75,34 @@ func run() error {
 		log.Printf("dbrest: warning: %s", w)
 	}
 
+	if dumpConfig {
+		fmt.Print(cfg.Dump())
+		return nil
+	}
+	if ready {
+		return probeReady(cfg)
+	}
+
 	be, err := openBackend(cfg)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = be.Close() }()
+
+	if dumpSchema {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		model, err := be.Introspect(ctx)
+		if err != nil {
+			return fmt.Errorf("introspect: %w", err)
+		}
+		out, err := json.MarshalIndent(map[string]any{"relations": model.Relations()}, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(out))
+		return nil
+	}
 
 	metrics := adminapi.NewMetrics(cfg.DBPool)
 	a := &app{cfgPath: configPath, be: be, cfg: cfg, metrics: metrics}
