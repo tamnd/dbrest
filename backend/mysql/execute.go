@@ -247,7 +247,10 @@ func (b *Backend) executeInsertEmulated(
 	return nil
 }
 
-// executeUpdateEmulated runs UPDATE then re-selects with the same filter.
+// executeUpdateEmulated runs UPDATE then re-selects by pre-captured primary keys.
+// The re-select must use PKs, not the original filter, because the UPDATE may
+// change the very column being filtered (e.g. PATCH /todos?task=eq.old sets
+// task=new — after the UPDATE, task=eq.old matches nothing).
 func (b *Backend) executeUpdateEmulated(
 	ctx context.Context, tx *sql.Tx,
 	q *ir.Query, returning []string, rel *schema.Relation,
@@ -257,6 +260,16 @@ func (b *Backend) executeUpdateEmulated(
 	if apiErr != nil {
 		return apiErr
 	}
+
+	// Pre-capture PKs when we need to return representation.
+	var pkValues []any
+	if len(returning) > 0 && len(rel.PrimaryKey) == 1 {
+		pkValues, apiErr = b.selectPKs(ctx, tx, q, rel.PrimaryKey[0])
+		if apiErr != nil {
+			return apiErr
+		}
+	}
+
 	out, err := tx.ExecContext(ctx, st.SQL, st.Args...)
 	if err != nil {
 		return err
@@ -264,35 +277,84 @@ func (b *Backend) executeUpdateEmulated(
 	n, _ := out.RowsAffected()
 	res.affected, res.hasAff = n, true
 
-	if len(returning) == 0 || n == 0 {
+	if len(returning) == 0 || len(pkValues) == 0 {
 		return nil
 	}
 
-	// Re-select: compile the equivalent SELECT with the same filters.
-	readQ := *q
-	readQ.Kind = ir.Read
-	readST, apiErr := sqlgen.CompileRead(Dialect{}, &readQ)
-	if apiErr != nil {
-		return apiErr
-	}
-	rows, err := tx.QueryContext(ctx, readST.SQL, normalizeArgs(readST.Args)...)
-	if err != nil {
-		return err
-	}
-	colNames, err := rows.Columns()
-	if err != nil {
-		rows.Close()
-		return err
-	}
-	boolCols := buildBoolCols(rel)
-	jsonIdx, boolIdx, _ := buildColMaps(rows, boolCols)
-	buf, err := drain(rows, colNames, jsonIdx, boolIdx)
-	rows.Close()
+	// Re-select by PK (post-update values).
+	colNames, buf, err := b.selectByPKs(ctx, tx, rel, rel.PrimaryKey[0], pkValues, returning)
 	if err != nil {
 		return err
 	}
 	res.cols, res.rows = colNames, buf
 	return nil
+}
+
+// selectPKs runs "SELECT pk FROM table WHERE <original filter>" and returns
+// the raw PK values. Used to anchor the post-write re-select.
+func (b *Backend) selectPKs(
+	ctx context.Context, tx *sql.Tx,
+	q *ir.Query, pkCol string,
+) ([]any, *pgerr.APIError) {
+	pkQ := *q
+	pkQ.Kind = ir.Read
+	pkQ.Select = []ir.SelectItem{ir.Column{Path: []string{pkCol}}}
+	pkQ.Embeds = nil
+	pkQ.Order = nil
+	pkQ.Singular = false
+	st, apiErr := sqlgen.CompileRead(Dialect{}, &pkQ)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+	rows, err := tx.QueryContext(ctx, st.SQL, normalizeArgs(st.Args)...)
+	if err != nil {
+		return nil, pgerr.New(500, "XX000", err.Error())
+	}
+	defer rows.Close()
+	var vals []any
+	for rows.Next() {
+		var v any
+		if err := rows.Scan(&v); err != nil {
+			return nil, pgerr.New(500, "XX000", err.Error())
+		}
+		vals = append(vals, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, pgerr.New(500, "XX000", err.Error())
+	}
+	return vals, nil
+}
+
+// selectByPKs runs "SELECT cols FROM table WHERE pk IN (?,...)" using pre-captured
+// PK values and returns the column names and buffered rows.
+func (b *Backend) selectByPKs(
+	ctx context.Context, tx *sql.Tx,
+	rel *schema.Relation, pkCol string, pkValues []any, cols []string,
+) ([]string, [][]any, error) {
+	d := Dialect{}
+	table := d.QuoteIdent(rel.Name)
+	pk := d.QuoteIdent(pkCol)
+	selCols := quotedCols(cols)
+	placeholders := make([]string, len(pkValues))
+	for i := range pkValues {
+		placeholders[i] = "?"
+	}
+	sql := fmt.Sprintf("SELECT %s FROM %s WHERE %s IN (%s)",
+		selCols, table, pk, strings.Join(placeholders, ","))
+	rows, err := tx.QueryContext(ctx, sql, pkValues...)
+	if err != nil {
+		return nil, nil, err
+	}
+	colNames, err := rows.Columns()
+	if err != nil {
+		rows.Close()
+		return nil, nil, err
+	}
+	boolCols := buildBoolCols(rel)
+	jsonIdx, boolIdx, _ := buildColMaps(rows, boolCols)
+	buf, err := drain(rows, colNames, jsonIdx, boolIdx)
+	rows.Close()
+	return colNames, buf, err
 }
 
 // executeDeleteEmulated selects the rows to return, then deletes them.
