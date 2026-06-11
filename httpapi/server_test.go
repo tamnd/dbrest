@@ -149,6 +149,14 @@ func TestGetSingularZeroRowsIs406(t *testing.T) {
 	if env["code"] != "PGRST116" {
 		t.Errorf("code = %v, want PGRST116", env["code"])
 	}
+	// v14 texts: the message dropped the pre-v12 spelling and the row count
+	// rides in details.
+	if env["message"] != "Cannot coerce the result to a single JSON object" {
+		t.Errorf("message = %v", env["message"])
+	}
+	if env["details"] != "The result contains 0 rows" {
+		t.Errorf("details = %v, want row count", env["details"])
+	}
 }
 
 func TestGetEmptyArray(t *testing.T) {

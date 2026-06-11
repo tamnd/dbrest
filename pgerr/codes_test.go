@@ -100,6 +100,41 @@ func TestEmptyMessageDefaults(t *testing.T) {
 	}
 }
 
+// The v14 message texts replaced several pre-v12 spellings; clients match on
+// them, so each retired text is pinned to its current form here.
+func TestV14MessageTexts(t *testing.T) {
+	if got, want := ErrSingularZeroMany().Message, "Cannot coerce the result to a single JSON object"; got != want {
+		t.Errorf("PGRST116 message = %q, want %q", got, want)
+	}
+	if got, want := ErrUnsupported("the sl operator", "mysql").Message, "Feature not implemented"; got != want {
+		t.Errorf("PGRST127 message = %q, want %q", got, want)
+	}
+	if got, want := ErrFullTextUnavailable("body", "sqlite").Message, "Feature not implemented"; got != want {
+		t.Errorf("PGRST127 fts message = %q, want %q", got, want)
+	}
+}
+
+// A 22P02 names the type the way PostgreSQL's own message does: the SQL
+// standard spelling, never the internal catalog name.
+func TestInvalidInputTypeSpelling(t *testing.T) {
+	cases := map[string]string{
+		"int2":   "smallint",
+		"int4":   "integer",
+		"int8":   "bigint",
+		"float4": "real",
+		"float8": "double precision",
+		"bool":   "boolean",
+		"uuid":   "uuid", // no PG alias, passes through
+	}
+	for canonical, spelled := range cases {
+		got := ErrInvalidInput(canonical, "abc").Message
+		want := `invalid input syntax for type ` + spelled + `: "abc"`
+		if got != want {
+			t.Errorf("ErrInvalidInput(%q) message = %q, want %q", canonical, got, want)
+		}
+	}
+}
+
 // PGRST102 is the v14 code for every request-body failure. The default message
 // is PostgREST's generic JSON-body text; a specific parser failure overrides it.
 func TestInvalidBodyMessages(t *testing.T) {

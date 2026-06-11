@@ -49,10 +49,11 @@ func ErrInvalidBody(msg string) *APIError {
 }
 
 // ErrSingularZeroMany is raised when a singular response was requested but zero
-// or many rows were produced.
+// or many rows were produced. The text is v14's; render call sites attach the
+// row count as details ("The result contains N rows").
 func ErrSingularZeroMany() *APIError {
 	return New(http.StatusNotAcceptable, CodeSingularZeroMany,
-		"JSON object requested, multiple (or no) rows returned")
+		"Cannot coerce the result to a single JSON object")
 }
 
 // ErrRangeNotSatisfiable is raised when the requested window starts past the end
@@ -126,11 +127,13 @@ func ErrMethodNotAllowed(msg string) *APIError {
 	return New(http.StatusMethodNotAllowed, CodeMethodNotAllowed, msg)
 }
 
-// ErrUnsupported is the dbrest-specific PGRST127. The details string always
-// names both the feature and the backend, per spec 18 section "PGRST127".
-// Emission must happen strictly before any backend call.
+// ErrUnsupported is PGRST127, which v14 defines as "the feature specified in
+// the details field is not implemented"; the message is upstream's "Feature not
+// implemented" and the details string always names both the feature and the
+// backend, per spec 18 section "PGRST127". Emission must happen strictly before
+// any backend call.
 func ErrUnsupported(feature, backend string) *APIError {
-	e := New(http.StatusBadRequest, CodeUnsupported, "feature not implemented on this backend")
+	e := New(http.StatusBadRequest, CodeUnsupported, "Feature not implemented")
 	e = e.WithDetails(fmt.Sprintf("%s is not supported by the %s backend", feature, backend))
 	return e.WithHint("see the capability matrix for supported features on this backend")
 }
@@ -141,7 +144,7 @@ func ErrUnsupported(feature, backend string) *APIError {
 // 21's "never silently wrong" rule: dbrest errors rather than degrading to a
 // substring scan. Emission happens before any backend call.
 func ErrFullTextUnavailable(column, backend string) *APIError {
-	e := New(http.StatusBadRequest, CodeUnsupported, "feature not implemented on this backend")
+	e := New(http.StatusBadRequest, CodeUnsupported, "Feature not implemented")
 	e = e.WithDetails(fmt.Sprintf("full-text search on column %q has no full-text index on the %s backend", column, backend))
 	return e.WithHint("create a full-text index covering the column")
 }
@@ -189,10 +192,25 @@ func ErrCheckViolation(detail string) *APIError {
 // same 400 on every backend (spec 16).
 const CodeInvalidText = "22P02"
 
+// pgTypeSpelling maps dbrest's canonical type names to the spellings PostgreSQL
+// uses in its own error messages, so a 22P02 reads exactly like the server's
+// ("invalid input syntax for type integer", never "type int4").
+var pgTypeSpelling = map[string]string{
+	"int2":   "smallint",
+	"int4":   "integer",
+	"int8":   "bigint",
+	"float4": "real",
+	"float8": "double precision",
+	"bool":   "boolean",
+}
+
 // ErrInvalidInput is raised when a query-string operand or a payload value cannot
 // be coerced to its canonical type. It mirrors PostgreSQL's "invalid input syntax
 // for type T" message and surfaces the 22P02 SQLSTATE as a 400.
 func ErrInvalidInput(canonicalType, input string) *APIError {
+	if s, ok := pgTypeSpelling[canonicalType]; ok {
+		canonicalType = s
+	}
 	return New(http.StatusBadRequest, CodeInvalidText,
 		fmt.Sprintf("invalid input syntax for type %s: %q", canonicalType, input))
 }

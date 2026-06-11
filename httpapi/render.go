@@ -111,7 +111,8 @@ func renderCall(media string, res backend.Result, fn *rpc.Function, fnName strin
 
 	if media == mediaObject {
 		if len(vals) != 1 {
-			return nil, pgerr.ErrSingularZeroMany()
+			return nil, pgerr.ErrSingularZeroMany().
+				WithDetails(fmt.Sprintf("The result contains %d rows", len(vals)))
 		}
 		body, aerr := marshalCall(vals[0])
 		if aerr != nil {
@@ -209,7 +210,8 @@ func renderRows(res backend.Result, singular bool, rawCols map[string]bool) (*re
 
 	if singular {
 		if len(rows) != 1 {
-			return nil, pgerr.ErrSingularZeroMany()
+			return nil, pgerr.ErrSingularZeroMany().
+				WithDetails(fmt.Sprintf("The result contains %d rows", len(rows)))
 		}
 		out.body = rows[0]
 		return out, nil

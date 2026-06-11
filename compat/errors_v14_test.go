@@ -26,6 +26,28 @@ func decodeEnvelope(t *testing.T, r response) errEnvelope {
 	return e
 }
 
+// TestSingularEnvelope compares the PGRST116 envelope byte-for-byte between
+// the servers: v14 says "Cannot coerce the result to a single JSON object"
+// with the row count in details (review item 04.3).
+func TestSingularEnvelope(t *testing.T) {
+	pgrest, dbrest := urls(t)
+	for _, c := range []compatCase{
+		{name: "singular zero rows", method: "GET", path: "/todos?id=eq.999999",
+			headers: map[string]string{"Accept": "application/vnd.pgrst.object+json"}},
+		{name: "singular many rows", method: "GET", path: "/todos?id=lte.2",
+			headers: map[string]string{"Accept": "application/vnd.pgrst.object+json"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			pgResp := doRequest(t, pgrest, c)
+			dbResp := doRequest(t, dbrest, c)
+			if pgResp.status != http.StatusNotAcceptable || dbResp.status != http.StatusNotAcceptable {
+				t.Errorf("status: postgrest=%d dbrest=%d, want 406", pgResp.status, dbResp.status)
+			}
+			compareJSON(t, pgResp, dbResp)
+		})
+	}
+}
+
 // TestContentTypeContract locks the request Content-Type error contract
 // (review item 04.1 task 4). The published v14 error table still carries a
 // stale PGRST107/415 row for an invalid request Content-Type; live v14
