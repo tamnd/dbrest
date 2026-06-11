@@ -278,6 +278,9 @@ func (Dialect) ArrayLiteral(pgText string) string {
 		p = strings.TrimSpace(p)
 		if p == "NULL" {
 			quoted[i] = "null"
+		} else if len(p) >= 2 && p[0] == '"' && p[len(p)-1] == '"' {
+			// PostgreSQL double-quote escaping: "foo" is already valid JSON; pass through.
+			quoted[i] = p
 		} else {
 			quoted[i] = `"` + strings.ReplaceAll(p, `"`, `\"`) + `"`
 		}

@@ -195,13 +195,14 @@ func (b *Backend) executeInsert(
 	return nil
 }
 
-// executeUpsert implements the SQL Server multi-statement upsert pattern:
-// for each row emit UPDATE … WHERE pk=@pN; IF @@ROWCOUNT=0 INSERT …
-// inside the request transaction. Named @pN placeholders let each value be
-// referenced by both the UPDATE and the INSERT within the same batch.
+// executeUpsert implements the SQL Server upsert as a single MERGE statement per
+// batch. MERGE avoids the semicolon-separated multi-statement pattern that
+// go-mssqldb rejects when sent via sp_executesql.
 //
-// After the batch, when returning columns are requested, the upserted rows are
-// read back via SELECT … WHERE (pk1=@q1 AND pk2=@q2) OR …
+// All rows are merged in one statement: the source is a VALUES(...) table with
+// one row-tuple per input row; the ON clause matches the conflict (primary-key)
+// columns; WHEN MATCHED updates non-key columns; WHEN NOT MATCHED inserts.
+// The OUTPUT clause captures written rows when returning is requested.
 func (b *Backend) executeUpsert(
 	ctx context.Context, tx *sql.Tx,
 	q *ir.Query, returning []string,
@@ -235,131 +236,139 @@ func (b *Backend) executeUpsert(
 		}
 	}
 
-	var batchSQL strings.Builder
-	batchRaw := []any{} // raw values; wrapped by namedArgs() as p1, p2, ...
+	// Collect args; @pN bind positions match the order we append.
+	raw := []any{}
 	argN := 0
 	bind := func(v any) string {
 		argN++
-		batchRaw = append(batchRaw, v)
+		raw = append(raw, v)
 		return "@p" + strconv.Itoa(argN)
 	}
 
-	for _, row := range w.Rows {
-		// Bind each column value once; named placeholders can be reused.
-		colP := make(map[string]string, len(w.Columns))
-		for _, c := range w.Columns {
-			colP[c] = bind(sqlgen.WriteArg(row[c]))
-		}
-
-		if len(nonConflictCols) > 0 {
-			// UPDATE … SET non-pk cols WHERE pk cols
-			batchSQL.WriteString("UPDATE ")
-			batchSQL.WriteString(tableName)
-			batchSQL.WriteString(" WITH (UPDLOCK,HOLDLOCK) SET ")
-			for i, c := range nonConflictCols {
-				if i > 0 {
-					batchSQL.WriteString(",")
-				}
-				batchSQL.WriteString(d.QuoteIdent(c) + "=" + colP[c])
-			}
-			batchSQL.WriteString(" WHERE ")
-			for i, c := range conflictCols {
-				if i > 0 {
-					batchSQL.WriteString(" AND ")
-				}
-				batchSQL.WriteString(d.QuoteIdent(c) + "=" + colP[c])
-			}
-			batchSQL.WriteString("; IF @@ROWCOUNT=0 ")
-		} else {
-			// No non-conflict columns: row is pk-only; insert if absent.
-			batchSQL.WriteString("IF NOT EXISTS(SELECT 1 FROM ")
-			batchSQL.WriteString(tableName)
-			batchSQL.WriteString(" WITH (UPDLOCK,HOLDLOCK) WHERE ")
-			for i, c := range conflictCols {
-				if i > 0 {
-					batchSQL.WriteString(" AND ")
-				}
-				batchSQL.WriteString(d.QuoteIdent(c) + "=" + colP[c])
-			}
-			batchSQL.WriteString(") ")
-		}
-
-		batchSQL.WriteString("INSERT INTO ")
-		batchSQL.WriteString(tableName)
-		batchSQL.WriteString("(")
-		for i, c := range w.Columns {
-			if i > 0 {
-				batchSQL.WriteString(",")
-			}
-			batchSQL.WriteString(d.QuoteIdent(c))
-		}
-		batchSQL.WriteString(") VALUES(")
-		for i, c := range w.Columns {
-			if i > 0 {
-				batchSQL.WriteString(",")
-			}
-			batchSQL.WriteString(colP[c])
-		}
-		batchSQL.WriteString(");")
+	// Build the source alias column names: s0, s1, ...
+	srcCols := make([]string, len(w.Columns))
+	for i := range w.Columns {
+		srcCols[i] = "s" + strconv.Itoa(i)
 	}
 
-	if _, err := tx.ExecContext(ctx, batchSQL.String(), namedArgs(batchRaw)...); err != nil {
-		return err
-	}
-	res.affected, res.hasAff = int64(len(w.Rows)), true
+	var sb strings.Builder
 
-	if len(returning) == 0 {
+	// MERGE INTO target USING (VALUES (...),(...)) AS src(s0,s1,...)
+	sb.WriteString("MERGE INTO ")
+	sb.WriteString(tableName)
+	sb.WriteString(" WITH (HOLDLOCK) AS [_target] USING (VALUES ")
+	for ri, row := range w.Rows {
+		if ri > 0 {
+			sb.WriteString(",")
+		}
+		sb.WriteString("(")
+		for ci, c := range w.Columns {
+			if ci > 0 {
+				sb.WriteString(",")
+			}
+			sb.WriteString(bind(sqlgen.WriteArg(row[c])))
+		}
+		sb.WriteString(")")
+	}
+	sb.WriteString(") AS [_src](")
+	for i, sc := range srcCols {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		sb.WriteString(d.QuoteIdent(sc))
+	}
+	sb.WriteString(") ON (")
+	// ON conflict columns match
+	for i, c := range conflictCols {
+		if i > 0 {
+			sb.WriteString(" AND ")
+		}
+		ci := colIndex(w.Columns, c)
+		sb.WriteString("[_target]." + d.QuoteIdent(c) + "=[_src]." + d.QuoteIdent(srcCols[ci]))
+	}
+	sb.WriteString(")")
+
+	// WHEN MATCHED THEN UPDATE (skip if ignore or no non-conflict cols)
+	if w.Conflict.Resolution != ir.ConflictIgnore && len(nonConflictCols) > 0 {
+		sb.WriteString(" WHEN MATCHED THEN UPDATE SET ")
+		for i, c := range nonConflictCols {
+			if i > 0 {
+				sb.WriteString(",")
+			}
+			ci := colIndex(w.Columns, c)
+			sb.WriteString("[_target]." + d.QuoteIdent(c) + "=[_src]." + d.QuoteIdent(srcCols[ci]))
+		}
+	}
+
+	// WHEN NOT MATCHED THEN INSERT
+	sb.WriteString(" WHEN NOT MATCHED THEN INSERT (")
+	for i, c := range w.Columns {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		sb.WriteString(d.QuoteIdent(c))
+	}
+	sb.WriteString(") VALUES (")
+	for i, sc := range srcCols {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		sb.WriteString("[_src]." + d.QuoteIdent(sc))
+	}
+	sb.WriteString(")")
+
+	// OUTPUT clause when returning is requested
+	if len(returning) > 0 {
+		sb.WriteString(" OUTPUT ")
+		for i, c := range returning {
+			if i > 0 {
+				sb.WriteString(",")
+			}
+			sb.WriteString("INSERTED." + d.QuoteIdent(c))
+		}
+	}
+
+	// MERGE requires a terminating semicolon.
+	sb.WriteString(";")
+
+	if len(returning) > 0 {
+		rows, err := tx.QueryContext(ctx, sb.String(), namedArgs(raw)...)
+		if err != nil {
+			return err
+		}
+		cols, err := rows.Columns()
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		jsonIdx, timeIdx := buildColMaps(rows, nil)
+		buf, err := drain(rows, cols, jsonIdx, timeIdx)
+		rows.Close()
+		if err != nil {
+			return err
+		}
+		res.cols, res.rows = cols, buf
+		res.affected, res.hasAff = int64(len(buf)), true
 		return nil
 	}
 
-	// SELECT the upserted rows back by their conflict key values.
-	var selSQL strings.Builder
-	selSQL.WriteString("SELECT ")
-	for i, c := range returning {
-		if i > 0 {
-			selSQL.WriteString(",")
-		}
-		selSQL.WriteString(d.QuoteIdent(c))
-	}
-	selSQL.WriteString(" FROM ")
-	selSQL.WriteString(tableName)
-	selSQL.WriteString(" WHERE ")
-	selRaw := []any{}
-	selN := 0
-	for ri, row := range w.Rows {
-		if ri > 0 {
-			selSQL.WriteString(" OR ")
-		}
-		selSQL.WriteString("(")
-		for ci, c := range conflictCols {
-			if ci > 0 {
-				selSQL.WriteString(" AND ")
-			}
-			selN++
-			selSQL.WriteString(d.QuoteIdent(c) + "=@p" + strconv.Itoa(selN))
-			selRaw = append(selRaw, sqlgen.WriteArg(row[c]))
-		}
-		selSQL.WriteString(")")
-	}
-
-	rows, err := tx.QueryContext(ctx, selSQL.String(), namedArgs(selRaw)...)
+	out, err := tx.ExecContext(ctx, sb.String(), namedArgs(raw)...)
 	if err != nil {
 		return err
 	}
-	cols, err := rows.Columns()
-	if err != nil {
-		rows.Close()
-		return err
-	}
-	jsonIdx, timeIdx := buildColMaps(rows, nil)
-	buf, err := drain(rows, cols, jsonIdx, timeIdx)
-	rows.Close()
-	if err != nil {
-		return err
-	}
-	res.cols, res.rows = cols, buf
-	res.affected, res.hasAff = int64(len(buf)), true
+	n, _ := out.RowsAffected()
+	res.affected, res.hasAff = n, true
 	return nil
+}
+
+// colIndex returns the position of name in cols, or 0 as a safe fallback.
+func colIndex(cols []string, name string) int {
+	for i, c := range cols {
+		if c == name {
+			return i
+		}
+	}
+	return 0
 }
 
 // executeUpdate runs UPDATE [t] SET ... OUTPUT INSERTED.* WHERE ...
