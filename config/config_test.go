@@ -475,3 +475,79 @@ func TestDumpRoundTrips(t *testing.T) {
 		t.Error("Dump is not a fixed point of Load(Dump)")
 	}
 }
+
+// TestEnvInterpolation covers $(NAME) in file string values: an environment
+// variable, an earlier config key, the $$ escape, and the hard error on an
+// unset name, all upstream configurator behavior.
+func TestEnvInterpolation(t *testing.T) {
+	t.Setenv("DBREST_TEST_SECRET", "from-env")
+	path := writeConf(t, `
+db-uri = "file:interp.db"
+db-anon-role = "web_anon"
+jwt-secret = "$(DBREST_TEST_SECRET)"
+db-pre-request = "check_$(db-anon-role)"
+app.settings.cost = "5$$ per row"
+`)
+	c, err := Load(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.JWTSecret != "from-env" {
+		t.Errorf("jwt-secret = %q, want the env value", c.JWTSecret)
+	}
+	if c.PreRequest != "check_web_anon" {
+		t.Errorf("pre-request = %q, earlier config key did not resolve", c.PreRequest)
+	}
+	if c.AppSettings["cost"] != "5$ per row" {
+		t.Errorf("$$ escape: got %q", c.AppSettings["cost"])
+	}
+
+	bad := writeConf(t, `jwt-secret = "$(DBREST_TEST_UNSET_VAR)"`)
+	if _, err := Load(bad, nil); err == nil || !strings.Contains(err.Error(), "no such variable") {
+		t.Errorf("unset variable should be a hard error, got %v", err)
+	}
+}
+
+// TestEnvValuesAreNotInterpolated pins the asymmetry: only file values
+// expand; an env-sourced value keeps its dollars verbatim.
+func TestEnvValuesAreNotInterpolated(t *testing.T) {
+	c, err := Load("", []string{"PGRST_DB_URI=x", "PGRST_JWT_SECRET=pa$(ss)word"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.JWTSecret != "pa$(ss)word" {
+		t.Errorf("jwt-secret = %q, env values must stay literal", c.JWTSecret)
+	}
+}
+
+// TestAtFileReferences covers the @path form for the two options that support
+// it: jwt-secret (one trailing newline chomped) and db-uri (whitespace
+// trimmed), plus the error on a missing file.
+func TestAtFileReferences(t *testing.T) {
+	dir := t.TempDir()
+	secretPath := filepath.Join(dir, "secret")
+	if err := os.WriteFile(secretPath, []byte("hush hush hush hush hush hush 32\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	uriPath := filepath.Join(dir, "uri")
+	if err := os.WriteFile(uriPath, []byte("  file:from-file.db \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := FromMap(map[string]string{
+		"db-uri":     "@" + uriPath,
+		"jwt-secret": "@" + secretPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.DBURI != "file:from-file.db" {
+		t.Errorf("db-uri = %q, want the trimmed file contents", c.DBURI)
+	}
+	if c.JWTSecret != "hush hush hush hush hush hush 32" {
+		t.Errorf("jwt-secret = %q, want the file contents with one newline chomped", c.JWTSecret)
+	}
+
+	if _, err := FromMap(map[string]string{"db-uri": "@" + filepath.Join(dir, "missing")}); err == nil {
+		t.Error("missing @file should be an error")
+	}
+}

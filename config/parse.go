@@ -132,16 +132,72 @@ func parseFile(path string) (map[string]string, []string, error) {
 				return nil, nil, fmt.Errorf("config: %s line %d: %w", path, i+1, err)
 			}
 			if key != "" {
-				raw[key] = block
+				expanded, err := interpolate(block, raw)
+				if err != nil {
+					return nil, nil, fmt.Errorf("config: %s line %d: %w", path, i+1, err)
+				}
+				raw[key] = expanded
 			}
 			i = used
 			continue
 		}
 		if key != "" {
-			raw[key] = unquote(val)
+			v := val
+			if quoted := strings.HasPrefix(val, `"`); quoted {
+				// Only quoted strings interpolate, as in upstream's config
+				// format; a bare number or boolean is taken verbatim.
+				expanded, err := interpolate(unquote(val), raw)
+				if err != nil {
+					return nil, nil, fmt.Errorf("config: %s line %d: %w", path, i+1, err)
+				}
+				v = expanded
+			}
+			raw[key] = v
 		}
 	}
 	return raw, warnings, nil
+}
+
+// interpolate expands $(NAME) inside a config-file string value, the upstream
+// configurator behavior: NAME resolves against the options bound earlier in
+// the file first, then the process environment, and an unset name is a hard
+// error rather than an empty string. The sequence $$ collapses to a literal
+// dollar. Environment-sourced option values are never interpolated; this runs
+// only on file values.
+func interpolate(v string, raw map[string]string) (string, error) {
+	if !strings.Contains(v, "$") {
+		return v, nil
+	}
+	var b strings.Builder
+	for i := 0; i < len(v); i++ {
+		if v[i] != '$' {
+			b.WriteByte(v[i])
+			continue
+		}
+		if i+1 < len(v) && v[i+1] == '$' {
+			b.WriteByte('$')
+			i++
+			continue
+		}
+		if i+1 < len(v) && v[i+1] == '(' {
+			end := strings.IndexByte(v[i+2:], ')')
+			if end < 0 {
+				return "", fmt.Errorf("unterminated $( in %q", v)
+			}
+			name := v[i+2 : i+2+end]
+			if prior, ok := raw[name]; ok {
+				b.WriteString(prior)
+			} else if env, ok := os.LookupEnv(name); ok {
+				b.WriteString(env)
+			} else {
+				return "", fmt.Errorf("no such variable %q", name)
+			}
+			i += 2 + end
+			continue
+		}
+		b.WriteByte('$')
+	}
+	return b.String(), nil
 }
 
 // stripComment removes a trailing '#' comment from a line, leaving '#' that sits

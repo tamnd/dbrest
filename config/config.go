@@ -14,6 +14,7 @@ package config
 import (
 	"fmt"
 	"maps"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -215,6 +216,18 @@ func fromRaw(raw map[string]string) (*Config, error) {
 	if v, ok := get("db-uri"); ok {
 		c.DBURI = v
 	}
+	// An @path value loads the option from a file, the documented way to keep
+	// secrets out of config files. Upstream supports it for exactly two
+	// options: db-uri (trimmed of surrounding whitespace) and jwt-secret
+	// (one trailing newline chomped), with the path read relative to the
+	// working directory.
+	if path, ok := strings.CutPrefix(c.DBURI, "@"); ok {
+		if data, err := os.ReadFile(path); err != nil {
+			errs = append(errs, fmt.Sprintf("db-uri: reading %s: %v", path, err))
+		} else {
+			c.DBURI = strings.TrimSpace(string(data))
+		}
+	}
 	for _, key := range []string{"db-schemas", "db-schema"} {
 		if v, ok := get(key); ok {
 			c.Schemas = splitList(v)
@@ -249,6 +262,13 @@ func fromRaw(raw map[string]string) (*Config, error) {
 
 	if v, ok := get("jwt-secret"); ok {
 		c.JWTSecret = v
+	}
+	if path, ok := strings.CutPrefix(c.JWTSecret, "@"); ok {
+		if data, err := os.ReadFile(path); err != nil {
+			errs = append(errs, fmt.Sprintf("jwt-secret: reading %s: %v", path, err))
+		} else {
+			c.JWTSecret = strings.TrimSuffix(string(data), "\n")
+		}
 	}
 	c.JWTSecretIsBase64 = pickBool(raw, &errs, c.JWTSecretIsBase64, "jwt-secret-is-base64", "secret-is-base64")
 	if v, ok := get("jwt-aud"); ok {
