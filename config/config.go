@@ -274,6 +274,10 @@ func fromRaw(raw map[string]string) (*Config, error) {
 		c.AdminServerHost = v
 	}
 	c.AdminServerPort = pickInt(raw, &errs, c.AdminServerPort, "admin-server-port")
+	if c.AdminServerHost == "" {
+		// Upstream defaults the admin host to the API host.
+		c.AdminServerHost = c.ServerHost
+	}
 
 	c.DBPool = pickInt(raw, &errs, c.DBPool, "db-pool")
 	c.DBPoolAcquisitionTimeout = pickDuration(raw, &errs, c.DBPoolAcquisitionTimeout, "db-pool-acquisition-timeout")
@@ -348,6 +352,9 @@ func (c *Config) validate(errs *[]string) {
 	}
 	if c.AdminServerPort < 0 || c.AdminServerPort > 65535 {
 		*errs = append(*errs, fmt.Sprintf("admin-server-port %d is out of range", c.AdminServerPort))
+	}
+	if c.AdminServerPort != 0 && c.AdminServerPort == c.ServerPort {
+		*errs = append(*errs, "admin-server-port cannot be the same as server-port")
 	}
 	if c.MaxRows < 0 {
 		*errs = append(*errs, "db-max-rows must not be negative")

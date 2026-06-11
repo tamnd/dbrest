@@ -5,13 +5,16 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"time"
 
+	"github.com/tamnd/dbrest/adminapi"
 	"github.com/tamnd/dbrest/auth"
 	"github.com/tamnd/dbrest/backend"
 	_ "github.com/tamnd/dbrest/backend/mongo"
@@ -22,6 +25,7 @@ import (
 	"github.com/tamnd/dbrest/config"
 	"github.com/tamnd/dbrest/httpapi"
 	"github.com/tamnd/dbrest/rpc"
+	"github.com/tamnd/dbrest/schema"
 )
 
 func main() {
@@ -51,9 +55,12 @@ func run() error {
 	}
 	defer func() { _ = be.Close() }()
 
+	metrics := adminapi.NewMetrics(cfg.DBPool)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	started := time.Now()
 	model, err := be.Introspect(ctx)
 	cancel()
+	metrics.ObserveSchemaCacheLoad(time.Since(started), err)
 	if err != nil {
 		return fmt.Errorf("introspect: %w", err)
 	}
@@ -67,11 +74,62 @@ func run() error {
 		return err
 	}
 
+	if cfg.AdminEnabled() {
+		startAdmin(cfg, be, model, metrics)
+	}
+
 	log.Printf("dbrest listening on %s (backend %s, %d relations)", cfg.ServerAddr(), cfg.Backend, model.Len())
 	if err := http.ListenAndServe(cfg.ServerAddr(), srv); err != nil {
 		return fmt.Errorf("serve: %w", err)
 	}
 	return nil
+}
+
+// startAdmin runs the admin listener (admin-server-port) next to the API: the
+// /live and /ready probes, the /schema_cache dump, and /metrics. The liveness
+// check dials the API socket the way PostgREST's admin server does.
+func startAdmin(cfg *config.Config, be backend.Backend, model *schema.Model, metrics *adminapi.Metrics) {
+	apiAddr := probeAddr(cfg.ServerHost, cfg.ServerPort)
+	admin := &adminapi.Server{
+		Live: func(ctx context.Context) error {
+			d := net.Dialer{Timeout: time.Second}
+			conn, err := d.DialContext(ctx, "tcp", apiAddr)
+			if err != nil {
+				return err
+			}
+			return conn.Close()
+		},
+		Ready: func(ctx context.Context) error {
+			// A backend that can check its connection exposes Ping; one that
+			// cannot (an embedded engine) is ready once the cache is loaded.
+			if p, ok := be.(interface{ Ping(context.Context) error }); ok {
+				return p.Ping(ctx)
+			}
+			return nil
+		},
+		SchemaCache: func() ([]byte, error) {
+			return json.Marshal(map[string]any{"relations": model.Relations()})
+		},
+		Metrics: metrics,
+	}
+	go func() {
+		log.Printf("dbrest admin listening on %s", cfg.AdminAddr())
+		if err := http.ListenAndServe(cfg.AdminAddr(), admin); err != nil {
+			log.Printf("dbrest: admin server: %v", err)
+		}
+	}()
+}
+
+// probeAddr is the address the liveness probe dials. A wildcard listen host is
+// not dialable as written, so the probe goes through loopback.
+func probeAddr(host string, port int) string {
+	switch host {
+	case "", "0.0.0.0", "*", "*4", "!4":
+		host = "127.0.0.1"
+	case "::", "*6", "!6":
+		host = "::1"
+	}
+	return net.JoinHostPort(host, fmt.Sprint(port))
 }
 
 // openBackend opens the engine the configuration selected.

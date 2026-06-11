@@ -382,3 +382,33 @@ func BenchmarkLoad(b *testing.B) {
 		}
 	}
 }
+
+// TestAdminPortCannotEqualServerPort mirrors the upstream boot failure: the
+// admin server cannot share the API port.
+func TestAdminPortCannotEqualServerPort(t *testing.T) {
+	if _, err := FromMap(map[string]string{"db-uri": "x", "server-port": "3000", "admin-server-port": "3000"}); err == nil {
+		t.Error("expected error for admin-server-port == server-port")
+	}
+	if _, err := FromMap(map[string]string{"db-uri": "x", "server-port": "3000", "admin-server-port": "3001"}); err != nil {
+		t.Errorf("distinct ports should boot: %v", err)
+	}
+}
+
+// TestAdminHostDefaultsToServerHost checks the upstream default: an unset
+// admin-server-host follows server-host.
+func TestAdminHostDefaultsToServerHost(t *testing.T) {
+	c, err := FromMap(map[string]string{"db-uri": "x", "server-host": "127.0.0.5", "admin-server-port": "3001"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AdminServerHost != "127.0.0.5" {
+		t.Errorf("admin-server-host = %q, want the server-host 127.0.0.5", c.AdminServerHost)
+	}
+	c, err = FromMap(map[string]string{"db-uri": "x", "admin-server-host": "10.0.0.1", "admin-server-port": "3001"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AdminServerHost != "10.0.0.1" {
+		t.Errorf("admin-server-host = %q, explicit value lost", c.AdminServerHost)
+	}
+}
