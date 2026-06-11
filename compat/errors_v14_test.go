@@ -48,6 +48,35 @@ func TestSingularEnvelope(t *testing.T) {
 	}
 }
 
+// TestProxyStatusOnErrors checks that every error response names its code in
+// the Proxy-Status header the way v14 does ("PostgREST; error=PGRST205"),
+// which is how a HEAD request identifies the failure (review item 04.11).
+func TestProxyStatusOnErrors(t *testing.T) {
+	pgrest, dbrest := urls(t)
+	for _, c := range []compatCase{
+		{name: "unknown table", method: "GET", path: "/definitely_not_a_table"},
+		{name: "head unknown table", method: "HEAD", path: "/definitely_not_a_table"},
+		{name: "singular zero rows", method: "GET", path: "/todos?id=eq.999999",
+			headers: map[string]string{"Accept": "application/vnd.pgrst.object+json"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			pgResp := doRequest(t, pgrest, c)
+			dbResp := doRequest(t, dbrest, c)
+			pgPS := pgResp.header.Get("Proxy-Status")
+			dbPS := dbResp.header.Get("Proxy-Status")
+			if pgPS == "" || pgPS != dbPS {
+				t.Errorf("Proxy-Status: postgrest=%q dbrest=%q", pgPS, dbPS)
+			}
+		})
+	}
+
+	// A successful response carries no Proxy-Status.
+	ok := doRequest(t, dbrest, compatCase{method: "GET", path: "/todos?id=eq.1"})
+	if ps := ok.header.Get("Proxy-Status"); ps != "" {
+		t.Errorf("Proxy-Status on success = %q, want absent", ps)
+	}
+}
+
 // TestContentTypeContract locks the request Content-Type error contract
 // (review item 04.1 task 4). The published v14 error table still carries a
 // stale PGRST107/415 row for an invalid request Content-Type; live v14

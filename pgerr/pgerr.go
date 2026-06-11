@@ -106,10 +106,15 @@ func (e *APIError) JSON() []byte {
 	return b
 }
 
-// Write renders e onto w: it sets the JSON content type and the status, then
-// writes the envelope. It is the single place an error reaches the client.
+// Write renders e onto w: it sets the JSON content type, the Proxy-Status
+// header, and the status, then writes the envelope. It is the single place an
+// error reaches the client. v14 adds Proxy-Status to every error response so a
+// HEAD request, whose status alone is not descriptive enough, still names the
+// error code; the "PostgREST" identifier is kept byte-identical for wire
+// compatibility.
 func (e *APIError) Write(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Proxy-Status", "PostgREST; error="+e.Code)
 	w.WriteHeader(e.HTTPStatus)
 	_, _ = w.Write(e.JSON())
 }

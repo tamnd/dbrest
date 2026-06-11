@@ -119,6 +119,11 @@ func TestWriteSetsStatusAndContentType(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); ct != "application/json; charset=utf-8" {
 		t.Errorf("content-type = %q", ct)
 	}
+	// v14 names the error code in Proxy-Status so HEAD requests can identify
+	// the failure; the value matches a live v14's byte for byte.
+	if ps := rec.Header().Get("Proxy-Status"); ps != "PostgREST; error=PGRST205" {
+		t.Errorf("Proxy-Status = %q, want %q", ps, "PostgREST; error=PGRST205")
+	}
 	var b body
 	if err := json.Unmarshal(rec.Body.Bytes(), &b); err != nil {
 		t.Fatalf("body not valid json: %v", err)
