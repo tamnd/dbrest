@@ -86,6 +86,28 @@ func TestPermissionDeniedAnonymousIs401(t *testing.T) {
 	}
 }
 
+// GradePrivilegeStatus is the single spelling of the 42501 rule: 403 when
+// authenticated, 401 when anonymous, untouched for every other code.
+func TestGradePrivilegeStatus(t *testing.T) {
+	native := New(http.StatusUnauthorized, CodeInsufficientPrivilege, "permission denied for table films")
+	if got := GradePrivilegeStatus(native, true).HTTPStatus; got != http.StatusForbidden {
+		t.Errorf("authenticated 42501 = %d, want 403", got)
+	}
+	if got := GradePrivilegeStatus(native, false).HTTPStatus; got != http.StatusUnauthorized {
+		t.Errorf("anonymous 42501 = %d, want 401", got)
+	}
+	if native.HTTPStatus != http.StatusUnauthorized {
+		t.Error("GradePrivilegeStatus mutated its argument")
+	}
+	other := ErrUniqueViolation("films_pkey")
+	if got := GradePrivilegeStatus(other, true); got != other {
+		t.Error("non-42501 errors must pass through unchanged")
+	}
+	if GradePrivilegeStatus(nil, true) != nil {
+		t.Error("nil must pass through")
+	}
+}
+
 // The empty-message constructors fall back to a non-empty default rather than
 // shipping a blank message to the client.
 func TestEmptyMessageDefaults(t *testing.T) {

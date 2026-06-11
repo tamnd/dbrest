@@ -295,6 +295,25 @@ func ErrPermissionDenied(relation string, anonymous bool) *APIError {
 		fmt.Sprintf("permission denied for table %s", relation))
 }
 
+// GradePrivilegeStatus applies PostgREST's 42501 rule to e: insufficient
+// privilege is 403 when the request was authenticated and 401 when it ran as
+// anon, so an authenticated client never gets the 401 that would trigger a
+// token-refresh loop. An error with any other code passes through unchanged.
+// This is the one place the rule lives; the exec-error mapping and the
+// per-driver SQLSTATE tables defer to it.
+func GradePrivilegeStatus(e *APIError, authenticated bool) *APIError {
+	if e == nil || e.Code != CodeInsufficientPrivilege {
+		return e
+	}
+	c := *e
+	if authenticated {
+		c.HTTPStatus = http.StatusForbidden
+	} else {
+		c.HTTPStatus = http.StatusUnauthorized
+	}
+	return &c
+}
+
 // ErrRLSViolation is a row that fails a WITH CHECK policy on a write, mirroring
 // PostgreSQL's "new row violates row-level security policy" mapped to 403. The
 // transaction is aborted so nothing is committed (spec 14).
