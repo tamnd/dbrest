@@ -32,6 +32,8 @@ func TestConstructorStatusAndCode(t *testing.T) {
 		{"ambiguous-embed", ErrAmbiguousEmbed("films", "actors"), http.StatusMultipleChoices, CodeAmbiguousEmbed},
 		{"no-function", ErrNoFunction("add"), http.StatusNotFound, CodeNoFunction},
 		{"method-not-allowed", ErrMethodNotAllowed(""), http.StatusMethodNotAllowed, CodeMethodNotAllowed},
+		{"invalid-rpc-method", ErrInvalidRPCMethod("DELETE"), http.StatusMethodNotAllowed, CodeMethodNotAllowed},
+		{"read-only-txn", ErrReadOnlyTransaction("UPDATE"), http.StatusMethodNotAllowed, CodeReadOnlyTransaction},
 		{"unsupported", ErrUnsupported("the sl operator", "mysql"), http.StatusBadRequest, CodeUnsupported},
 		{"fts-unavailable", ErrFullTextUnavailable("body", "sqlite"), http.StatusBadRequest, CodeUnsupported},
 		{"unique", ErrUniqueViolation("Key (id)=(1) already exists"), http.StatusConflict, CodeUniqueViolation},
@@ -142,6 +144,16 @@ func TestUndefinedColumnMessage(t *testing.T) {
 	got := ErrUndefinedColumn("todos.nope").Message
 	if want := "column todos.nope does not exist"; got != want {
 		t.Errorf("message = %q, want %q", got, want)
+	}
+}
+
+// The wrong-verb and read-only texts match a live v14's exactly.
+func TestRPCMethodMessages(t *testing.T) {
+	if got, want := ErrInvalidRPCMethod("TRACE").Message, "Cannot use the TRACE method on RPC"; got != want {
+		t.Errorf("PGRST101 message = %q, want %q", got, want)
+	}
+	if got, want := ErrReadOnlyTransaction("UPDATE").Message, "cannot execute UPDATE in a read-only transaction"; got != want {
+		t.Errorf("25006 message = %q, want %q", got, want)
 	}
 }
 

@@ -134,13 +134,38 @@ func ErrNoFunction(name string) *APIError {
 		fmt.Sprintf("Could not find the function '%s' in the schema cache", name))
 }
 
-// ErrMethodNotAllowed is raised when a read method calls a volatile function: a
-// GET to a function with side effects, which PostgREST rejects with 405.
+// ErrMethodNotAllowed is a 405 PGRST101 with a caller-supplied message. Prefer
+// ErrInvalidRPCMethod for the wrong-verb-on-a-function case, which carries
+// upstream's exact text.
 func ErrMethodNotAllowed(msg string) *APIError {
 	if msg == "" {
 		msg = "Method not allowed"
 	}
 	return New(http.StatusMethodNotAllowed, CodeMethodNotAllowed, msg)
+}
+
+// ErrInvalidRPCMethod is raised when a function is called with a verb other
+// than GET, HEAD, or POST. The text matches v14's PGRST101 ("Cannot use the
+// DELETE method on RPC", verified live).
+func ErrInvalidRPCMethod(method string) *APIError {
+	return New(http.StatusMethodNotAllowed, CodeMethodNotAllowed,
+		fmt.Sprintf("Cannot use the %s method on RPC", method))
+}
+
+// CodeReadOnlyTransaction is PostgreSQL's read_only_sql_transaction. PostgREST
+// runs a GET/HEAD function call in a read-only transaction; a function that
+// writes fails with this SQLSTATE, surfaced as a 405 with the server's message.
+// dbrest's registry path raises it up front when a GET reaches a function
+// declared volatile, since registry backends cannot run the call to find out.
+const CodeReadOnlyTransaction = "25006"
+
+// ErrReadOnlyTransaction mirrors PostgreSQL's "cannot execute X in a read-only
+// transaction" for a write attempted under a read verb; action names what was
+// attempted (a statement kind, or the function for the declared-volatility
+// pre-check).
+func ErrReadOnlyTransaction(action string) *APIError {
+	return New(http.StatusMethodNotAllowed, CodeReadOnlyTransaction,
+		fmt.Sprintf("cannot execute %s in a read-only transaction", action))
 }
 
 // ErrUnsupported is PGRST127, which v14 defines as "the feature specified in
