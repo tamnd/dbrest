@@ -551,3 +551,41 @@ func TestAtFileReferences(t *testing.T) {
 		t.Error("missing @file should be an error")
 	}
 }
+
+// TestListenSpecs pins the special host values to their candidate lists, and
+// the default host to upstream's !4.
+func TestListenSpecs(t *testing.T) {
+	c, err := FromMap(map[string]string{"db-uri": "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ServerHost != "!4" {
+		t.Errorf("default server-host = %q, want !4", c.ServerHost)
+	}
+
+	cases := []struct {
+		host string
+		want []ListenSpec
+	}{
+		{"*", []ListenSpec{{"tcp", ":3000"}}},
+		{"*4", []ListenSpec{{"tcp4", "0.0.0.0:3000"}, {"tcp6", "[::]:3000"}}},
+		{"!4", []ListenSpec{{"tcp4", "0.0.0.0:3000"}}},
+		{"*6", []ListenSpec{{"tcp6", "[::]:3000"}, {"tcp4", "0.0.0.0:3000"}}},
+		{"!6", []ListenSpec{{"tcp6", "[::]:3000"}}},
+		{"127.0.0.1", []ListenSpec{{"tcp", "127.0.0.1:3000"}}},
+		{"::1", []ListenSpec{{"tcp", "[::1]:3000"}}},
+	}
+	for _, tc := range cases {
+		c.ServerHost = tc.host
+		got := c.Listeners()
+		if len(got) != len(tc.want) {
+			t.Errorf("%s: %v, want %v", tc.host, got, tc.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Errorf("%s[%d]: %v, want %v", tc.host, i, got[i], tc.want[i])
+			}
+		}
+	}
+}

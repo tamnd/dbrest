@@ -14,6 +14,7 @@ package config
 import (
 	"fmt"
 	"maps"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -151,7 +152,7 @@ func defaults() *Config {
 		Schemas:            []string{""},
 		JWTRoleClaimKey:    ".role",
 		JWTCacheMaxEntries: 1000,
-		ServerHost:         "0.0.0.0",
+		ServerHost:         "!4",
 		ServerPort:         3000,
 		DBPool:             10,
 		OpenAPIMode:        OpenAPIFollowPrivileges,
@@ -464,9 +465,48 @@ func (c *Config) MergeReloadable(next *Config) (*Config, []string) {
 	return &merged, kept
 }
 
-// ServerAddr is the API listen address in host:port form.
+// ServerAddr is the API listen address in host:port form. With one of the
+// special hosts the result is for display only; the listener is built from
+// Listeners.
 func (c *Config) ServerAddr() string {
 	return fmt.Sprintf("%s:%d", c.ServerHost, c.ServerPort)
+}
+
+// ListenSpec is one candidate listener: the net.Listen network and address.
+type ListenSpec struct {
+	Network string
+	Addr    string
+}
+
+// listenSpecs maps a host option to ordered listener candidates, implementing
+// PostgREST's special values: * is any host on either stack, *4 and *6 prefer
+// one stack and fall back to the other, !4 and !6 require their stack. Any
+// other value is a literal address. The caller takes the first candidate that
+// binds.
+func listenSpecs(host string, port int) []ListenSpec {
+	p := strconv.Itoa(port)
+	switch host {
+	case "*":
+		return []ListenSpec{{"tcp", ":" + p}}
+	case "*4":
+		return []ListenSpec{{"tcp4", "0.0.0.0:" + p}, {"tcp6", "[::]:" + p}}
+	case "!4":
+		return []ListenSpec{{"tcp4", "0.0.0.0:" + p}}
+	case "*6":
+		return []ListenSpec{{"tcp6", "[::]:" + p}, {"tcp4", "0.0.0.0:" + p}}
+	case "!6":
+		return []ListenSpec{{"tcp6", "[::]:" + p}}
+	default:
+		return []ListenSpec{{"tcp", net.JoinHostPort(host, p)}}
+	}
+}
+
+// Listeners are the API listener candidates, in preference order.
+func (c *Config) Listeners() []ListenSpec { return listenSpecs(c.ServerHost, c.ServerPort) }
+
+// AdminListeners are the admin listener candidates, in preference order.
+func (c *Config) AdminListeners() []ListenSpec {
+	return listenSpecs(c.AdminServerHost, c.AdminServerPort)
 }
 
 // AdminEnabled reports whether the admin server should run.

@@ -98,3 +98,28 @@ func TestProbeReady(t *testing.T) {
 		t.Error("no admin port: expected an error")
 	}
 }
+
+// TestListenFirstBindsSpecialHosts checks each special host value yields a
+// bindable listener on this machine (port 0 picks a free port), and that the
+// fallback order engages when the first candidate cannot bind.
+func TestListenFirstBindsSpecialHosts(t *testing.T) {
+	for _, host := range []string{"*", "*4", "!4", "*6", "!6"} {
+		specs := listenSpecsFor(t, host)
+		ln, err := listenFirst(specs)
+		if err != nil {
+			t.Errorf("host %q: %v", host, err)
+			continue
+		}
+		ln.Close()
+	}
+}
+
+func listenSpecsFor(t *testing.T, host string) []config.ListenSpec {
+	t.Helper()
+	cfg, err := config.FromMap(map[string]string{"db-uri": "x", "server-port": "0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ServerHost = host
+	return cfg.Listeners()
+}

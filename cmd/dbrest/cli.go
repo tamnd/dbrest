@@ -84,8 +84,10 @@ db-uri = "file:dbrest.db"
 ## Secret for validating JWTs (HS256). Longer than 32 characters.
 # jwt-secret = "reallyreallyreallyreallyverysafe"
 
-## Where the API listens.
-# server-host = "0.0.0.0"
+## Where the API listens. Besides a literal address, the host takes the
+## PostgREST special values: "*" (any host, either stack), "*4"/"*6"
+## (prefer one stack, fall back to the other), "!4"/"!6" (require it).
+# server-host = "!4"
 # server-port = 3000
 
 ## The admin server with /live, /ready, /schema_cache, and /metrics.

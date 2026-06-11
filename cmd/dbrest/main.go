@@ -115,11 +115,31 @@ func run() error {
 		startAdmin(cfg, be, a, metrics)
 	}
 
-	log.Printf("dbrest listening on %s (backend %s, %d relations)", cfg.ServerAddr(), cfg.Backend, a.Model().Len())
-	if err := http.ListenAndServe(cfg.ServerAddr(), a); err != nil {
+	ln, err := listenFirst(cfg.Listeners())
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", cfg.ServerAddr(), err)
+	}
+	log.Printf("dbrest listening on %s (backend %s, %d relations)", ln.Addr(), cfg.Backend, a.Model().Len())
+	if err := http.Serve(ln, a); err != nil {
 		return fmt.Errorf("serve: %w", err)
 	}
 	return nil
+}
+
+// listenFirst binds the first candidate that works, in the preference order
+// the host option encodes (the *4/*6 fallback story).
+func listenFirst(specs []config.ListenSpec) (net.Listener, error) {
+	var firstErr error
+	for _, s := range specs {
+		ln, err := net.Listen(s.Network, s.Addr)
+		if err == nil {
+			return ln, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	return nil, firstErr
 }
 
 // startAdmin runs the admin listener (admin-server-port) next to the API: the
@@ -150,8 +170,13 @@ func startAdmin(cfg *config.Config, be backend.Backend, a *app, metrics *adminap
 		Metrics: metrics,
 	}
 	go func() {
-		log.Printf("dbrest admin listening on %s", cfg.AdminAddr())
-		if err := http.ListenAndServe(cfg.AdminAddr(), admin); err != nil {
+		ln, err := listenFirst(cfg.AdminListeners())
+		if err != nil {
+			log.Printf("dbrest: admin server: listen on %s: %v", cfg.AdminAddr(), err)
+			return
+		}
+		log.Printf("dbrest admin listening on %s", ln.Addr())
+		if err := http.Serve(ln, admin); err != nil {
 			log.Printf("dbrest: admin server: %v", err)
 		}
 	}()
