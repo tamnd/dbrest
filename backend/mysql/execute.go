@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/tamnd/dbrest/backend"
 	"github.com/tamnd/dbrest/backend/sqlgen"
@@ -13,6 +14,30 @@ import (
 	"github.com/tamnd/dbrest/reqctx"
 	"github.com/tamnd/dbrest/schema"
 )
+
+// normalizeArgs converts ISO 8601 datetime strings (e.g. "2024-01-01T00:00:00Z")
+// to time.Time so the MySQL driver can bind them correctly. MySQL rejects the ISO
+// T-separator format; passing time.Time avoids the string-to-DATETIME cast entirely.
+func normalizeArgs(args []any) []any {
+	if len(args) == 0 {
+		return args
+	}
+	out := make([]any, len(args))
+	for i, a := range args {
+		if s, ok := a.(string); ok {
+			if t, err := time.Parse(time.RFC3339, s); err == nil {
+				out[i] = t
+				continue
+			}
+			if t, err := time.Parse("2006-01-02T15:04:05", s); err == nil {
+				out[i] = t
+				continue
+			}
+		}
+		out[i] = a
+	}
+	return out
+}
 
 // Execute lowers a resolved plan to MySQL operations and returns a streamable
 // result. Reads stream from an open cursor; writes run in a transaction and
@@ -47,7 +72,7 @@ func (b *Backend) executeRead(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 		if apiErr != nil {
 			return nil, apiErr
 		}
-		if err := b.db.QueryRowContext(ctx, cst.SQL, cst.Args...).Scan(&res.count); err != nil {
+		if err := b.db.QueryRowContext(ctx, cst.SQL, normalizeArgs(cst.Args)...).Scan(&res.count); err != nil {
 			return nil, b.MapError(err)
 		}
 		res.hasCount = true
@@ -57,7 +82,7 @@ func (b *Backend) executeRead(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 	if apiErr != nil {
 		return nil, apiErr
 	}
-	rows, err := b.db.QueryContext(ctx, st.SQL, st.Args...)
+	rows, err := b.db.QueryContext(ctx, st.SQL, normalizeArgs(st.Args)...)
 	if err != nil {
 		return nil, b.MapError(err)
 	}
@@ -250,7 +275,7 @@ func (b *Backend) executeUpdateEmulated(
 	if apiErr != nil {
 		return apiErr
 	}
-	rows, err := tx.QueryContext(ctx, readST.SQL, readST.Args...)
+	rows, err := tx.QueryContext(ctx, readST.SQL, normalizeArgs(readST.Args)...)
 	if err != nil {
 		return err
 	}
@@ -284,7 +309,7 @@ func (b *Backend) executeDeleteEmulated(
 		if apiErr != nil {
 			return apiErr
 		}
-		rows, err := tx.QueryContext(ctx, readST.SQL, readST.Args...)
+		rows, err := tx.QueryContext(ctx, readST.SQL, normalizeArgs(readST.Args)...)
 		if err != nil {
 			return err
 		}
@@ -322,6 +347,7 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 	if apiErr != nil {
 		return nil, apiErr
 	}
+	st.Args = normalizeArgs(st.Args)
 
 	if plan.ReadOnly {
 		res := &result{controls: rc.Controls()}
@@ -383,17 +409,26 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 
 // compileWrite dispatches to the right compiler for the mutation kind.
 // When returning is empty the compiler omits the RETURNING / OUTPUT clause.
+// Args are normalized for MySQL (ISO 8601 → time.Time) before returning.
 func compileWrite(q *ir.Query, returning []string) (*sqlgen.Statement, *pgerr.APIError) {
+	var (
+		st     *sqlgen.Statement
+		apiErr *pgerr.APIError
+	)
 	switch q.Kind {
 	case ir.Insert, ir.Upsert:
-		return sqlgen.CompileInsert(Dialect{}, q, returning)
+		st, apiErr = sqlgen.CompileInsert(Dialect{}, q, returning)
 	case ir.Update:
-		return sqlgen.CompileUpdate(Dialect{}, q, returning)
+		st, apiErr = sqlgen.CompileUpdate(Dialect{}, q, returning)
 	case ir.Delete:
-		return sqlgen.CompileDelete(Dialect{}, q, returning)
+		st, apiErr = sqlgen.CompileDelete(Dialect{}, q, returning)
 	default:
 		return nil, pgerr.ErrUnsupported("this operation", "mysql")
 	}
+	if st != nil {
+		st.Args = normalizeArgs(st.Args)
+	}
+	return st, apiErr
 }
 
 // returningCols decides which columns to read back after a write.

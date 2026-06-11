@@ -52,6 +52,7 @@ func Open(dsn string) (*Backend, error) {
 		return nil, fmt.Errorf("invalid MySQL DSN: %w", err)
 	}
 	cfg.ParseTime = true
+	cfg.ClientFoundRows = true           // report matched rows, not changed rows (UPDATE re-select gate)
 	delete(cfg.Params, "tinyInt1IsBool") // removed in v1.8; schema-layer handles coercion
 
 	connector, err := mysqldrv.NewConnector(cfg)

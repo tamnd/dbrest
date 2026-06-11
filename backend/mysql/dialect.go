@@ -215,9 +215,12 @@ func (Dialect) ArrayOp(col, op, val, colType string) (string, bool) {
 // ILike uses plain LIKE; MySQL's default utf8mb4_unicode_ci collation is CI.
 func (Dialect) ILike(col, val string) (string, bool) { return col + " LIKE " + val, true }
 
-// IsBool falls back to the generic "IS 1"/"IS 0" form; MySQL treats IS TRUE
-// and IS 1 equivalently for TINYINT(1) columns.
-func (Dialect) IsBool(string, bool) (string, bool) { return "", false }
+// IsBool renders "col = 1" or "col = 0". MySQL 8's IS operator only accepts
+// NULL/UNKNOWN/TRUE/FALSE, not integer literals, so "col IS 1" is a syntax
+// error; equality works for TINYINT(1) boolean columns.
+func (Dialect) IsBool(col string, v bool) (string, bool) {
+	return col + " = " + Dialect{}.BoolValue(v), true
+}
 
 // BoolValue renders a boolean as 1/0. MySQL's BOOL is an alias for TINYINT(1),
 // so there is no native boolean keyword.
