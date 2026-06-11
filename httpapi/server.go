@@ -675,6 +675,9 @@ func mapExecError(b backend.Backend, err error, anonymous bool) *pgerr.APIError 
 	if anonymous && e.Code == pgerr.CodeInsufficientPrivilege {
 		lifted := *e
 		lifted.HTTPStatus = http.StatusUnauthorized
+		// PostgREST sends the bare Bearer challenge on every 401, including a
+		// privilege denial lifted from 403 for an unauthenticated request.
+		lifted.WWWAuthenticate = "Bearer"
 		return &lifted
 	}
 	return e

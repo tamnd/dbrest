@@ -21,9 +21,9 @@ func TestCheckTime(t *testing.T) {
 	}{
 		{"valid window", map[string]any{"exp": float64(now + 60), "nbf": float64(now - 60)}, ""},
 		{"no time claims", map[string]any{}, ""},
-		{"expired", map[string]any{"exp": float64(now - 60)}, "PGRST301"},
+		{"expired", map[string]any{"exp": float64(now - 60)}, "PGRST303"},
 		{"expired within skew", map[string]any{"exp": float64(now - 10)}, ""}, // 30s skew
-		{"not yet valid", map[string]any{"nbf": float64(now + 60)}, "PGRST302"},
+		{"not yet valid", map[string]any{"nbf": float64(now + 60)}, "PGRST303"},
 		{"not-before within skew", map[string]any{"nbf": float64(now + 10)}, ""},
 	}
 	for _, c := range cases {

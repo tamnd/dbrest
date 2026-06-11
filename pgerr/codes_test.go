@@ -37,8 +37,9 @@ func TestConstructorStatusAndCode(t *testing.T) {
 		{"foreign-key", ErrForeignKeyViolation("Key (dir)=(9) is not present"), http.StatusConflict, CodeForeignKeyViolation},
 		{"check", ErrCheckViolation("rating must be positive"), http.StatusBadRequest, CodeCheckViolation},
 		{"invalid-input", ErrInvalidInput("integer", "abc"), http.StatusBadRequest, CodeInvalidText},
-		{"jwt-expired", ErrJWTExpired(), http.StatusUnauthorized, CodeJWTExpired},
-		{"jwt-invalid", ErrJWTInvalid(""), http.StatusUnauthorized, CodeJWTInvalid},
+		{"jwt-decode", ErrJWTDecode("JWT couldn't be decoded"), http.StatusUnauthorized, CodeJWTDecode},
+		{"jwt-required", ErrJWTRequired(), http.StatusUnauthorized, CodeJWTRequired},
+		{"jwt-claims", ErrJWTClaims("JWT expired"), http.StatusUnauthorized, CodeJWTClaims},
 		{"role-not-allowed", ErrRoleNotAllowed("admin"), http.StatusForbidden, CodeInsufficientPrivilege},
 		{"permission-denied", ErrPermissionDenied("films", false), http.StatusForbidden, CodeInsufficientPrivilege},
 		{"rls-violation", ErrRLSViolation("films"), http.StatusForbidden, CodeInsufficientPrivilege},
@@ -83,14 +84,30 @@ func TestEmptyMessageDefaults(t *testing.T) {
 	if got := ErrMethodNotAllowed("").Message; got == "" {
 		t.Error("ErrMethodNotAllowed default message is empty")
 	}
-	if got := ErrJWTInvalid("").Message; got == "" {
-		t.Error("ErrJWTInvalid default message is empty")
-	}
 	if got := ErrMethodNotAllowed("custom").Message; got != "custom" {
 		t.Errorf("ErrMethodNotAllowed override = %q, want custom", got)
 	}
-	if got := ErrJWTInvalid("custom").Message; got != "custom" {
-		t.Errorf("ErrJWTInvalid override = %q, want custom", got)
+}
+
+// The JWT errors carry the WWW-Authenticate challenge PostgREST sends on every
+// 401: the RFC 6750 invalid_token form on PGRST301/PGRST303, the bare Bearer on
+// PGRST302 and on an anonymous privilege denial.
+func TestJWTErrorsCarryWWWAuthenticate(t *testing.T) {
+	wantInvalid := `Bearer error="invalid_token", error_description="JWT expired"`
+	if got := ErrJWTClaims("JWT expired").WWWAuthenticate; got != wantInvalid {
+		t.Errorf("ErrJWTClaims challenge = %q, want %q", got, wantInvalid)
+	}
+	if got := ErrJWTDecode("JWT couldn't be decoded").WWWAuthenticate; got == "" {
+		t.Error("ErrJWTDecode must carry an invalid_token challenge")
+	}
+	if got := ErrJWTRequired().WWWAuthenticate; got != "Bearer" {
+		t.Errorf("ErrJWTRequired challenge = %q, want Bearer", got)
+	}
+	if got := ErrPermissionDenied("films", true).WWWAuthenticate; got != "Bearer" {
+		t.Errorf("anonymous ErrPermissionDenied challenge = %q, want Bearer", got)
+	}
+	if got := ErrPermissionDenied("films", false).WWWAuthenticate; got != "" {
+		t.Errorf("authenticated ErrPermissionDenied challenge = %q, want none", got)
 	}
 }
 

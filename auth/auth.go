@@ -1,7 +1,7 @@
 // Package auth verifies JSON Web Tokens and resolves the request role, the
 // single piece of PostgREST's stateless auth model that lives in the frontend
 // (spec 13). It is backend-agnostic: the signature and algorithm checks, the
-// exp/nbf/iat/aud validation, the role resolution, and the PGRST301/PGRST302
+// exp/nbf/iat/aud validation, the role resolution, and the PGRST301/302/303
 // codes are produced here and are byte-identical on every engine. Only the
 // unobservable role switch differs per backend, which this package never touches.
 //
@@ -13,9 +13,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -139,8 +141,9 @@ func NewVerifier(cfg Config) (*Verifier, error) {
 }
 
 // Authenticate resolves the identity of a request from its Authorization header
-// value. No bearer token runs as anon; an expired token is PGRST301; any other
-// verification failure is PGRST302; a valid token naming a forbidden role is 403.
+// value. No bearer token runs as anon; a token that cannot be decoded is
+// PGRST301; a decoded token failing claims validation is PGRST303; a valid
+// token naming a forbidden role is 403.
 // When no key material is configured, verification is disabled and every request
 // runs as anon, matching PostgREST with no jwt-secret.
 func (v *Verifier) Authenticate(authHeader string) (*Result, *pgerr.APIError) {
@@ -171,9 +174,16 @@ func (v *Verifier) Authenticate(authHeader string) (*Result, *pgerr.APIError) {
 }
 
 // verify checks the signature, the pinned algorithm, and the time and audience
-// claims with skew, returning the claim set or a JWT error. The error message is
-// fixed text: the token and the secret are never reflected back to the client.
+// claims with skew, returning the claim set or a JWT error. The error messages
+// are PostgREST's fixed texts: the token and the secret are never reflected
+// back to the client.
 func (v *Verifier) verify(raw string) (map[string]any, *pgerr.APIError) {
+	if n := strings.Count(raw, ".") + 1; n != 3 {
+		return nil, pgerr.ErrJWTDecode(fmt.Sprintf("Expected 3 parts in JWT; got %d", n))
+	}
+	if apiErr := v.checkAlg(raw); apiErr != nil {
+		return nil, apiErr
+	}
 	claims := jwt.MapClaims{}
 	opts := []jwt.ParserOption{
 		jwt.WithValidMethods(v.validMethods),
@@ -184,12 +194,67 @@ func (v *Verifier) verify(raw string) (map[string]any, *pgerr.APIError) {
 		opts = append(opts, jwt.WithAudience(v.audience))
 	}
 	if _, err := jwt.NewParser(opts...).ParseWithClaims(raw, claims, v.keyfunc); err != nil {
-		if errors.Is(err, jwt.ErrTokenExpired) {
-			return nil, pgerr.ErrJWTExpired()
-		}
-		return nil, pgerr.ErrJWTInvalid("JWT invalid")
+		return nil, mapJWTError(err)
 	}
 	return map[string]any(claims), nil
+}
+
+// checkAlg reads the unverified alg header of a compact JWT and rejects a value
+// outside the pinned method set before any cryptography runs. The three failure
+// shapes carry PostgREST's exact messages: an unsecured token, an alg the
+// library does not know, and a known alg with no matching key.
+func (v *Verifier) checkAlg(raw string) *pgerr.APIError {
+	headerPart := raw[:strings.IndexByte(raw, '.')]
+	headerJSON, err := base64.RawURLEncoding.DecodeString(headerPart)
+	if err != nil {
+		return pgerr.ErrJWTDecode("JWT cryptographic operation failed")
+	}
+	var header struct {
+		Alg string `json:"alg"`
+	}
+	if err := json.Unmarshal(headerJSON, &header); err != nil {
+		return pgerr.ErrJWTDecode("JWT cryptographic operation failed")
+	}
+	if strings.EqualFold(header.Alg, "none") {
+		return pgerr.ErrJWTDecode("Wrong or unsupported encoding algorithm").
+			WithDetails("JWT is unsecured but expected 'alg' was not 'none'")
+	}
+	if jwt.GetSigningMethod(header.Alg) == nil {
+		return pgerr.ErrJWTDecode("JWT cryptographic operation failed")
+	}
+	for _, m := range v.validMethods {
+		if header.Alg == m {
+			return nil
+		}
+	}
+	return pgerr.ErrJWTDecode("No suitable key or wrong key type").
+		WithDetails("No suitable key was found to decode the JWT")
+}
+
+// mapJWTError translates a golang-jwt failure onto the v14 code split: claim
+// validation failures are PGRST303, everything that prevented decoding or
+// verifying the token is PGRST301. The messages are PostgREST's own.
+func mapJWTError(err error) *pgerr.APIError {
+	switch {
+	case errors.Is(err, jwt.ErrTokenExpired):
+		return pgerr.ErrJWTClaims("JWT expired")
+	case errors.Is(err, jwt.ErrTokenNotValidYet):
+		return pgerr.ErrJWTClaims("JWT not yet valid")
+	case errors.Is(err, jwt.ErrTokenUsedBeforeIssued):
+		return pgerr.ErrJWTClaims("JWT issued at future")
+	case errors.Is(err, jwt.ErrTokenInvalidAudience):
+		return pgerr.ErrJWTClaims("JWT not in audience")
+	case errors.Is(err, jwt.ErrTokenInvalidClaims):
+		return pgerr.ErrJWTClaims("Parsing claims failed")
+	case errors.Is(err, jwt.ErrTokenSignatureInvalid):
+		return pgerr.ErrJWTDecode("No suitable key or wrong key type").
+			WithDetails("None of the keys was able to decode the JWT")
+	case errors.Is(err, jwt.ErrTokenUnverifiable):
+		return pgerr.ErrJWTDecode("No suitable key or wrong key type").
+			WithDetails("No suitable key was found to decode the JWT")
+	default:
+		return pgerr.ErrJWTDecode("JWT cryptographic operation failed")
+	}
 }
 
 // keyfunc returns the verification key for the token's algorithm family. The
@@ -225,12 +290,12 @@ func (v *Verifier) checkTime(claims map[string]any) *pgerr.APIError {
 	now := v.now()
 	if exp, ok := numClaim(claims, "exp"); ok {
 		if now.After(time.Unix(exp, 0).Add(v.skew)) {
-			return pgerr.ErrJWTExpired()
+			return pgerr.ErrJWTClaims("JWT expired")
 		}
 	}
 	if nbf, ok := numClaim(claims, "nbf"); ok {
 		if now.Before(time.Unix(nbf, 0).Add(-v.skew)) {
-			return pgerr.ErrJWTInvalid("JWT invalid")
+			return pgerr.ErrJWTClaims("JWT not yet valid")
 		}
 	}
 	return nil
@@ -274,7 +339,7 @@ func (v *Verifier) anon() (*Result, *pgerr.APIError) {
 // errAnonDisabled is the 401 a request gets when it presents no usable identity
 // and no anon role is configured, so it cannot be run as anyone.
 func errAnonDisabled() *pgerr.APIError {
-	return pgerr.ErrJWTInvalid("anonymous access is disabled").
+	return pgerr.ErrJWTRequired().
 		WithMessage("no JWT was sent and no anonymous role is configured")
 }
 

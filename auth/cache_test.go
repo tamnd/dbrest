@@ -75,8 +75,8 @@ func TestCacheHitSkipsVerifyButRechecksExpiry(t *testing.T) {
 	// Advance the clock past exp: the cached entry must not extend its life.
 	v.now = fixedClock(clockNow.Add(2 * time.Minute))
 	_, err := v.Authenticate("Bearer " + tok)
-	if err == nil || err.Code != "PGRST301" {
-		t.Fatalf("a cached but now-expired token must be PGRST301, got %v", err)
+	if err == nil || err.Code != "PGRST303" {
+		t.Fatalf("a cached but now-expired token must be PGRST303, got %v", err)
 	}
 }
 

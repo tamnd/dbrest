@@ -25,8 +25,9 @@ const (
 	CodeNoFunction       = "PGRST202" // 404 no function matches name/args
 	CodeUnknownColumn    = "PGRST204" // 400 column in write payload not found
 	CodeUnknownTable     = "PGRST205" // 404 table or view not found / not exposed
-	CodeJWTExpired       = "PGRST301" // 401 JWT expired
-	CodeJWTInvalid       = "PGRST302" // 401 JWT malformed/bad signature/alg/nbf/aud
+	CodeJWTDecode        = "PGRST301" // 401 JWT could not be decoded (parts/key/alg/signature)
+	CodeJWTRequired      = "PGRST302" // 401 no token sent and the anonymous role is disabled
+	CodeJWTClaims        = "PGRST303" // 401 JWT claims validation or parsing failed
 	CodeUnsupported      = "PGRST127" // 400 feature not implemented on this backend
 	CodeInternal         = "PGRSTXX0" // 500 internal error (XX family rendered as 500)
 )
@@ -182,18 +183,31 @@ func ErrInvalidInput(canonicalType, input string) *APIError {
 		fmt.Sprintf("invalid input syntax for type %s: %q", canonicalType, input))
 }
 
-// ErrJWTExpired is raised when a JWT is past its exp (with skew applied).
-func ErrJWTExpired() *APIError {
-	return New(http.StatusUnauthorized, CodeJWTExpired, "JWT expired")
+// ErrJWTDecode is raised when a JWT cannot be decoded: a wrong number of parts,
+// no suitable key, a disallowed algorithm, or a failed signature check. It is
+// PostgREST's PGRST301 with the RFC 6750 invalid_token challenge.
+func ErrJWTDecode(msg string) *APIError {
+	e := New(http.StatusUnauthorized, CodeJWTDecode, msg)
+	e.WWWAuthenticate = BearerInvalidToken(msg)
+	return e
 }
 
-// ErrJWTInvalid is raised for a malformed token, bad signature, disallowed alg,
-// or a failed nbf/aud check.
-func ErrJWTInvalid(msg string) *APIError {
-	if msg == "" {
-		msg = "JWT invalid"
-	}
-	return New(http.StatusUnauthorized, CodeJWTInvalid, msg)
+// ErrJWTClaims is raised when a decoded JWT fails claims validation or parsing:
+// exp/nbf/iat out of range, an audience mismatch, or an unparseable claim set.
+// It is PostgREST's PGRST303 with the RFC 6750 invalid_token challenge.
+func ErrJWTClaims(msg string) *APIError {
+	e := New(http.StatusUnauthorized, CodeJWTClaims, msg)
+	e.WWWAuthenticate = BearerInvalidToken(msg)
+	return e
+}
+
+// ErrJWTRequired is raised when a request presents no token and the anonymous
+// role is disabled, so there is no role to run it as. It is PostgREST's PGRST302
+// with the bare Bearer challenge.
+func ErrJWTRequired() *APIError {
+	e := New(http.StatusUnauthorized, CodeJWTRequired, "Anonymous access is disabled")
+	e.WWWAuthenticate = "Bearer"
+	return e
 }
 
 // CodeInsufficientPrivilege is PostgreSQL's class-42 SQLSTATE for a denied role
@@ -214,11 +228,15 @@ func ErrRoleNotAllowed(role string) *APIError {
 // JWT and was denied to anon (spec 14).
 func ErrPermissionDenied(relation string, anonymous bool) *APIError {
 	status := http.StatusForbidden
-	if anonymous {
-		status = http.StatusUnauthorized
-	}
-	return New(status, CodeInsufficientPrivilege,
+	e := New(status, CodeInsufficientPrivilege,
 		fmt.Sprintf("permission denied for table %s", relation))
+	if anonymous {
+		// PostgREST sends the bare Bearer challenge on every 401, including a
+		// privilege denial lifted from 403 for an unauthenticated request.
+		e.HTTPStatus = http.StatusUnauthorized
+		e.WWWAuthenticate = "Bearer"
+	}
+	return e
 }
 
 // ErrRLSViolation is a row that fails a WITH CHECK policy on a write, mirroring

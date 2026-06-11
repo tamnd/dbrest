@@ -84,8 +84,12 @@ func TestExpiredTokenIsRejected(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if body["code"] != "PGRST301" {
-		t.Errorf("code = %v, want PGRST301", body["code"])
+	if body["code"] != "PGRST303" {
+		t.Errorf("code = %v, want PGRST303", body["code"])
+	}
+	want := `Bearer error="invalid_token", error_description="JWT expired"`
+	if h := resp.Header.Get("WWW-Authenticate"); h != want {
+		t.Errorf("WWW-Authenticate = %q, want %q", h, want)
 	}
 }
 
@@ -99,8 +103,11 @@ func TestGarbageTokenIsRejected(t *testing.T) {
 	}
 	var body map[string]any
 	json.NewDecoder(resp.Body).Decode(&body)
-	if body["code"] != "PGRST302" {
-		t.Errorf("code = %v, want PGRST302", body["code"])
+	if body["code"] != "PGRST301" {
+		t.Errorf("code = %v, want PGRST301", body["code"])
+	}
+	if h := resp.Header.Get("WWW-Authenticate"); !strings.Contains(h, `error="invalid_token"`) {
+		t.Errorf("WWW-Authenticate = %q, want the invalid_token challenge", h)
 	}
 }
 

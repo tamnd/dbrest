@@ -78,6 +78,18 @@ func TestWriteSetsStatusAndContentType(t *testing.T) {
 	if b.Code != CodeUnknownTable {
 		t.Errorf("code = %s", b.Code)
 	}
+	if h := rec.Header().Get("WWW-Authenticate"); h != "" {
+		t.Errorf("a non-auth error must not carry WWW-Authenticate, got %q", h)
+	}
+}
+
+func TestWriteEmitsWWWAuthenticate(t *testing.T) {
+	rec := httptest.NewRecorder()
+	ErrJWTClaims("JWT expired").Write(rec)
+	want := `Bearer error="invalid_token", error_description="JWT expired"`
+	if h := rec.Header().Get("WWW-Authenticate"); h != want {
+		t.Errorf("WWW-Authenticate = %q, want %q", h, want)
+	}
 }
 
 func TestAs(t *testing.T) {
