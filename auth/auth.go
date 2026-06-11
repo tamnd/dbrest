@@ -48,8 +48,11 @@ type Config struct {
 	PublicKeyPEM string
 	// Audience, when set, must appear in the token's aud claim.
 	Audience string
-	// RoleClaimKey names the claim the request role is read from; default "role".
-	// A leading-dot dotted path (".app_metadata.role") reads a nested claim.
+	// RoleClaimKey names the claim the request role is read from; default ".role".
+	// The value is a JSPath expression: dotted keys (".app_metadata.role"), quoted
+	// keys (."https://example.com/role"), array indexes (".roles[0]"), and a
+	// trailing filter (".roles[?(@ == \"admin\")]"). An invalid value is a
+	// startup error.
 	RoleClaimKey string
 	// AnonRole is the role an unauthenticated or role-less request runs as. Empty
 	// means such requests are refused rather than run as the connection identity.
@@ -85,7 +88,7 @@ type Verifier struct {
 	hasKeys      bool
 
 	audience    string
-	roleKeyPath []string
+	roleKeyPath []jsPathExp
 	anonRole    string
 	permitted   map[string]bool
 	skew        time.Duration
@@ -112,7 +115,11 @@ func NewVerifier(cfg Config) (*Verifier, error) {
 	for _, r := range cfg.PermittedRoles {
 		v.permitted[r] = true
 	}
-	v.roleKeyPath = parseRoleKey(cfg.RoleClaimKey)
+	roleKey, err := parseJSPath(cfg.RoleClaimKey)
+	if err != nil {
+		return nil, err
+	}
+	v.roleKeyPath = roleKey
 
 	if len(cfg.Secret) > 0 {
 		if len(cfg.Secret) < minHMACSecret {
@@ -402,31 +409,15 @@ func bearer(header string) (string, bool) {
 	return tok, tok != ""
 }
 
-// parseRoleKey splits a role-claim key into a path of map keys. A leading dot is
-// optional; an empty key defaults to the single segment "role".
-func parseRoleKey(key string) []string {
-	key = strings.TrimPrefix(strings.TrimSpace(key), ".")
-	if key == "" {
-		return []string{"role"}
+// roleFromClaims walks the role-claim JSPath over the claim set and returns the
+// string value it resolves to, or "" if the path resolves to nothing or to a
+// non-string value.
+func roleFromClaims(claims map[string]any, path []jsPathExp) string {
+	val, ok := walkJSPath(claims, path)
+	if !ok {
+		return ""
 	}
-	return strings.Split(key, ".")
-}
-
-// roleFromClaims walks the claim path and returns the string value at its end,
-// or "" if any segment is missing or the value is not a string.
-func roleFromClaims(claims map[string]any, path []string) string {
-	var cur any = claims
-	for _, seg := range path {
-		m, ok := cur.(map[string]any)
-		if !ok {
-			return ""
-		}
-		cur, ok = m[seg]
-		if !ok {
-			return ""
-		}
-	}
-	if s, ok := cur.(string); ok {
+	if s, ok := val.(string); ok {
 		return s
 	}
 	return ""
