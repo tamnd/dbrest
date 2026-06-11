@@ -137,6 +137,55 @@ func TestAuthRejectionShortCircuitsBeforeQuery(t *testing.T) {
 	}
 }
 
+func TestNoVerifierNoDefaultRoleFailsClosed(t *testing.T) {
+	// A bare NewServer has no identity source: every request is refused
+	// with 401 PGRST302 rather than served as a made-up role.
+	srv := newServerNoRole(t)
+	resp := do(t, srv, http.MethodGet, "/films", nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+	var body map[string]any
+	json.NewDecoder(resp.Body).Decode(&body)
+	if body["code"] != "PGRST302" {
+		t.Errorf("code = %v, want PGRST302", body["code"])
+	}
+	if body["message"] != "Anonymous access is disabled" {
+		t.Errorf("message = %v, want the exact PGRST302 text", body["message"])
+	}
+	if h := resp.Header.Get("WWW-Authenticate"); h != "Bearer" {
+		t.Errorf("WWW-Authenticate = %q, want Bearer", h)
+	}
+}
+
+func TestTokenWithoutSecretIs500(t *testing.T) {
+	// A verifier with no key material refuses presented tokens with the
+	// PGRST300 misconfiguration error instead of running them as anon.
+	srv := authServer(t, auth.Config{Secret: []byte{}, AnonRole: "anon"})
+	resp := do(t, srv, http.MethodGet, "/films", map[string]string{
+		"Authorization": "Bearer some.jwt.token",
+	})
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", resp.StatusCode)
+	}
+	var body map[string]any
+	json.NewDecoder(resp.Body).Decode(&body)
+	if body["code"] != "PGRST300" {
+		t.Errorf("code = %v, want PGRST300", body["code"])
+	}
+	if body["message"] != "Server lacks JWT secret" {
+		t.Errorf("message = %v, want Server lacks JWT secret", body["message"])
+	}
+	if h := resp.Header.Get("WWW-Authenticate"); h != "" {
+		t.Errorf("a PGRST300 must not carry a challenge, got %q", h)
+	}
+	// Tokenless requests on the same server still run as anon.
+	resp = do(t, srv, http.MethodGet, "/films?select=id", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("tokenless status = %d, want 200", resp.StatusCode)
+	}
+}
+
 func TestSecretNeverEchoedInError(t *testing.T) {
 	srv := authServer(t, auth.Config{})
 	resp := do(t, srv, http.MethodGet, "/films", map[string]string{

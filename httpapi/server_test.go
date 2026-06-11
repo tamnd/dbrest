@@ -15,6 +15,15 @@ import (
 
 func newServer(t testing.TB) *httpapi.Server {
 	t.Helper()
+	srv := newServerNoRole(t)
+	srv.SetDefaultRole("anon")
+	return srv
+}
+
+// newServerNoRole builds the test server without a default role, the state a
+// bare NewServer is in before db-anon-role is applied.
+func newServerNoRole(t testing.TB) *httpapi.Server {
+	t.Helper()
 	// A uniquely named shared-cache memory DB isolates each test's data.
 	dsn := "file:" + strings.ReplaceAll(t.Name(), "/", "_") + "?mode=memory&cache=shared"
 	be, err := sqlite.Open(dsn)

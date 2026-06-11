@@ -25,6 +25,7 @@ const (
 	CodeNoFunction       = "PGRST202" // 404 no function matches name/args
 	CodeUnknownColumn    = "PGRST204" // 400 column in write payload not found
 	CodeUnknownTable     = "PGRST205" // 404 table or view not found / not exposed
+	CodeJWTSecretMissing = "PGRST300" // 500 a token was presented but no jwt-secret is configured
 	CodeJWTDecode        = "PGRST301" // 401 JWT could not be decoded (parts/key/alg/signature)
 	CodeJWTRequired      = "PGRST302" // 401 no token sent and the anonymous role is disabled
 	CodeJWTClaims        = "PGRST303" // 401 JWT claims validation or parsing failed
@@ -181,6 +182,14 @@ const CodeInvalidText = "22P02"
 func ErrInvalidInput(canonicalType, input string) *APIError {
 	return New(http.StatusBadRequest, CodeInvalidText,
 		fmt.Sprintf("invalid input syntax for type %s: %q", canonicalType, input))
+}
+
+// ErrJWTSecretMissing is raised when a request presents a Bearer token but the
+// server has no key material to verify it with. It is PostgREST's PGRST300, a
+// 500: the misconfiguration is on the server, not the client, and no challenge
+// header is sent.
+func ErrJWTSecretMissing() *APIError {
+	return New(http.StatusInternalServerError, CodeJWTSecretMissing, "Server lacks JWT secret")
 }
 
 // ErrJWTDecode is raised when a JWT cannot be decoded: a wrong number of parts,

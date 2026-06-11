@@ -270,23 +270,48 @@ func TestAnonDisabledWithoutToken(t *testing.T) {
 		t.Fatalf("NewVerifier: %v", err)
 	}
 	_, aerr := v.Authenticate("")
-	if aerr == nil || aerr.HTTPStatus != 401 {
-		t.Fatalf("no anon role + no token must be 401, got %v", aerr)
+	if aerr == nil || aerr.HTTPStatus != 401 || aerr.Code != "PGRST302" {
+		t.Fatalf("no anon role + no token must be 401 PGRST302, got %v", aerr)
+	}
+	if aerr.Message != "Anonymous access is disabled" {
+		t.Errorf("message = %q, want the exact PGRST302 text", aerr.Message)
+	}
+	if aerr.WWWAuthenticate != "Bearer" {
+		t.Errorf("WWW-Authenticate = %q, want Bearer", aerr.WWWAuthenticate)
 	}
 }
 
-func TestNoKeysDisablesVerification(t *testing.T) {
+func TestNoKeysNoTokenRunsAnon(t *testing.T) {
 	v, err := NewVerifier(Config{AnonRole: anonRole})
 	if err != nil {
 		t.Fatalf("NewVerifier: %v", err)
 	}
-	// A token is presented but no key is configured: it runs as anon.
-	res, aerr := v.Authenticate("Bearer anything.at.all")
+	res, aerr := v.Authenticate("")
 	if aerr != nil {
 		t.Fatalf("Authenticate: %v", aerr)
 	}
-	if res.Role != anonRole {
-		t.Fatalf("role = %q, want anon when verification is off", res.Role)
+	if res.Role != anonRole || !res.Anonymous {
+		t.Fatalf("res = %+v, want anon", res)
+	}
+}
+
+func TestNoKeysWithTokenIs500(t *testing.T) {
+	// A token presented to a server without key material is a server
+	// misconfiguration, not an anonymous request: PostgREST fails closed
+	// with 500 PGRST300.
+	v, err := NewVerifier(Config{AnonRole: anonRole})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+	_, aerr := v.Authenticate("Bearer anything.at.all")
+	if aerr == nil || aerr.HTTPStatus != 500 || aerr.Code != "PGRST300" {
+		t.Fatalf("token with no keys must be 500 PGRST300, got %v", aerr)
+	}
+	if aerr.Message != "Server lacks JWT secret" {
+		t.Errorf("message = %q, want Server lacks JWT secret", aerr.Message)
+	}
+	if aerr.WWWAuthenticate != "" {
+		t.Errorf("a PGRST300 must not carry a challenge, got %q", aerr.WWWAuthenticate)
 	}
 }
 

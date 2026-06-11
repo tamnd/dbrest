@@ -43,10 +43,12 @@ type Server struct {
 }
 
 // NewServer builds a Server over a backend, its introspected model, and the
-// schema search path (the exposed schemas, in resolution order). It runs every
-// request as the anon role until a verifier is attached with SetVerifier.
+// schema search path (the exposed schemas, in resolution order). It has no
+// default role: until SetDefaultRole or SetVerifier provides an identity
+// source, every request is refused with 401 PGRST302, matching PostgREST's
+// fail-closed posture when db-anon-role is unset.
 func NewServer(b backend.Backend, model *schema.Model, searchPath []string) *Server {
-	return &Server{backend: b, model: model, searchPath: searchPath, role: "anon"}
+	return &Server{backend: b, model: model, searchPath: searchPath}
 }
 
 // SetOpenAPI configures the root document. mode is the openapi-mode option:
@@ -60,10 +62,9 @@ func (s *Server) SetOpenAPI(mode, proxyURI string) {
 	s.openapiProxy = proxyURI
 }
 
-// SetDefaultRole overrides the static role used for unauthenticated requests
-// when no verifier is configured. It should be called with the db-anon-role
-// option value so the server uses the configured anon role instead of the
-// hardcoded "anon" placeholder.
+// SetDefaultRole sets the static role used for unauthenticated requests when no
+// verifier is configured. It should be called with the db-anon-role option
+// value; left unset, tokenless requests are refused with 401 PGRST302.
 func (s *Server) SetDefaultRole(role string) {
 	if role != "" {
 		s.role = role
@@ -153,9 +154,14 @@ func applyControls(w http.ResponseWriter, rc *reqctx.ResponseControls, def int) 
 
 // authenticate resolves the request identity from the Authorization header. With
 // no verifier it is the static default role; otherwise the verifier maps the
-// bearer token to a role (or anon), or returns the 401/403 the token earns.
+// bearer token to a role (or anon), or returns the 401/403 the token earns. The
+// no-verifier path fails closed: with no default role configured, tokenless
+// requests are refused with 401 PGRST302 rather than run as anyone.
 func (s *Server) authenticate(r *http.Request) (identity, *pgerr.APIError) {
 	if s.verifier == nil {
+		if s.role == "" {
+			return identity{}, pgerr.ErrJWTRequired()
+		}
 		return identity{role: s.role, anonymous: true}, nil
 	}
 	res, apiErr := s.verifier.Authenticate(r.Header.Get("Authorization"))

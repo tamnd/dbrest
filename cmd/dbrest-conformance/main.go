@@ -85,7 +85,9 @@ func sqliteFixture() (*httpapi.Server, *sqlite.Backend, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("introspect: %w", err)
 	}
-	return httpapi.NewServer(be, model, nil), be, nil
+	srv := httpapi.NewServer(be, model, nil)
+	srv.SetDefaultRole("anon")
+	return srv, be, nil
 }
 
 const fixtureDDL = `

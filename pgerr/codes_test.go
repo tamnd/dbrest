@@ -37,6 +37,7 @@ func TestConstructorStatusAndCode(t *testing.T) {
 		{"foreign-key", ErrForeignKeyViolation("Key (dir)=(9) is not present"), http.StatusConflict, CodeForeignKeyViolation},
 		{"check", ErrCheckViolation("rating must be positive"), http.StatusBadRequest, CodeCheckViolation},
 		{"invalid-input", ErrInvalidInput("integer", "abc"), http.StatusBadRequest, CodeInvalidText},
+		{"jwt-secret-missing", ErrJWTSecretMissing(), http.StatusInternalServerError, CodeJWTSecretMissing},
 		{"jwt-decode", ErrJWTDecode("JWT couldn't be decoded"), http.StatusUnauthorized, CodeJWTDecode},
 		{"jwt-required", ErrJWTRequired(), http.StatusUnauthorized, CodeJWTRequired},
 		{"jwt-claims", ErrJWTClaims("JWT expired"), http.StatusUnauthorized, CodeJWTClaims},
@@ -108,6 +109,9 @@ func TestJWTErrorsCarryWWWAuthenticate(t *testing.T) {
 	}
 	if got := ErrPermissionDenied("films", false).WWWAuthenticate; got != "" {
 		t.Errorf("authenticated ErrPermissionDenied challenge = %q, want none", got)
+	}
+	if got := ErrJWTSecretMissing().WWWAuthenticate; got != "" {
+		t.Errorf("ErrJWTSecretMissing challenge = %q, want none on a 500", got)
 	}
 }
 

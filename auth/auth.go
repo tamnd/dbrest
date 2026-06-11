@@ -144,12 +144,15 @@ func NewVerifier(cfg Config) (*Verifier, error) {
 // value. No bearer token runs as anon; a token that cannot be decoded is
 // PGRST301; a decoded token failing claims validation is PGRST303; a valid
 // token naming a forbidden role is 403.
-// When no key material is configured, verification is disabled and every request
-// runs as anon, matching PostgREST with no jwt-secret.
+// When no key material is configured the server fails closed, as PostgREST
+// does: a presented token is a 500 PGRST300, never silently accepted.
 func (v *Verifier) Authenticate(authHeader string) (*Result, *pgerr.APIError) {
 	raw, ok := bearer(authHeader)
-	if !ok || !v.hasKeys {
+	if !ok {
 		return v.anon()
+	}
+	if !v.hasKeys {
+		return nil, pgerr.ErrJWTSecretMissing()
 	}
 
 	if v.cache != nil {
@@ -337,10 +340,10 @@ func (v *Verifier) anon() (*Result, *pgerr.APIError) {
 }
 
 // errAnonDisabled is the 401 a request gets when it presents no usable identity
-// and no anon role is configured, so it cannot be run as anyone.
+// and no anon role is configured, so it cannot be run as anyone. The message is
+// PostgREST's exact PGRST302 text.
 func errAnonDisabled() *pgerr.APIError {
-	return pgerr.ErrJWTRequired().
-		WithMessage("no JWT was sent and no anonymous role is configured")
+	return pgerr.ErrJWTRequired()
 }
 
 // loadPublicKey parses a PEM-encoded RSA or ECDSA public key into the verifier.

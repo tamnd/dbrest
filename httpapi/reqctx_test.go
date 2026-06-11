@@ -67,7 +67,9 @@ func captureServer(t *testing.T) (*httpapi.Server, *captureBackend) {
 		t.Fatalf("introspect: %v", err)
 	}
 	cap := &captureBackend{Backend: be}
-	return httpapi.NewServer(cap, model, nil), cap
+	srv := httpapi.NewServer(cap, model, nil)
+	srv.SetDefaultRole("anon")
+	return srv, cap
 }
 
 func TestContextCarriesRequestMetadata(t *testing.T) {

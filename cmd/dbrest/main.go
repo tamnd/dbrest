@@ -94,13 +94,11 @@ func openBackend(cfg *config.Config) (backend.Backend, error) {
 	return be, nil
 }
 
-// attachAuth wires a JWT verifier onto the server when a key is configured.
-// With no key material the server runs every request as the static anon role,
-// which is the PostgREST behavior for an unconfigured jwt-secret.
+// attachAuth wires a JWT verifier onto the server. The verifier is always
+// attached so the server fails closed the way PostgREST does: with no key
+// material a presented token is a 500 PGRST300, and with no anon role a
+// tokenless request is a 401 PGRST302.
 func attachAuth(srv *httpapi.Server, cfg *config.Config) error {
-	if cfg.JWTSecret == "" && cfg.JWKSet == "" {
-		return nil
-	}
 	v, err := auth.NewVerifier(auth.Config{
 		Secret:          []byte(cfg.JWTSecret),
 		Audience:        cfg.JWTAud,
