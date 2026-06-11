@@ -9,7 +9,6 @@ package schema
 
 import (
 	"slices"
-	"strings"
 )
 
 // Kind distinguishes the relation flavors the planner cares about.
@@ -144,21 +143,37 @@ func Key(schemaName, rel string) string {
 	return schemaName + "." + rel
 }
 
-// Lookup resolves a possibly-qualified relation name. An unqualified name
-// (no dot) is matched first directly, then against each schema in searchPath in
-// order, mirroring PostgREST's exposed-schema / search-path resolution.
+// Lookup resolves a relation name against the search path, trying each schema
+// in order. Request resolution passes the single active schema (selected by
+// the profile headers, defaulting to the first exposed schema), so a request
+// can never reach a relation outside it: PostgREST treats the path segment as
+// a bare name within the active schema, never as a qualified reference. With
+// an empty searchPath the name is matched directly against the model keys,
+// the mode introspection-internal callers use.
 func (m *Model) Lookup(name string, searchPath []string) (*Relation, bool) {
-	if r, ok := m.relations[name]; ok {
+	if len(searchPath) == 0 {
+		r, ok := m.relations[name]
 		return r, ok
 	}
-	if !strings.Contains(name, ".") {
-		for _, s := range searchPath {
-			if r, ok := m.relations[Key(s, name)]; ok {
-				return r, ok
-			}
+	for _, s := range searchPath {
+		if r, ok := m.relations[Key(s, name)]; ok {
+			return r, ok
 		}
 	}
 	return nil, false
+}
+
+// RelationsIn returns the relations of one schema in deterministic insertion
+// order. It is the per-schema view the OpenAPI root builds its document from,
+// so two same-named relations in different schemas can never collide there.
+func (m *Model) RelationsIn(schemaName string) []*Relation {
+	var out []*Relation
+	for _, k := range m.order {
+		if r := m.relations[k]; r.Schema == schemaName {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // Relations returns the relations in deterministic insertion order.

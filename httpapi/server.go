@@ -104,10 +104,10 @@ type identity struct {
 
 // buildContext assembles the per-request context the backend receives: the
 // resolved identity plus the request metadata that crosses the HTTP/query
-// boundary (method, path, headers, cookies, and the selected schema). The
+// boundary (method, path, headers, cookies, and the active schema). The
 // frontend builds it once after authentication; on the emulated backend the
 // values a policy references are later bound as parameters (spec 15).
-func buildContext(r *http.Request, id identity) *reqctx.Context {
+func buildContext(r *http.Request, id identity, activeSchema string) *reqctx.Context {
 	cookies := r.Cookies()
 	jar := make(map[string]string, len(cookies))
 	for _, c := range cookies {
@@ -121,19 +121,46 @@ func buildContext(r *http.Request, id identity) *reqctx.Context {
 		Path:      r.URL.Path,
 		Headers:   r.Header,
 		Cookies:   jar,
-		Schema:    requestSchema(r),
+		Schema:    activeSchema,
 	}
 }
 
-// requestSchema reads the schema the client selected with the Accept-Profile
-// header (reads) or the Content-Profile header (writes). It carries the choice
-// onto the context; cross-schema identifier routing is the introspection
-// subsystem's job (spec 08), so an unset header is the default schema.
-func requestSchema(r *http.Request) string {
-	if r.Method == http.MethodGet || r.Method == http.MethodHead {
-		return r.Header.Get("Accept-Profile")
+// resolveSchema negotiates the active schema for the request, the PostgREST
+// profile rules: POST/PATCH/PUT/DELETE read Content-Profile, every other
+// method reads Accept-Profile; no header selects the first exposed schema. A
+// profile outside db-schemas is 406 PGRST106. The bool reports whether the
+// schema was negotiated, which is when the client named one, or implicitly on
+// a multi-schema deployment; a negotiated response echoes the active schema in
+// a Content-Profile response header.
+func (s *Server) resolveSchema(r *http.Request) (string, bool, *pgerr.APIError) {
+	var profile string
+	switch r.Method {
+	case http.MethodPost, http.MethodPatch, http.MethodPut, http.MethodDelete:
+		profile = r.Header.Get("Content-Profile")
+	default:
+		profile = r.Header.Get("Accept-Profile")
 	}
-	return r.Header.Get("Content-Profile")
+	if profile == "" {
+		var def string
+		if len(s.searchPath) > 0 {
+			def = s.searchPath[0]
+		}
+		return def, len(s.searchPath) > 1, nil
+	}
+	for _, sch := range s.searchPath {
+		if sch == profile {
+			return profile, true, nil
+		}
+	}
+	return "", false, errUnacceptableSchema(profile, s.searchPath)
+}
+
+// errUnacceptableSchema is PostgREST's PGRST106: a profile header naming a
+// schema that is not exposed by db-schemas, a 406 whose hint lists the schemas
+// that are.
+func errUnacceptableSchema(profile string, schemas []string) *pgerr.APIError {
+	e := pgerr.New(http.StatusNotAcceptable, "PGRST106", "Invalid schema: "+profile)
+	return e.WithHint("Only the following schemas are exposed: " + strings.Join(schemas, ", "))
 }
 
 // applyControls applies a backend's response controls and returns the status to
@@ -175,25 +202,35 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, apiErr)
 		return
 	}
+	activeSchema, negotiated, apiErr := s.resolveSchema(r)
+	if apiErr != nil {
+		writeError(w, apiErr)
+		return
+	}
+	if negotiated {
+		// PostgREST echoes the negotiated schema on successful responses so the
+		// client knows which schema served it; writeError strips it on failure.
+		w.Header().Set("Content-Profile", activeSchema)
+	}
 	if fn, ok := rpcName(r.URL.Path); ok {
-		s.handleRPC(w, r, fn, id)
+		s.handleRPC(w, r, fn, id, activeSchema)
 		return
 	}
 	if r.URL.Path == "/" {
-		s.handleRoot(w, r)
+		s.handleRoot(w, r, activeSchema)
 		return
 	}
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
-		s.handleRead(w, r, id)
+		s.handleRead(w, r, id, activeSchema)
 	case http.MethodPost:
-		s.handleWrite(w, r, ir.Insert, id)
+		s.handleWrite(w, r, ir.Insert, id, activeSchema)
 	case http.MethodPatch:
-		s.handleWrite(w, r, ir.Update, id)
+		s.handleWrite(w, r, ir.Update, id, activeSchema)
 	case http.MethodPut:
-		s.handleWrite(w, r, ir.Upsert, id)
+		s.handleWrite(w, r, ir.Upsert, id, activeSchema)
 	case http.MethodDelete:
-		s.handleWrite(w, r, ir.Delete, id)
+		s.handleWrite(w, r, ir.Delete, id, activeSchema)
 	default:
 		writeError(w, pgerr.ErrUnsupported(r.Method+" requests", "dbrest"))
 	}
@@ -214,7 +251,7 @@ func rpcName(path string) (string, bool) {
 // string); POST reads or writes (arguments from the JSON body). A read method may
 // only reach a read-only function; the plan raises 405 otherwise. Any other
 // method is not allowed on a function. See spec 12-rpc.
-func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id identity) {
+func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id identity, activeSchema string) {
 	if fn == "" || strings.Contains(fn, "/") {
 		writeError(w, pgerr.ErrNoFunction(fn))
 		return
@@ -260,14 +297,14 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 		// read-only transaction fails with SQLSTATE 25006, which maps to 405.
 		planned = &ir.Plan{Call: call, ReadOnly: isGet}
 	} else {
-		planned, apiErr = plan.Call(s.backend.Functions(), call, isGet, s.searchPath)
+		planned, apiErr = plan.Call(s.backend.Functions(), call, isGet, []string{activeSchema})
 		if apiErr != nil {
 			writeError(w, apiErr)
 			return
 		}
 	}
 
-	rc := buildContext(r, id)
+	rc := buildContext(r, id, activeSchema)
 	res, err := s.backend.Execute(r.Context(), planned, rc)
 	if err != nil {
 		writeError(w, mapExecError(s.backend, err, id.anonymous))
@@ -311,7 +348,7 @@ func (s *Server) writeCall(w http.ResponseWriter, r *http.Request, call *ir.Call
 	}
 }
 
-func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity) {
+func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity, activeSchema string) {
 	relation := strings.Trim(r.URL.Path, "/")
 	if relation == "" || strings.Contains(relation, "/") {
 		writeError(w, pgerr.ErrUnknownTable(relation))
@@ -348,13 +385,13 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity)
 		}
 	}
 
-	planned, apiErr := plan.Read(s.model, q, s.searchPath)
+	planned, apiErr := plan.Read(s.model, q, []string{activeSchema})
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
 	}
 
-	rc := buildContext(r, id)
+	rc := buildContext(r, id, activeSchema)
 
 	if apiErr := s.authorize(rc, planned); apiErr != nil {
 		writeError(w, apiErr)
@@ -394,7 +431,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity)
 	s.writeRead(w, r, q, out, res.ResponseControls())
 }
 
-func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.QueryKind, id identity) {
+func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.QueryKind, id identity, activeSchema string) {
 	relation := strings.Trim(r.URL.Path, "/")
 	if relation == "" || strings.Contains(relation, "/") {
 		writeError(w, pgerr.ErrUnknownTable(relation))
@@ -424,13 +461,13 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.Que
 	}
 	q.Singular = media == mediaObject
 
-	planned, apiErr := plan.Write(s.model, q, s.searchPath)
+	planned, apiErr := plan.Write(s.model, q, []string{activeSchema})
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
 	}
 
-	rc := buildContext(r, id)
+	rc := buildContext(r, id, activeSchema)
 	if apiErr := s.authorize(rc, planned); apiErr != nil {
 		writeError(w, apiErr)
 		return
@@ -681,5 +718,8 @@ func mapExecError(b backend.Backend, err error, anonymous bool) *pgerr.APIError 
 }
 
 func writeError(w http.ResponseWriter, e *pgerr.APIError) {
+	// PostgREST does not echo Content-Profile on an error response; drop the
+	// header ServeHTTP may have staged before the handler failed.
+	w.Header().Del("Content-Profile")
 	e.Write(w)
 }

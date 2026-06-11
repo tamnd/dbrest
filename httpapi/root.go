@@ -15,7 +15,7 @@ import (
 // backend's declared capabilities, so it describes exactly what this server can
 // serve and never promises an operator the next request would reject. HEAD
 // returns the headers with no body. See spec 19.
-func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request, activeSchema string) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		writeError(w, pgerr.ErrUnsupported(r.Method+" requests on the root", "dbrest"))
 		return
@@ -28,9 +28,10 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	opts := openapi.Options{
-		Host:    r.Host,
-		Schemes: []string{requestScheme(r)},
-		JWT:     s.verifier != nil,
+		Host:         r.Host,
+		Schemes:      []string{requestScheme(r)},
+		JWT:          s.verifier != nil,
+		ActiveSchema: activeSchema,
 	}
 	if s.openapiProxy != "" {
 		applyProxyURI(&opts, s.openapiProxy)

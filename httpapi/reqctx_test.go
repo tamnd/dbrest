@@ -2,6 +2,7 @@ package httpapi_test
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -97,25 +98,68 @@ func TestContextCarriesRequestMetadata(t *testing.T) {
 	}
 }
 
-func TestContextCarriesProfileSchema(t *testing.T) {
+func TestAcceptProfileUnknownSchemaIs406(t *testing.T) {
 	srv, cap := captureServer(t)
 	req := newReq(http.MethodGet, "/films?select=id")
 	req.Header.Set("Accept-Profile", "reporting")
-	srv.ServeHTTP(newRecorder(), req)
+	rec := newRecorder()
+	srv.ServeHTTP(rec, req)
 
-	if cap.got.Schema != "reporting" {
-		t.Errorf("Schema = %q, want reporting (from Accept-Profile)", cap.got.Schema)
+	if cap.got != nil {
+		t.Fatal("backend executed despite an invalid Accept-Profile")
+	}
+	resp := rec.Result()
+	if resp.StatusCode != http.StatusNotAcceptable {
+		t.Fatalf("status = %d, want 406", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), `"PGRST106"`) {
+		t.Errorf("body = %s, want code PGRST106", body)
+	}
+	if !strings.Contains(string(body), "Invalid schema: reporting") {
+		t.Errorf("body = %s, want message naming the schema", body)
+	}
+	if h := resp.Header.Get("Content-Profile"); h != "" {
+		t.Errorf("Content-Profile = %q on an error, want unset", h)
 	}
 }
 
-func TestContextWriteUsesContentProfile(t *testing.T) {
+func TestContentProfileUnknownSchemaIs406(t *testing.T) {
 	srv, cap := captureServer(t)
 	req := newReqBody(http.MethodPost, "/films", `{"id":3,"title":"Dune"}`)
 	req.Header.Set("Content-Profile", "staging")
-	srv.ServeHTTP(newRecorder(), req)
+	rec := newRecorder()
+	srv.ServeHTTP(rec, req)
 
-	if cap.got.Schema != "staging" {
-		t.Errorf("Schema = %q, want staging (from Content-Profile)", cap.got.Schema)
+	if cap.got != nil {
+		t.Fatal("backend executed despite an invalid Content-Profile")
+	}
+	resp := rec.Result()
+	if resp.StatusCode != http.StatusNotAcceptable {
+		t.Fatalf("status = %d, want 406", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "Invalid schema: staging") {
+		t.Errorf("body = %s, want message naming the schema", body)
+	}
+}
+
+// TestNoProfileUsesDefaultSchema pins the default: with no profile header the
+// active schema is the first exposed schema, and on a single-schema deployment
+// no Content-Profile response header is emitted.
+func TestNoProfileUsesDefaultSchema(t *testing.T) {
+	srv, cap := captureServer(t)
+	rec := newRecorder()
+	srv.ServeHTTP(rec, newReq(http.MethodGet, "/films?select=id"))
+
+	if cap.got == nil {
+		t.Fatal("Execute never received a context")
+	}
+	if cap.got.Schema != "" {
+		t.Errorf("Schema = %q, want the default (first exposed) schema", cap.got.Schema)
+	}
+	if h := rec.Result().Header.Get("Content-Profile"); h != "" {
+		t.Errorf("Content-Profile = %q, want unset on a single-schema server", h)
 	}
 }
 

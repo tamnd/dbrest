@@ -34,6 +34,11 @@ type Options struct {
 	BasePath string   // mount path; defaults to "/"
 	Schemes  []string // url schemes; defaults to ["http"]
 
+	// ActiveSchema is the schema the document describes: the request's
+	// profile-negotiated schema, so a multi-schema deployment serves one
+	// document per schema and same-named relations never collide on a path key.
+	ActiveSchema string
+
 	// JWT advertises a bearer security scheme in securityDefinitions when true,
 	// matching a server with JWT auth configured (spec 13).
 	JWT bool
@@ -95,7 +100,7 @@ func build(model *schema.Model, fns rpc.Registry, caps backend.Capabilities, opt
 		}
 	}
 
-	for _, rel := range model.Relations() {
+	for _, rel := range model.RelationsIn(opts.ActiveSchema) {
 		doc.Paths["/"+rel.Name] = relationPath(rel, ops, security)
 		doc.Definitions[rel.Name] = relationDefinition(rel)
 	}
