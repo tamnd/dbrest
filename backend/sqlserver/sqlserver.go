@@ -120,7 +120,7 @@ func (b *Backend) MapError(err error) *pgerr.APIError {
 }
 
 // mapSQLServerError builds the unified API error from a SQL Server error.
-func mapSQLServerError(me *mssql.Error) *pgerr.APIError {
+func mapSQLServerError(me mssql.Error) *pgerr.APIError {
 	switch me.Number {
 	case 2627, 2601: // unique constraint / unique index violation
 		return pgerr.ErrUniqueViolation(me.Message)
@@ -206,9 +206,10 @@ func sqlServerCanonicalType(dataType string) string {
 	}
 }
 
-// asMSSQLError unwraps err as a *mssql.Error.
-func asMSSQLError(err error) (*mssql.Error, bool) {
-	var me *mssql.Error
+// asMSSQLError unwraps err as a mssql.Error. mssql.Error implements error via a
+// value receiver so errors.As requires a value target, not a pointer.
+func asMSSQLError(err error) (mssql.Error, bool) {
+	var me mssql.Error
 	ok := errors.As(err, &me)
 	return me, ok
 }

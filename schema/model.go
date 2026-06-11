@@ -55,6 +55,11 @@ type Column struct {
 	Type       string // canonical PG type name (spec 16)
 	Nullable   bool
 	HasDefault bool
+	// Identity reports whether the column is an auto-generated identity/serial
+	// column (IDENTITY on SQL Server, SERIAL/GENERATED ALWAYS AS IDENTITY on
+	// PostgreSQL). Backends that support explicit-identity inserts (e.g. SQL
+	// Server's IDENTITY_INSERT) use this to decide whether to enable it.
+	Identity bool
 	// Position is the 1-based ordinal, used for stable ordering.
 	Position int
 }

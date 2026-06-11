@@ -155,7 +155,7 @@ func (b *Backend) executeInsert(
 	res *writeResult,
 ) error {
 	if q.Kind == ir.Upsert {
-		return b.executeUpsert(ctx, tx, q, returning, res)
+		return b.executeUpsert(ctx, tx, q, returning, rel, res)
 	}
 
 	st, apiErr := sqlgen.CompileInsert(Dialect{}, q, nil)
@@ -205,7 +205,7 @@ func (b *Backend) executeInsert(
 // The OUTPUT clause captures written rows when returning is requested.
 func (b *Backend) executeUpsert(
 	ctx context.Context, tx *sql.Tx,
-	q *ir.Query, returning []string,
+	q *ir.Query, returning []string, rel *schema.Relation,
 	res *writeResult,
 ) error {
 	w := q.Write
@@ -331,6 +331,16 @@ func (b *Backend) executeUpsert(
 	// MERGE requires a terminating semicolon.
 	sb.WriteString(";")
 
+	// When any conflict column is an IDENTITY column and the user provided
+	// an explicit value, SQL Server requires IDENTITY_INSERT to be ON.
+	needIdentityInsert := rel != nil && hasIdentityConflictCol(rel, conflictCols)
+	if needIdentityInsert {
+		if _, err := tx.ExecContext(ctx, "SET IDENTITY_INSERT "+tableName+" ON"); err != nil {
+			return err
+		}
+		defer func() { _, _ = tx.ExecContext(ctx, "SET IDENTITY_INSERT "+tableName+" OFF") }()
+	}
+
 	if len(returning) > 0 {
 		rows, err := tx.QueryContext(ctx, sb.String(), namedArgs(raw)...)
 		if err != nil {
@@ -359,6 +369,17 @@ func (b *Backend) executeUpsert(
 	n, _ := out.RowsAffected()
 	res.affected, res.hasAff = n, true
 	return nil
+}
+
+// hasIdentityConflictCol reports whether any of the conflict target columns is
+// an identity column in rel.
+func hasIdentityConflictCol(rel *schema.Relation, conflictCols []string) bool {
+	for _, c := range conflictCols {
+		if col, ok := rel.Column(c); ok && col.Identity {
+			return true
+		}
+	}
+	return false
 }
 
 // colIndex returns the position of name in cols, or 0 as a safe fallback.
