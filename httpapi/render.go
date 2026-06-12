@@ -98,7 +98,7 @@ func renderCall(media string, res backend.Result, fn *rpc.Function, fnName strin
 		}
 		// A scalar function projects one column; if a registry declares scalar
 		// over a wider statement, the first column is the value.
-		vals = append(vals, row[0])
+		vals = append(vals, rawJSONValue(row[0], fn.Returns.Type))
 	}
 	if err := rs.Err(); err != nil {
 		return nil, pgerr.ErrInternal(err.Error())
@@ -144,6 +144,22 @@ func renderCall(media string, res backend.Result, fn *rpc.Function, fnName strin
 	}
 	out.body = body
 	return out, nil
+}
+
+// rawJSONValue embeds a json-declared scalar verbatim. An engine expression
+// (a registry SELECT json_object(...), say) carries no column type the driver
+// could key the conversion on, so the declared return type decides here: a
+// valid-JSON string under a json/jsonb declaration becomes a RawMessage and
+// the encoder emits the document rather than a quoted string, matching how
+// PostgreSQL functions returning json behave through PostgREST.
+func rawJSONValue(v any, declared string) any {
+	if declared != "json" && declared != "jsonb" {
+		return v
+	}
+	if s, ok := v.(string); ok && json.Valid([]byte(s)) {
+		return json.RawMessage(s)
+	}
+	return v
 }
 
 // marshalCall encodes one RPC value (a scalar or an array of scalars) to JSON

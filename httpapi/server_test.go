@@ -505,3 +505,58 @@ func BenchmarkGetFilteredRead(b *testing.B) {
 		}
 	}
 }
+
+// TestReloadPublishesNewSchema pins the schema cache reload: DDL applied
+// after startup is invisible (404 PGRST205) until Reload re-runs
+// introspection, after which the new table serves and the OpenAPI document
+// describes it. This is the dbrest side of PostgREST's SIGUSR1 / NOTIFY
+// reload flow; the signal wiring lives in cmd.
+func TestReloadPublishesNewSchema(t *testing.T) {
+	dsn := "file:" + strings.ReplaceAll(t.Name(), "/", "_") + "?mode=memory&cache=shared"
+	be, err := sqlite.Open(dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { be.Close() })
+	if _, err := be.DB().Exec(`CREATE TABLE films (id INTEGER PRIMARY KEY, title TEXT NOT NULL);`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	model, err := be.Introspect(context.Background())
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+	srv := httpapi.NewServer(be, model, nil)
+	srv.SetDefaultRole("anon")
+
+	if _, err := be.DB().Exec(`CREATE TABLE actors (id INTEGER PRIMARY KEY, name TEXT NOT NULL);`); err != nil {
+		t.Fatalf("ddl: %v", err)
+	}
+
+	resp := do(t, srv, http.MethodGet, "/actors", nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("pre-reload status = %d, want 404", resp.StatusCode)
+	}
+	var env map[string]any
+	json.NewDecoder(resp.Body).Decode(&env)
+	if env["code"] != "PGRST205" {
+		t.Errorf("pre-reload code = %v, want PGRST205", env["code"])
+	}
+
+	if err := srv.Reload(context.Background()); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+
+	resp = do(t, srv, http.MethodGet, "/actors", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("post-reload status = %d, want 200", resp.StatusCode)
+	}
+
+	resp = do(t, srv, http.MethodGet, "/", nil)
+	var doc map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		t.Fatalf("decode document: %v", err)
+	}
+	if _, ok := doc["paths"].(map[string]any)["/actors"]; !ok {
+		t.Error("the document should describe the new table after reload")
+	}
+}

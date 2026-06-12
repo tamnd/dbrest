@@ -40,15 +40,50 @@ func TestLookupSearchPath(t *testing.T) {
 		t.Error("secrets should not resolve when only public is searched")
 	}
 
-	// Qualified resolves regardless of search path.
+	// An empty search path matches model keys directly, the
+	// introspection-internal mode.
 	if _, ok := m.Lookup("private.secrets", nil); !ok {
-		t.Error("private.secrets should resolve when fully qualified")
+		t.Error("private.secrets should resolve against the model key with no search path")
 	}
 
 	// Unknown stays unknown.
 	if _, ok := m.Lookup("nope", []string{"public"}); ok {
 		t.Error("unknown relation should not resolve")
 	}
+
+	// A request never reaches outside its active schema with a dotted name:
+	// the path segment is a bare name within the schema, never a qualified
+	// reference (PostgREST profile semantics).
+	if _, ok := m.Lookup("private.secrets", []string{"public"}); ok {
+		t.Error("a dotted name must not escape the active schema")
+	}
+	if _, ok := m.Lookup("public.users", []string{"public"}); ok {
+		t.Error("a dotted name must not bypass search-path keying")
+	}
+}
+
+func TestRelationsIn(t *testing.T) {
+	m := sampleModel()
+
+	pub := m.RelationsIn("public")
+	if len(pub) != 2 || pub[0].Name != "users" || pub[1].Name != "todos" {
+		t.Fatalf("RelationsIn(public) = %v, want [users todos]", names(pub))
+	}
+	priv := m.RelationsIn("private")
+	if len(priv) != 1 || priv[0].Name != "secrets" {
+		t.Fatalf("RelationsIn(private) = %v, want [secrets]", names(priv))
+	}
+	if got := m.RelationsIn("nope"); len(got) != 0 {
+		t.Errorf("RelationsIn(nope) = %v, want empty", names(got))
+	}
+}
+
+func names(rels []*Relation) []string {
+	out := make([]string, len(rels))
+	for i, r := range rels {
+		out[i] = r.Name
+	}
+	return out
 }
 
 func TestColumnLookup(t *testing.T) {

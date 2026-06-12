@@ -146,18 +146,16 @@ type Config struct {
 
 // defaultSchemas is the exposed-schema default for an unset db-schemas: the
 // engine's natural namespace rather than a hardcoded value. PostgreSQL gets
-// upstream's "public", SQLite its main database; the engines whose default
-// namespace is the connected database itself ("" lets the backend decide) get
-// the empty marker.
+// upstream's "public"; the engines whose default namespace is the connected
+// database itself get the empty marker, matching their introspection contract
+// of unqualified relations. SQLite is one of those: its main database maps to
+// the unqualified namespace, and attached databases become named schemas when
+// that subsystem lands (spec 08).
 func defaultSchemas(backendName string) []string {
-	switch backendName {
-	case BackendPostgres:
+	if backendName == BackendPostgres {
 		return []string{"public"}
-	case BackendSQLite:
-		return []string{"main"}
-	default:
-		return []string{""}
 	}
+	return []string{""}
 }
 
 // defaults returns a Config carrying the unambiguous PostgREST defaults, before

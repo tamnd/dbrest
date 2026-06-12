@@ -9,7 +9,6 @@ package schema
 
 import (
 	"slices"
-	"strings"
 )
 
 // Kind distinguishes the relation flavors the planner cares about.
@@ -28,13 +27,35 @@ type Model struct {
 	relations map[string]*Relation
 	// order preserves a deterministic relation order for OpenAPI and tests.
 	order []string
+	// schemaComments holds the database comment on each exposed schema, the
+	// source of the OpenAPI info title and description (first line and rest).
+	schemaComments map[string]string
+}
+
+// SetSchemaComment records a schema's database comment. It is called during
+// introspection, before the model is published; readers use SchemaComment.
+func (m *Model) SetSchemaComment(schemaName, comment string) {
+	if m.schemaComments == nil {
+		m.schemaComments = make(map[string]string)
+	}
+	m.schemaComments[schemaName] = comment
+}
+
+// SchemaComment returns the database comment on the named schema, or "" when
+// none was recorded.
+func (m *Model) SchemaComment(schemaName string) string {
+	return m.schemaComments[schemaName]
 }
 
 // Relation is one table or view in the exposed schema.
 type Relation struct {
-	Schema     string
-	Name       string
-	Kind       Kind
+	Schema string
+	Name   string
+	Kind   Kind
+	// Comment is the database comment on the relation (COMMENT ON TABLE, or
+	// the declared-schema equivalent). The OpenAPI generator splits it into
+	// the operation summary (first line) and description (rest), as v14 does.
+	Comment    string
 	Columns    []*Column
 	PrimaryKey []string // column names forming the PK, in order; may be empty
 	// ForeignKeys are the relation's outgoing foreign keys, the raw material the
@@ -51,8 +72,12 @@ type Relation struct {
 
 // Column is one attribute of a relation.
 type Column struct {
-	Name       string
-	Type       string // canonical PG type name (spec 16)
+	Name string
+	Type string // canonical PG type name (spec 16)
+	// Comment is the database comment on the column. The OpenAPI generator
+	// surfaces it on the column's rowFilter parameter and ahead of the pk/fk
+	// notes in the definition property, matching v14.
+	Comment    string
 	Nullable   bool
 	HasDefault bool
 	// Identity reports whether the column is an auto-generated identity/serial
@@ -144,21 +169,37 @@ func Key(schemaName, rel string) string {
 	return schemaName + "." + rel
 }
 
-// Lookup resolves a possibly-qualified relation name. An unqualified name
-// (no dot) is matched first directly, then against each schema in searchPath in
-// order, mirroring PostgREST's exposed-schema / search-path resolution.
+// Lookup resolves a relation name against the search path, trying each schema
+// in order. Request resolution passes the single active schema (selected by
+// the profile headers, defaulting to the first exposed schema), so a request
+// can never reach a relation outside it: PostgREST treats the path segment as
+// a bare name within the active schema, never as a qualified reference. With
+// an empty searchPath the name is matched directly against the model keys,
+// the mode introspection-internal callers use.
 func (m *Model) Lookup(name string, searchPath []string) (*Relation, bool) {
-	if r, ok := m.relations[name]; ok {
+	if len(searchPath) == 0 {
+		r, ok := m.relations[name]
 		return r, ok
 	}
-	if !strings.Contains(name, ".") {
-		for _, s := range searchPath {
-			if r, ok := m.relations[Key(s, name)]; ok {
-				return r, ok
-			}
+	for _, s := range searchPath {
+		if r, ok := m.relations[Key(s, name)]; ok {
+			return r, ok
 		}
 	}
 	return nil, false
+}
+
+// RelationsIn returns the relations of one schema in deterministic insertion
+// order. It is the per-schema view the OpenAPI root builds its document from,
+// so two same-named relations in different schemas can never collide there.
+func (m *Model) RelationsIn(schemaName string) []*Relation {
+	var out []*Relation
+	for _, k := range m.order {
+		if r := m.relations[k]; r.Schema == schemaName {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // Relations returns the relations in deterministic insertion order.

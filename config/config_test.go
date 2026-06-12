@@ -44,6 +44,26 @@ func TestDefaultsApplied(t *testing.T) {
 	}
 }
 
+func TestOpenAPISecurityActiveParsed(t *testing.T) {
+	c, err := FromMap(map[string]string{"db-uri": "file:x.db"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.OpenAPISecurityActive {
+		t.Error("openapi-security-active should default to false")
+	}
+	c, err = FromMap(map[string]string{"db-uri": "file:x.db", "openapi-security-active": "true"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.OpenAPISecurityActive {
+		t.Error("openapi-security-active = true not parsed")
+	}
+	if _, err = FromMap(map[string]string{"db-uri": "file:x.db", "openapi-security-active": "banana"}); err == nil {
+		t.Error("a non-boolean openapi-security-active should abort boot")
+	}
+}
+
 func TestDBURIRequired(t *testing.T) {
 	_, err := FromMap(map[string]string{})
 	if err == nil {
@@ -753,7 +773,7 @@ func TestSchemasDefaultFollowsBackend(t *testing.T) {
 		want    string
 	}{
 		{"postgres", "public"},
-		{"sqlite", "main"},
+		{"sqlite", ""},
 		{"mysql", ""},
 	}
 	for _, tc := range cases {

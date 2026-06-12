@@ -104,7 +104,8 @@ func (a *app) reloadConfig(environ []string) error {
 func (a *app) rebuildLocked() error {
 	srv := httpapi.NewServer(a.be, a.model, a.cfg.Schemas)
 	srv.SetDefaultRole(a.cfg.AnonRole)
-	srv.SetOpenAPI(a.cfg.OpenAPIMode, a.cfg.OpenAPIServerProxyURI)
+	srv.SetOpenAPI(a.cfg.OpenAPIMode, a.cfg.OpenAPIServerProxyURI, a.cfg.OpenAPISecurityActive)
+	srv.SetRootSpec(a.cfg.RootSpec)
 	srv.SetCORSAllowedOrigins(a.cfg.CORSAllowedOrigins)
 	srv.SetMaxRows(a.cfg.MaxRows)
 	srv.SetPlanEnabled(a.cfg.PlanEnabled)
