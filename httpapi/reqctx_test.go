@@ -67,7 +67,9 @@ func captureServer(t *testing.T) (*httpapi.Server, *captureBackend) {
 		t.Fatalf("introspect: %v", err)
 	}
 	cap := &captureBackend{Backend: be}
-	return httpapi.NewServer(cap, model, nil), cap
+	srv := httpapi.NewServer(cap, model, nil)
+	srv.SetDefaultRole("anon")
+	return srv, cap
 }
 
 func TestContextCarriesRequestMetadata(t *testing.T) {
@@ -116,6 +118,33 @@ func TestContextWriteUsesContentProfile(t *testing.T) {
 
 	if cap.got.Schema != "staging" {
 		t.Errorf("Schema = %q, want staging (from Content-Profile)", cap.got.Schema)
+	}
+}
+
+func TestContextCarriesPreRequest(t *testing.T) {
+	srv, cap := captureServer(t)
+	srv.SetPreRequest("check_request")
+
+	srv.ServeHTTP(newRecorder(), newReq(http.MethodGet, "/films?select=id"))
+	if cap.got == nil || cap.got.PreRequest != "check_request" {
+		t.Fatalf("read context PreRequest = %v, want check_request", cap.got)
+	}
+
+	cap.got = nil
+	srv.ServeHTTP(newRecorder(), newReqBody(http.MethodPost, "/films", `{"id":6,"title":"Heat"}`))
+	if cap.got == nil || cap.got.PreRequest != "check_request" {
+		t.Fatalf("write context PreRequest = %v, want check_request", cap.got)
+	}
+}
+
+func TestContextHasNoPreRequestByDefault(t *testing.T) {
+	srv, cap := captureServer(t)
+	srv.ServeHTTP(newRecorder(), newReq(http.MethodGet, "/films?select=id"))
+	if cap.got == nil {
+		t.Fatal("Execute never received a context")
+	}
+	if cap.got.PreRequest != "" {
+		t.Errorf("PreRequest = %q, want empty with none configured", cap.got.PreRequest)
 	}
 }
 

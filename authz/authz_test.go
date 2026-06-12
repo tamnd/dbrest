@@ -96,33 +96,69 @@ func TestExplicitForbiddenColumnDenied(t *testing.T) {
 	}
 }
 
-func TestStarNarrowedToGrantedColumns(t *testing.T) {
+// A star projection under a column-limited grant means SELECT every column,
+// which the grant does not cover. PostgreSQL raises 42501 for that and the
+// PostgREST maintainers rejected narrowing * to the granted set (issue #1732),
+// so the request is denied; the client must name the granted columns.
+func TestStarRejectedUnderColumnLimitedGrant(t *testing.T) {
 	reg := authz.NewRegistry(
 		[]authz.Grant{{Role: "web_user", Relation: "films", Action: authz.Select, Columns: []string{"id", "title"}}},
 		nil,
 	)
 	p := readPlan(star())
-	if err := reg.Authorize(&reqctx.Context{Role: "web_user"}, p); err != nil {
-		t.Fatalf("Authorize: %v", err)
+	err := reg.Authorize(&reqctx.Context{Role: "web_user"}, p)
+	if err == nil {
+		t.Fatal("star projection under a column-limited grant was allowed")
 	}
-	got := projectedNames(p.Query.Select)
-	want := []string{"id", "title"}
-	if !equal(got, want) {
-		t.Errorf("narrowed projection = %v, want %v", got, want)
+	if err.HTTPStatus != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", err.HTTPStatus)
+	}
+	if err.Code != "42501" {
+		t.Errorf("code = %q, want 42501", err.Code)
 	}
 }
 
-func TestEmptyProjectionNarrowedToGrantedColumns(t *testing.T) {
+func TestEmptyProjectionRejectedUnderColumnLimitedGrant(t *testing.T) {
 	reg := authz.NewRegistry(
 		[]authz.Grant{{Role: "web_user", Relation: "films", Action: authz.Select, Columns: []string{"title"}}},
 		nil,
 	)
-	p := readPlan() // no select items: whole-row projection
-	if err := reg.Authorize(&reqctx.Context{Role: "web_user"}, p); err != nil {
-		t.Fatalf("Authorize: %v", err)
+	p := readPlan() // no select items: whole-row projection, same as *
+	err := reg.Authorize(&reqctx.Context{Role: "web_user"}, p)
+	if err == nil {
+		t.Fatal("whole-row projection under a column-limited grant was allowed")
 	}
-	if got := projectedNames(p.Query.Select); !equal(got, []string{"title"}) {
-		t.Errorf("narrowed projection = %v, want [title]", got)
+	if err.HTTPStatus != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", err.HTTPStatus)
+	}
+}
+
+func TestStarRejectedForAnonIs401(t *testing.T) {
+	reg := authz.NewRegistry(
+		[]authz.Grant{{Role: "anon", Relation: "films", Action: authz.Select, Columns: []string{"id"}}},
+		nil,
+	)
+	p := readPlan(star())
+	err := reg.Authorize(&reqctx.Context{Role: "anon", Anonymous: true}, p)
+	if err == nil {
+		t.Fatal("anon star projection under a column-limited grant was allowed")
+	}
+	if err.HTTPStatus != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", err.HTTPStatus)
+	}
+}
+
+func TestGrantedColumnsProjectFine(t *testing.T) {
+	reg := authz.NewRegistry(
+		[]authz.Grant{{Role: "web_user", Relation: "films", Action: authz.Select, Columns: []string{"id", "title"}}},
+		nil,
+	)
+	p := readPlan(col("id"), col("title"))
+	if err := reg.Authorize(&reqctx.Context{Role: "web_user"}, p); err != nil {
+		t.Fatalf("Authorize denied a fully granted projection: %v", err)
+	}
+	if got := projectedNames(p.Query.Select); !equal(got, []string{"id", "title"}) {
+		t.Errorf("projection = %v, want untouched [id title]", got)
 	}
 }
 
@@ -459,7 +495,7 @@ func BenchmarkAuthorizeReadWithPolicy(b *testing.B) {
 			Query: &ir.Query{
 				Kind:     ir.Read,
 				Relation: ir.Ref{Schema: "public", Name: "films"},
-				Select:   []ir.SelectItem{star()},
+				Select:   []ir.SelectItem{col("id"), col("title")},
 			},
 		}
 		if err := reg.Authorize(rc, p); err != nil {

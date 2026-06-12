@@ -38,15 +38,18 @@ type Server struct {
 	role         string
 	verifier     *auth.Verifier
 	authz        *authz.Registry
+	preRequest   string
 	openapiMode  string
 	openapiProxy string
 }
 
 // NewServer builds a Server over a backend, its introspected model, and the
-// schema search path (the exposed schemas, in resolution order). It runs every
-// request as the anon role until a verifier is attached with SetVerifier.
+// schema search path (the exposed schemas, in resolution order). It has no
+// default role: until SetDefaultRole or SetVerifier provides an identity
+// source, every request is refused with 401 PGRST302, matching PostgREST's
+// fail-closed posture when db-anon-role is unset.
 func NewServer(b backend.Backend, model *schema.Model, searchPath []string) *Server {
-	return &Server{backend: b, model: model, searchPath: searchPath, role: "anon"}
+	return &Server{backend: b, model: model, searchPath: searchPath}
 }
 
 // SetOpenAPI configures the root document. mode is the openapi-mode option:
@@ -60,10 +63,9 @@ func (s *Server) SetOpenAPI(mode, proxyURI string) {
 	s.openapiProxy = proxyURI
 }
 
-// SetDefaultRole overrides the static role used for unauthenticated requests
-// when no verifier is configured. It should be called with the db-anon-role
-// option value so the server uses the configured anon role instead of the
-// hardcoded "anon" placeholder.
+// SetDefaultRole sets the static role used for unauthenticated requests when no
+// verifier is configured. It should be called with the db-anon-role option
+// value; left unset, tokenless requests are refused with 401 PGRST302.
 func (s *Server) SetDefaultRole(role string) {
 	if role != "" {
 		s.role = role
@@ -74,6 +76,12 @@ func (s *Server) SetDefaultRole(role string) {
 // request come from its bearer token (spec 13), and a bad token is rejected
 // before any query runs. With no verifier the server keeps the static role.
 func (s *Server) SetVerifier(v *auth.Verifier) { s.verifier = v }
+
+// SetPreRequest names the db-pre-request function carried to the backend on
+// every request context. The backend invokes it after the request context is
+// in place and before the main statement (spec 13); the caller is responsible
+// for refusing the option at startup on a backend that cannot honor it.
+func (s *Server) SetPreRequest(fn string) { s.preRequest = fn }
 
 // SetAuthz attaches an authorization registry. Once set, every read and write is
 // gated by the registry's table and column privileges and has any Row Level
@@ -107,21 +115,22 @@ type identity struct {
 // boundary (method, path, headers, cookies, and the selected schema). The
 // frontend builds it once after authentication; on the emulated backend the
 // values a policy references are later bound as parameters (spec 15).
-func buildContext(r *http.Request, id identity) *reqctx.Context {
+func (s *Server) buildContext(r *http.Request, id identity) *reqctx.Context {
 	cookies := r.Cookies()
 	jar := make(map[string]string, len(cookies))
 	for _, c := range cookies {
 		jar[c.Name] = c.Value
 	}
 	return &reqctx.Context{
-		Role:      id.role,
-		Anonymous: id.anonymous,
-		Claims:    id.claims,
-		Method:    r.Method,
-		Path:      r.URL.Path,
-		Headers:   r.Header,
-		Cookies:   jar,
-		Schema:    requestSchema(r),
+		Role:       id.role,
+		Anonymous:  id.anonymous,
+		Claims:     id.claims,
+		Method:     r.Method,
+		Path:       r.URL.Path,
+		Headers:    r.Header,
+		Cookies:    jar,
+		Schema:     requestSchema(r),
+		PreRequest: s.preRequest,
 	}
 }
 
@@ -153,9 +162,14 @@ func applyControls(w http.ResponseWriter, rc *reqctx.ResponseControls, def int) 
 
 // authenticate resolves the request identity from the Authorization header. With
 // no verifier it is the static default role; otherwise the verifier maps the
-// bearer token to a role (or anon), or returns the 401/403 the token earns.
+// bearer token to a role (or anon), or returns the 401/403 the token earns. The
+// no-verifier path fails closed: with no default role configured, tokenless
+// requests are refused with 401 PGRST302 rather than run as anyone.
 func (s *Server) authenticate(r *http.Request) (identity, *pgerr.APIError) {
 	if s.verifier == nil {
+		if s.role == "" {
+			return identity{}, pgerr.ErrJWTRequired()
+		}
 		return identity{role: s.role, anonymous: true}, nil
 	}
 	res, apiErr := s.verifier.Authenticate(r.Header.Get("Authorization"))
@@ -267,7 +281,7 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 		}
 	}
 
-	rc := buildContext(r, id)
+	rc := s.buildContext(r, id)
 	res, err := s.backend.Execute(r.Context(), planned, rc)
 	if err != nil {
 		writeError(w, mapExecError(s.backend, err, id.anonymous))
@@ -354,7 +368,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity)
 		return
 	}
 
-	rc := buildContext(r, id)
+	rc := s.buildContext(r, id)
 
 	if apiErr := s.authorize(rc, planned); apiErr != nil {
 		writeError(w, apiErr)
@@ -430,7 +444,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.Que
 		return
 	}
 
-	rc := buildContext(r, id)
+	rc := s.buildContext(r, id)
 	if apiErr := s.authorize(rc, planned); apiErr != nil {
 		writeError(w, apiErr)
 		return
@@ -675,6 +689,9 @@ func mapExecError(b backend.Backend, err error, anonymous bool) *pgerr.APIError 
 	if anonymous && e.Code == pgerr.CodeInsufficientPrivilege {
 		lifted := *e
 		lifted.HTTPStatus = http.StatusUnauthorized
+		// PostgREST sends the bare Bearer challenge on every 401, including a
+		// privilege denial lifted from 403 for an unauthenticated request.
+		lifted.WWWAuthenticate = "Bearer"
 		return &lifted
 	}
 	return e

@@ -43,6 +43,12 @@ type Context struct {
 	// Content-Profile choice), or "" for the default. Cross-schema routing is the
 	// introspection subsystem's job (spec 08); this field carries the choice.
 	Schema string
+	// PreRequest names the db-pre-request function the backend must invoke after
+	// the request context is in place and before the main statement, in the same
+	// transaction (spec 13). Empty means none is configured. An error the
+	// function raises aborts the request through normal error mapping, and any
+	// response controls it writes are applied at render time.
+	PreRequest string
 
 	controls ResponseControls
 }

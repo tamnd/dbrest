@@ -9,6 +9,7 @@ package pgerr
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 )
 
 // APIError is the canonical error value. It carries the wire envelope
@@ -20,6 +21,11 @@ import (
 type APIError struct {
 	// HTTPStatus is the HTTP status code. It is not part of the JSON body.
 	HTTPStatus int `json:"-"`
+	// WWWAuthenticate, when set, is emitted as the WWW-Authenticate response
+	// header. PostgREST sends it on every 401: the RFC 6750 invalid_token form
+	// on PGRST301/PGRST303 and the bare "Bearer" challenge otherwise. It is not
+	// part of the JSON body.
+	WWWAuthenticate string `json:"-"`
 	// Code is the PGRST code (or a backend SQLSTATE passed through).
 	Code string `json:"code"`
 	// Message is the human-facing summary.
@@ -107,16 +113,26 @@ func (e *APIError) JSON() []byte {
 }
 
 // Write renders e onto w: it sets the JSON content type, the Proxy-Status
-// header, and the status, then writes the envelope. It is the single place an
-// error reaches the client. v14 adds Proxy-Status to every error response so a
-// HEAD request, whose status alone is not descriptive enough, still names the
-// error code; the "PostgREST" identifier is kept byte-identical for wire
-// compatibility.
+// header, the WWW-Authenticate challenge when one is carried, and the status,
+// then writes the envelope. It is the single place an error reaches the
+// client. v14 adds Proxy-Status to every error response so a HEAD request,
+// whose status alone is not descriptive enough, still names the error code;
+// the "PostgREST" identifier is kept byte-identical for wire compatibility.
 func (e *APIError) Write(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Proxy-Status", "PostgREST; error="+e.Code)
+	if e.WWWAuthenticate != "" {
+		w.Header().Set("WWW-Authenticate", e.WWWAuthenticate)
+	}
 	w.WriteHeader(e.HTTPStatus)
 	_, _ = w.Write(e.JSON())
+}
+
+// BearerInvalidToken renders the RFC 6750 challenge PostgREST sends with a JWT
+// decode or claims error: Bearer error="invalid_token" with the error message
+// quoted into error_description.
+func BearerInvalidToken(msg string) string {
+	return `Bearer error="invalid_token", error_description=` + strconv.Quote(msg)
 }
 
 // New builds an APIError from its parts.

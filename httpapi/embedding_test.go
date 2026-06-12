@@ -66,7 +66,9 @@ func newEmbedServer(t testing.TB) *httpapi.Server {
 	if err != nil {
 		t.Fatalf("introspect: %v", err)
 	}
-	return httpapi.NewServer(be, model, nil)
+	srv := httpapi.NewServer(be, model, nil)
+	srv.SetDefaultRole("anon")
+	return srv
 }
 
 func TestEmbedToOneObject(t *testing.T) {

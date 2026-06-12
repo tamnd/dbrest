@@ -46,7 +46,9 @@ func fixtureServer(t *testing.T) (*httpapi.Server, sqliteCaps) {
 	if err != nil {
 		t.Fatalf("introspect: %v", err)
 	}
-	return httpapi.NewServer(be, model, nil), sqliteCaps{be}
+	srv := httpapi.NewServer(be, model, nil)
+	srv.SetDefaultRole("anon")
+	return srv, sqliteCaps{be}
 }
 
 // sqliteCaps wraps the backend so a test can read its declared capabilities.

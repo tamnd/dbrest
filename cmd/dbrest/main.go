@@ -10,9 +10,11 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/tamnd/dbrest/auth"
+	"github.com/tamnd/dbrest/authz"
 	"github.com/tamnd/dbrest/backend"
 	_ "github.com/tamnd/dbrest/backend/mongo"
 	_ "github.com/tamnd/dbrest/backend/mysql"
@@ -61,6 +63,12 @@ func run() error {
 	if err := attachAuth(srv, cfg); err != nil {
 		return err
 	}
+	if err := attachPreRequest(srv, be, cfg); err != nil {
+		return err
+	}
+	if err := attachAuthz(srv, cfg); err != nil {
+		return err
+	}
 
 	log.Printf("dbrest listening on %s (backend %s, %d relations)", cfg.ServerAddr(), cfg.Backend, model.Len())
 	if err := http.ListenAndServe(cfg.ServerAddr(), srv); err != nil {
@@ -94,15 +102,68 @@ func openBackend(cfg *config.Config) (backend.Backend, error) {
 	return be, nil
 }
 
-// attachAuth wires a JWT verifier onto the server when a key is configured.
-// With no key material the server runs every request as the static anon role,
-// which is the PostgREST behavior for an unconfigured jwt-secret.
-func attachAuth(srv *httpapi.Server, cfg *config.Config) error {
-	if cfg.JWTSecret == "" && cfg.JWKSet == "" {
+// attachPreRequest wires the db-pre-request option. The function name rides the
+// request context so the backend can invoke it after the session settings and
+// before the main statement (spec 13). A backend that cannot honor it must not
+// silently drop the option, since deployments use db-pre-request for blocking
+// and custom auth; with no backend support declared, startup is refused.
+func attachPreRequest(srv *httpapi.Server, be backend.Backend, cfg *config.Config) error {
+	if cfg.PreRequest == "" {
 		return nil
 	}
+	if pr, ok := be.(interface{ SupportsPreRequest() bool }); ok && pr.SupportsPreRequest() {
+		srv.SetPreRequest(cfg.PreRequest)
+		return nil
+	}
+	return fmt.Errorf("db-pre-request: the %s backend cannot run a pre-request function; unset the option", cfg.Backend)
+}
+
+// attachAuthz wires the emulated authorization layer from the policy-registry
+// option. With no registry configured the gate stays off, which mirrors a
+// database where every role holds every privilege; declaring a registry flips
+// the model, and from then on the absence of a grant is a denial. A registry
+// the parser cannot fully understand is a startup error, never a silently
+// thinner rule set. Postgres delegates privileges and RLS to the engine, so a
+// registry configured there is a misconfiguration and is refused too.
+func attachAuthz(srv *httpapi.Server, cfg *config.Config) error {
+	if cfg.PolicyRegistry == "" {
+		return nil
+	}
+	if cfg.Backend == "postgres" {
+		return fmt.Errorf("policy-registry: the postgres backend enforces grants and RLS natively; manage them in the database and unset the option")
+	}
+	reg, err := authz.ParseRegistry(cfg.PolicyRegistry)
+	if err != nil {
+		return err
+	}
+	srv.SetAuthz(reg)
+	return nil
+}
+
+// attachAuth wires a JWT verifier onto the server. The verifier is always
+// attached so the server fails closed the way PostgREST does: with no key
+// material a presented token is a 500 PGRST300, and with no anon role a
+// tokenless request is a 401 PGRST302. The jwt-secret value is read the
+// PostgREST way (JWK Set, JWK, or text secret), optionally base64-decoded
+// first, and an unusable key configuration is a startup error.
+func attachAuth(srv *httpapi.Server, cfg *config.Config) error {
+	secret := []byte(cfg.JWTSecret)
+	if v := os.Getenv("PGRST_JWT_SECRET_IS_BASE64"); v != "" {
+		isB64, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("jwt-secret-is-base64: %w", err)
+		}
+		if isB64 && cfg.JWTSecret != "" {
+			decoded, err := auth.DecodeBase64Secret(cfg.JWTSecret)
+			if err != nil {
+				return fmt.Errorf("jwt-secret-is-base64: %w", err)
+			}
+			secret = decoded
+		}
+	}
 	v, err := auth.NewVerifier(auth.Config{
-		Secret:          []byte(cfg.JWTSecret),
+		Secret:          secret,
+		JWKSet:          cfg.JWKSet,
 		Audience:        cfg.JWTAud,
 		RoleClaimKey:    cfg.JWTRoleClaimKey,
 		AnonRole:        cfg.AnonRole,

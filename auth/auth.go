@@ -1,7 +1,7 @@
 // Package auth verifies JSON Web Tokens and resolves the request role, the
 // single piece of PostgREST's stateless auth model that lives in the frontend
 // (spec 13). It is backend-agnostic: the signature and algorithm checks, the
-// exp/nbf/iat/aud validation, the role resolution, and the PGRST301/PGRST302
+// exp/nbf/iat/aud validation, the role resolution, and the PGRST301/302/303
 // codes are produced here and are byte-identical on every engine. Only the
 // unobservable role switch differs per backend, which this package never touches.
 //
@@ -13,9 +13,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -39,15 +41,23 @@ type Config struct {
 	// Empty derives the set from the configured keys. "none" is never accepted and
 	// is rejected if listed explicitly.
 	AllowedAlgs []string
-	// Secret is the shared HMAC secret. When set it must be at least 32 bytes.
+	// Secret is the jwt-secret value. As in PostgREST it is read three ways: a
+	// JWK Set JSON, a single JWK JSON, or a plain text HMAC secret (which must
+	// be at least 32 bytes).
 	Secret []byte
+	// JWKSet is an explicit JWK Set (or single JWK) JSON. Unlike Secret it has
+	// no text fallback: an unparseable value is a startup error.
+	JWKSet string
 	// PublicKeyPEM is a PEM-encoded RSA or ECDSA public key (the static key source
 	// for the asymmetric families).
 	PublicKeyPEM string
 	// Audience, when set, must appear in the token's aud claim.
 	Audience string
-	// RoleClaimKey names the claim the request role is read from; default "role".
-	// A leading-dot dotted path (".app_metadata.role") reads a nested claim.
+	// RoleClaimKey names the claim the request role is read from; default ".role".
+	// The value is a JSPath expression: dotted keys (".app_metadata.role"), quoted
+	// keys (."https://example.com/role"), array indexes (".roles[0]"), and a
+	// trailing filter (".roles[?(@ == \"admin\")]"). An invalid value is a
+	// startup error.
 	RoleClaimKey string
 	// AnonRole is the role an unauthenticated or role-less request runs as. Empty
 	// means such requests are refused rather than run as the connection identity.
@@ -77,13 +87,11 @@ type Result struct {
 // itself.
 type Verifier struct {
 	validMethods []string
-	hmac         []byte
-	rsa          *rsa.PublicKey
-	ecdsa        *ecdsa.PublicKey
+	keys         []verKey
 	hasKeys      bool
 
 	audience    string
-	roleKeyPath []string
+	roleKeyPath []jsPathExp
 	anonRole    string
 	permitted   map[string]bool
 	skew        time.Duration
@@ -110,21 +118,32 @@ func NewVerifier(cfg Config) (*Verifier, error) {
 	for _, r := range cfg.PermittedRoles {
 		v.permitted[r] = true
 	}
-	v.roleKeyPath = parseRoleKey(cfg.RoleClaimKey)
+	roleKey, err := parseJSPath(cfg.RoleClaimKey)
+	if err != nil {
+		return nil, err
+	}
+	v.roleKeyPath = roleKey
 
 	if len(cfg.Secret) > 0 {
-		if len(cfg.Secret) < minHMACSecret {
-			return nil, errors.New("jwt-secret must be at least 32 characters")
+		keys, err := parseSecretKeys(cfg.Secret)
+		if err != nil {
+			return nil, err
 		}
-		v.hmac = cfg.Secret
-		v.hasKeys = true
+		v.keys = append(v.keys, keys...)
+	}
+	if cfg.JWKSet != "" {
+		keys, err := parseJWKSet(cfg.JWKSet)
+		if err != nil {
+			return nil, fmt.Errorf("jwk-set: %w", err)
+		}
+		v.keys = append(v.keys, keys...)
 	}
 	if cfg.PublicKeyPEM != "" {
 		if err := v.loadPublicKey(cfg.PublicKeyPEM); err != nil {
 			return nil, err
 		}
-		v.hasKeys = true
 	}
+	v.hasKeys = len(v.keys) > 0
 
 	methods, err := v.resolveMethods(cfg.AllowedAlgs)
 	if err != nil {
@@ -139,21 +158,30 @@ func NewVerifier(cfg Config) (*Verifier, error) {
 }
 
 // Authenticate resolves the identity of a request from its Authorization header
-// value. No bearer token runs as anon; an expired token is PGRST301; any other
-// verification failure is PGRST302; a valid token naming a forbidden role is 403.
-// When no key material is configured, verification is disabled and every request
-// runs as anon, matching PostgREST with no jwt-secret.
+// value. No bearer token runs as anon; a token that cannot be decoded is
+// PGRST301; a decoded token failing claims validation is PGRST303; a valid
+// token naming a forbidden role is 403.
+// When no key material is configured the server fails closed, as PostgREST
+// does: a presented token is a 500 PGRST300, never silently accepted.
 func (v *Verifier) Authenticate(authHeader string) (*Result, *pgerr.APIError) {
 	raw, ok := bearer(authHeader)
-	if !ok || !v.hasKeys {
+	if !ok {
 		return v.anon()
+	}
+	if raw == "" {
+		// A bearer scheme with nothing after it is a malformed credential, not
+		// an anonymous request: PostgREST answers PGRST301 with this message.
+		return nil, pgerr.ErrJWTDecode("Empty JWT is sent in Authorization header")
+	}
+	if !v.hasKeys {
+		return nil, pgerr.ErrJWTSecretMissing()
 	}
 
 	if v.cache != nil {
 		if claims, hit := v.cache.get(raw); hit {
-			// A cached entry never extends a token's life: the time claims are
-			// re-checked against the live clock on every request (spec 13).
-			if apiErr := v.checkTime(claims); apiErr != nil {
+			// A cached entry never extends a token's life: the claims are
+			// re-validated against the live clock on every request (spec 13).
+			if apiErr := v.validateClaims(claims); apiErr != nil {
 				return nil, apiErr
 			}
 			return v.resolve(claims)
@@ -171,81 +199,234 @@ func (v *Verifier) Authenticate(authHeader string) (*Result, *pgerr.APIError) {
 }
 
 // verify checks the signature, the pinned algorithm, and the time and audience
-// claims with skew, returning the claim set or a JWT error. The error message is
-// fixed text: the token and the secret are never reflected back to the client.
+// claims with skew, returning the claim set or a JWT error. The error messages
+// are PostgREST's fixed texts: the token and the secret are never reflected
+// back to the client.
 func (v *Verifier) verify(raw string) (map[string]any, *pgerr.APIError) {
+	if n := strings.Count(raw, ".") + 1; n != 3 {
+		return nil, pgerr.ErrJWTDecode(fmt.Sprintf("Expected 3 parts in JWT; got %d", n))
+	}
+	if apiErr := v.checkAlg(raw); apiErr != nil {
+		return nil, apiErr
+	}
 	claims := jwt.MapClaims{}
+	// Claims validation is done by validateClaims below, not by the library:
+	// PostgREST's rules differ (an absent or empty aud passes, iat is checked,
+	// and the type errors carry their own PGRST303 messages).
 	opts := []jwt.ParserOption{
 		jwt.WithValidMethods(v.validMethods),
-		jwt.WithLeeway(v.skew),
-		jwt.WithTimeFunc(v.now),
-	}
-	if v.audience != "" {
-		opts = append(opts, jwt.WithAudience(v.audience))
+		jwt.WithoutClaimsValidation(),
 	}
 	if _, err := jwt.NewParser(opts...).ParseWithClaims(raw, claims, v.keyfunc); err != nil {
-		if errors.Is(err, jwt.ErrTokenExpired) {
-			return nil, pgerr.ErrJWTExpired()
-		}
-		return nil, pgerr.ErrJWTInvalid("JWT invalid")
+		return nil, mapJWTError(err)
+	}
+	if apiErr := v.validateClaims(claims); apiErr != nil {
+		return nil, apiErr
 	}
 	return map[string]any(claims), nil
 }
 
-// keyfunc returns the verification key for the token's algorithm family. The
-// allowed-methods parser option already blocks a disallowed alg before this runs,
-// so the algorithm-confusion swap (an RS token verified against an HMAC secret)
-// cannot reach a key of the wrong family.
-func (v *Verifier) keyfunc(t *jwt.Token) (any, error) {
-	switch t.Method.(type) {
-	case *jwt.SigningMethodHMAC:
-		if v.hmac == nil {
-			return nil, errors.New("no HMAC key configured")
+// checkAlg reads the unverified alg header of a compact JWT and rejects a value
+// outside the pinned method set before any cryptography runs. The three failure
+// shapes carry PostgREST's exact messages: an unsecured token, an alg the
+// library does not know, and a known alg with no matching key.
+func (v *Verifier) checkAlg(raw string) *pgerr.APIError {
+	headerPart := raw[:strings.IndexByte(raw, '.')]
+	headerJSON, err := base64.RawURLEncoding.DecodeString(headerPart)
+	if err != nil {
+		return pgerr.ErrJWTDecode("JWT cryptographic operation failed")
+	}
+	var header struct {
+		Alg string `json:"alg"`
+	}
+	if err := json.Unmarshal(headerJSON, &header); err != nil {
+		return pgerr.ErrJWTDecode("JWT cryptographic operation failed")
+	}
+	if strings.EqualFold(header.Alg, "none") {
+		return pgerr.ErrJWTDecode("Wrong or unsupported encoding algorithm").
+			WithDetails("JWT is unsecured but expected 'alg' was not 'none'")
+	}
+	if jwt.GetSigningMethod(header.Alg) == nil {
+		return pgerr.ErrJWTDecode("JWT cryptographic operation failed")
+	}
+	for _, m := range v.validMethods {
+		if header.Alg == m {
+			return nil
 		}
-		return v.hmac, nil
-	case *jwt.SigningMethodRSA:
-		if v.rsa == nil {
-			return nil, errors.New("no RSA key configured")
-		}
-		return v.rsa, nil
-	case *jwt.SigningMethodECDSA:
-		if v.ecdsa == nil {
-			return nil, errors.New("no ECDSA key configured")
-		}
-		return v.ecdsa, nil
+	}
+	return pgerr.ErrJWTDecode("No suitable key or wrong key type").
+		WithDetails("No suitable key was found to decode the JWT")
+}
+
+// mapJWTError translates a golang-jwt failure onto the v14 code split: claim
+// validation failures are PGRST303, everything that prevented decoding or
+// verifying the token is PGRST301. The messages are PostgREST's own.
+func mapJWTError(err error) *pgerr.APIError {
+	switch {
+	case errors.Is(err, jwt.ErrTokenExpired):
+		return pgerr.ErrJWTClaims("JWT expired")
+	case errors.Is(err, jwt.ErrTokenNotValidYet):
+		return pgerr.ErrJWTClaims("JWT not yet valid")
+	case errors.Is(err, jwt.ErrTokenUsedBeforeIssued):
+		return pgerr.ErrJWTClaims("JWT issued at future")
+	case errors.Is(err, jwt.ErrTokenInvalidAudience):
+		return pgerr.ErrJWTClaims("JWT not in audience")
+	case errors.Is(err, jwt.ErrTokenInvalidClaims):
+		return pgerr.ErrJWTClaims("Parsing claims failed")
+	case errors.Is(err, jwt.ErrTokenSignatureInvalid):
+		return pgerr.ErrJWTDecode("No suitable key or wrong key type").
+			WithDetails("None of the keys was able to decode the JWT")
+	case errors.Is(err, jwt.ErrTokenUnverifiable):
+		return pgerr.ErrJWTDecode("No suitable key or wrong key type").
+			WithDetails("No suitable key was found to decode the JWT")
 	default:
-		return nil, errors.New("unsupported signing method")
+		return pgerr.ErrJWTDecode("JWT cryptographic operation failed")
 	}
 }
 
-// checkTime re-validates the exp and nbf claims against the live clock with the
-// configured skew. It runs on a cache hit so a cached verification can never
-// resurrect an expired token.
-func (v *Verifier) checkTime(claims map[string]any) *pgerr.APIError {
-	now := v.now()
-	if exp, ok := numClaim(claims, "exp"); ok {
-		if now.After(time.Unix(exp, 0).Add(v.skew)) {
-			return pgerr.ErrJWTExpired()
+// keyfunc selects the verification keys for a token. A kid header narrows the
+// set to the keys carrying that kid; a kid-less token tries every key of the
+// right family in turn, as the upstream jose library does. The allowed-methods
+// parser option already blocks a disallowed alg before this runs, so the
+// algorithm-confusion swap (an RS token verified against an HMAC secret)
+// cannot reach a key of the wrong family.
+func (v *Verifier) keyfunc(t *jwt.Token) (any, error) {
+	kid, _ := t.Header["kid"].(string)
+	set := jwt.VerificationKeySet{}
+	for _, k := range v.keys {
+		if kid != "" && k.kid != kid {
+			continue
+		}
+		if k.alg != "" && k.alg != t.Method.Alg() {
+			continue
+		}
+		if !methodMatchesKey(t.Method, k.key) {
+			continue
+		}
+		set.Keys = append(set.Keys, k.key)
+	}
+	switch len(set.Keys) {
+	case 0:
+		return nil, errors.New("no suitable key was found to decode the JWT")
+	case 1:
+		return set.Keys[0], nil
+	default:
+		return set, nil
+	}
+}
+
+// methodMatchesKey reports whether a verification key belongs to the family of
+// a signing method.
+func methodMatchesKey(method jwt.SigningMethod, key any) bool {
+	switch method.(type) {
+	case *jwt.SigningMethodHMAC:
+		_, ok := key.([]byte)
+		return ok
+	case *jwt.SigningMethodRSA, *jwt.SigningMethodRSAPSS:
+		_, ok := key.(*rsa.PublicKey)
+		return ok
+	case *jwt.SigningMethodECDSA:
+		_, ok := key.(*ecdsa.PublicKey)
+		return ok
+	}
+	return false
+}
+
+// validateClaims applies PostgREST's claim checks in its order: exp, nbf, iat,
+// then aud, each with the 30 second skew. An absent or null claim passes; a
+// present claim of the wrong type is its own PGRST303 error. It runs on every
+// request, including cache hits, so a cached verification can never resurrect
+// an expired token.
+func (v *Verifier) validateClaims(claims map[string]any) *pgerr.APIError {
+	now := v.now().Unix()
+	skew := int64(v.skew / time.Second)
+
+	if val, ok := presentClaim(claims, "exp"); ok {
+		exp, isNum := claimNumber(val)
+		if !isNum {
+			return pgerr.ErrJWTClaims("The JWT 'exp' claim must be a number")
+		}
+		if now-skew > exp {
+			return pgerr.ErrJWTClaims("JWT expired")
 		}
 	}
-	if nbf, ok := numClaim(claims, "nbf"); ok {
-		if now.Before(time.Unix(nbf, 0).Add(-v.skew)) {
-			return pgerr.ErrJWTInvalid("JWT invalid")
+	if val, ok := presentClaim(claims, "nbf"); ok {
+		nbf, isNum := claimNumber(val)
+		if !isNum {
+			return pgerr.ErrJWTClaims("The JWT 'nbf' claim must be a number")
+		}
+		if now+skew < nbf {
+			return pgerr.ErrJWTClaims("JWT not yet valid")
+		}
+	}
+	if val, ok := presentClaim(claims, "iat"); ok {
+		iat, isNum := claimNumber(val)
+		if !isNum {
+			return pgerr.ErrJWTClaims("The JWT 'iat' claim must be a number")
+		}
+		if now+skew < iat {
+			return pgerr.ErrJWTClaims("JWT issued at future")
+		}
+	}
+	if val, ok := presentClaim(claims, "aud"); ok {
+		if apiErr := v.checkAud(val); apiErr != nil {
+			return apiErr
 		}
 	}
 	return nil
 }
 
-// resolve reads the role from the claims and applies the anon fallback and the
-// permitted-role check. A valid token that resolves to no role and has no anon
-// fallback is refused; a role outside the permitted set is a 403.
-func (v *Verifier) resolve(claims map[string]any) (*Result, *pgerr.APIError) {
-	role := roleFromClaims(claims, v.roleKeyPath)
-	if role == "" {
-		role = v.anonRole
+// checkAud validates the aud claim the PostgREST way: a string must match the
+// configured audience, an array passes when empty or when any element matches,
+// and anything else is a type error. With no jwt-aud configured every audience
+// matches.
+func (v *Verifier) checkAud(val any) *pgerr.APIError {
+	switch aud := val.(type) {
+	case string:
+		if !v.audMatches(aud) {
+			return pgerr.ErrJWTClaims("JWT not in audience")
+		}
+	case []any:
+		matched := len(aud) == 0
+		for _, el := range aud {
+			s, isStr := el.(string)
+			if !isStr {
+				return pgerr.ErrJWTClaims("The JWT 'aud' claim must be a string or an array of strings")
+			}
+			if v.audMatches(s) {
+				matched = true
+			}
+		}
+		if !matched {
+			return pgerr.ErrJWTClaims("JWT not in audience")
+		}
+	default:
+		return pgerr.ErrJWTClaims("The JWT 'aud' claim must be a string or an array of strings")
 	}
-	if role == "" {
-		return nil, errAnonDisabled()
+	return nil
+}
+
+// audMatches reports whether a token audience satisfies the configured jwt-aud.
+// An unset jwt-aud accepts every audience.
+func (v *Verifier) audMatches(aud string) bool {
+	return v.audience == "" || v.audience == aud
+}
+
+// resolve reads the role from the claims and applies the anon fallback and the
+// permitted-role check. Only a genuinely absent role claim falls back to the
+// anonymous role: a present claim of any other type is rendered to text and
+// used as the role name, exactly as PostgREST does (the engine or the authz
+// registry then denies a role that does not exist, rather than the client
+// being silently downgraded to anonymous data). A valid token that resolves
+// to no role and has no anon fallback is refused; a role outside the
+// permitted set is a 403.
+func (v *Verifier) resolve(claims map[string]any) (*Result, *pgerr.APIError) {
+	role, present := roleFromClaims(claims, v.roleKeyPath)
+	if !present {
+		role = v.anonRole
+		if role == "" {
+			return nil, errAnonDisabled()
+		}
 	}
 	if apiErr := v.checkPermitted(role); apiErr != nil {
 		return nil, apiErr
@@ -272,10 +453,10 @@ func (v *Verifier) anon() (*Result, *pgerr.APIError) {
 }
 
 // errAnonDisabled is the 401 a request gets when it presents no usable identity
-// and no anon role is configured, so it cannot be run as anyone.
+// and no anon role is configured, so it cannot be run as anyone. The message is
+// PostgREST's exact PGRST302 text.
 func errAnonDisabled() *pgerr.APIError {
-	return pgerr.ErrJWTInvalid("anonymous access is disabled").
-		WithMessage("no JWT was sent and no anonymous role is configured")
+	return pgerr.ErrJWTRequired()
 }
 
 // loadPublicKey parses a PEM-encoded RSA or ECDSA public key into the verifier.
@@ -289,10 +470,8 @@ func (v *Verifier) loadPublicKey(pemText string) error {
 		return errors.New("jwt public key is not a valid PKIX key")
 	}
 	switch k := key.(type) {
-	case *rsa.PublicKey:
-		v.rsa = k
-	case *ecdsa.PublicKey:
-		v.ecdsa = k
+	case *rsa.PublicKey, *ecdsa.PublicKey:
+		v.keys = append(v.keys, verKey{key: k})
 	default:
 		return errors.New("jwt public key is neither RSA nor ECDSA")
 	}
@@ -310,64 +489,90 @@ func (v *Verifier) resolveMethods(allowed []string) ([]string, error) {
 		}
 		return allowed, nil
 	}
+	var hmac, rsaKey, ecdsaKey bool
+	for _, k := range v.keys {
+		switch k.key.(type) {
+		case []byte:
+			hmac = true
+		case *rsa.PublicKey:
+			rsaKey = true
+		case *ecdsa.PublicKey:
+			ecdsaKey = true
+		}
+	}
 	var methods []string
-	if v.hmac != nil {
+	if hmac {
 		methods = append(methods, "HS256", "HS384", "HS512")
 	}
-	if v.rsa != nil {
-		methods = append(methods, "RS256", "RS384", "RS512")
+	if rsaKey {
+		methods = append(methods, "RS256", "RS384", "RS512", "PS256", "PS384", "PS512")
 	}
-	if v.ecdsa != nil {
+	if ecdsaKey {
 		methods = append(methods, "ES256", "ES384", "ES512")
 	}
 	return methods, nil
 }
 
-// bearer extracts the token from an Authorization header value, accepting the
-// "Bearer" scheme case-insensitively. It reports false for any other header.
+// bearer extracts the token from an Authorization header value, mirroring the
+// wai-extra extractBearerAuth PostgREST uses: the first whitespace ends the
+// scheme word, the comparison is case-insensitive, and the token is whatever
+// follows the leading whitespace, possibly empty. It reports false only when
+// the credentials are not a bearer scheme at all, which is the anonymous
+// path; "Bearer" with an empty token reports true so the caller can answer
+// PGRST301 instead of downgrading the client to anon.
 func bearer(header string) (string, bool) {
-	const scheme = "bearer "
-	if len(header) < len(scheme) || !strings.EqualFold(header[:len(scheme)], scheme) {
+	scheme, rest := header, ""
+	if i := strings.IndexAny(header, " \t"); i >= 0 {
+		scheme, rest = header[:i], header[i+1:]
+	}
+	if !strings.EqualFold(scheme, "Bearer") {
 		return "", false
 	}
-	tok := strings.TrimSpace(header[len(scheme):])
-	return tok, tok != ""
+	return strings.TrimLeft(rest, " \t"), true
 }
 
-// parseRoleKey splits a role-claim key into a path of map keys. A leading dot is
-// optional; an empty key defaults to the single segment "role".
-func parseRoleKey(key string) []string {
-	key = strings.TrimPrefix(strings.TrimSpace(key), ".")
-	if key == "" {
-		return []string{"role"}
+// roleFromClaims walks the role-claim JSPath over the claim set, reporting
+// whether the path resolved to a value at all. A resolved value is rendered
+// the way PostgREST renders a claim where text is expected: a string is taken
+// bare, anything else (a number, bool, null, array, or object) becomes its
+// compact JSON text and is used as the role name verbatim.
+func roleFromClaims(claims map[string]any, path []jsPathExp) (string, bool) {
+	val, ok := walkJSPath(claims, path)
+	if !ok {
+		return "", false
 	}
-	return strings.Split(key, ".")
+	return unquoted(val), true
 }
 
-// roleFromClaims walks the claim path and returns the string value at its end,
-// or "" if any segment is missing or the value is not a string.
-func roleFromClaims(claims map[string]any, path []string) string {
-	var cur any = claims
-	for _, seg := range path {
-		m, ok := cur.(map[string]any)
-		if !ok {
-			return ""
-		}
-		cur, ok = m[seg]
-		if !ok {
-			return ""
-		}
-	}
-	if s, ok := cur.(string); ok {
+// unquoted renders a claim value as the text PostgREST would use it as: a
+// string stays bare, every other JSON value is its compact rendering ("null",
+// "42", "true", "[\"a\"]").
+func unquoted(val any) string {
+	if s, ok := val.(string); ok {
 		return s
 	}
-	return ""
+	b, err := json.Marshal(val)
+	if err != nil {
+		return fmt.Sprint(val)
+	}
+	return string(b)
 }
 
-// numClaim reads a numeric claim as a Unix-seconds int64, handling the float64
-// and json.Number forms a decoded claim set can carry.
-func numClaim(claims map[string]any, name string) (int64, bool) {
-	switch t := claims[name].(type) {
+// presentClaim reports a claim's value when it is present and non-null. An
+// absent or null claim is skipped by every check, as upstream.
+func presentClaim(claims map[string]any, name string) (any, bool) {
+	val, ok := claims[name]
+	if !ok || val == nil {
+		return nil, false
+	}
+	return val, true
+}
+
+// claimNumber reads a numeric claim value as Unix seconds, handling the
+// float64 and json.Number forms a decoded claim set can carry. A non-number is
+// reported false and becomes the claim's PGRST303 type error.
+func claimNumber(val any) (int64, bool) {
+	switch t := val.(type) {
 	case float64:
 		return int64(t), true
 	case int64:
@@ -375,6 +580,9 @@ func numClaim(claims map[string]any, name string) (int64, bool) {
 	case json.Number:
 		if n, err := t.Int64(); err == nil {
 			return n, true
+		}
+		if f, err := t.Float64(); err == nil {
+			return int64(f), true
 		}
 	}
 	return 0, false
