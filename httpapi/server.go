@@ -42,6 +42,7 @@ type Server struct {
 	openapiProxy string
 	corsOrigins  []string // server-cors-allowed-origins; empty means any
 	maxRows      int      // db-max-rows; 0 means no cap
+	planEnabled  bool     // db-plan-enabled; plans are off by default
 }
 
 // NewServer builds a Server over a backend, its introspected model, and the
@@ -99,6 +100,13 @@ func (s *Server) capLimit(limit *int) *int {
 // list (the server-cors-allowed-origins option). With an empty list the server
 // keeps the PostgREST default: any origin is accepted.
 func (s *Server) SetCORSAllowedOrigins(origins []string) { s.corsOrigins = origins }
+
+// SetPlanEnabled applies the db-plan-enabled option. Execution plans leak
+// schema and statistics detail, so PostgREST only honors the
+// application/vnd.pgrst.plan+json media type when the option is on; the
+// default is off, and a plan request then fails the same way as any other
+// unproducible media type.
+func (s *Server) SetPlanEnabled(on bool) { s.planEnabled = on }
 
 // SetVerifier attaches a JWT verifier. Once set, the role and claims of each
 // request come from its bearer token (spec 13), and a bad token is rejected
@@ -485,7 +493,13 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity)
 	}
 
 	// vnd.pgrst.plan+json: return EXPLAIN JSON when the backend supports it.
+	// The db-plan-enabled gate comes first: with the option off the media
+	// type is not producible at all, whatever the backend can do.
 	if media == mediaPlan {
+		if !s.planEnabled {
+			writeError(w, pgerr.ErrNotAcceptable(mediaPlan))
+			return
+		}
 		exp, supported := s.backend.(backend.Explainer)
 		if !supported {
 			writeError(w, pgerr.ErrNotAcceptable(mediaPlan))

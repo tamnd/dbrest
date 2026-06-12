@@ -101,6 +101,7 @@ func (a *app) rebuildLocked() error {
 	srv.SetOpenAPI(a.cfg.OpenAPIMode, a.cfg.OpenAPIServerProxyURI)
 	srv.SetCORSAllowedOrigins(a.cfg.CORSAllowedOrigins)
 	srv.SetMaxRows(a.cfg.MaxRows)
+	srv.SetPlanEnabled(a.cfg.PlanEnabled)
 	if err := attachAuth(srv, a.cfg); err != nil {
 		return err
 	}
