@@ -115,3 +115,25 @@ func TestEmptyRegistry(t *testing.T) {
 		t.Error("EmptyRegistry.List must be nil")
 	}
 }
+
+// TestParseRegistryComment checks a declaration's comment field rides into the
+// Function, where the OpenAPI generator reads it.
+func TestParseRegistryComment(t *testing.T) {
+	reg, err := ParseRegistry(`[{
+		"name": "add",
+		"sql": "select :a + :b",
+		"comment": "Add two numbers\nReturns the sum.",
+		"params": [{"name": "a", "type": "int4"}, {"name": "b", "type": "int4"}],
+		"returns": {"kind": "scalar", "type": "int4"}
+	}]`)
+	if err != nil {
+		t.Fatalf("ParseRegistry: %v", err)
+	}
+	f, ok := reg.Lookup("add", ArgSet{"a": true, "b": true})
+	if !ok {
+		t.Fatal("add not found")
+	}
+	if f.Comment != "Add two numbers\nReturns the sum." {
+		t.Errorf("Comment = %q", f.Comment)
+	}
+}

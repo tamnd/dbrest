@@ -161,13 +161,13 @@ func TestReservedParametersMatchV14(t *testing.T) {
 	params := doc["parameters"].(map[string]any)
 
 	cases := map[string]map[string]any{
-		"select":      {"name": "select", "in": "query", "description": "Filtering Columns"},
-		"on_conflict": {"name": "on_conflict", "in": "query", "description": "On Conflict"},
-		"order":       {"name": "order", "in": "query", "description": "Ordering"},
-		"range":       {"name": "Range", "in": "header", "description": "Limiting and Pagination"},
-		"rangeUnit":   {"name": "Range-Unit", "in": "header", "description": "Limiting and Pagination", "default": "items"},
-		"offset":      {"name": "offset", "in": "query", "description": "Limiting and Pagination"},
-		"limit":       {"name": "limit", "in": "query", "description": "Limiting and Pagination"},
+		"select":       {"name": "select", "in": "query", "description": "Filtering Columns"},
+		"on_conflict":  {"name": "on_conflict", "in": "query", "description": "On Conflict"},
+		"order":        {"name": "order", "in": "query", "description": "Ordering"},
+		"range":        {"name": "Range", "in": "header", "description": "Limiting and Pagination"},
+		"rangeUnit":    {"name": "Range-Unit", "in": "header", "description": "Limiting and Pagination", "default": "items"},
+		"offset":       {"name": "offset", "in": "query", "description": "Limiting and Pagination"},
+		"limit":        {"name": "limit", "in": "query", "description": "Limiting and Pagination"},
 		"preferParams": {"name": "Prefer", "in": "header", "description": "Preference"},
 		"preferReturn": {"name": "Prefer", "in": "header", "description": "Preference",
 			"enum": []any{"return=representation", "return=minimal", "return=none"}},
@@ -547,6 +547,110 @@ func TestRPCPaths(t *testing.T) {
 	}
 	if _, ok := logEvent["post"]; !ok {
 		t.Error("volatile function should be callable by POST")
+	}
+}
+
+// commentedModel is a films table annotated the way COMMENT ON does it: a
+// two-line relation comment, a column comment on title, none elsewhere.
+func commentedModel() *schema.Model {
+	rel := &schema.Relation{
+		Name: "films", Kind: schema.KindTable,
+		Comment: "The films catalog\nEvery film we know about, one row each.",
+		Columns: []*schema.Column{
+			{Name: "id", Type: "integer", Nullable: false, Position: 1},
+			{Name: "title", Type: "text", Nullable: false, Position: 2, Comment: "Original release title"},
+		},
+		PrimaryKey: []string{"id"},
+	}
+	return schema.NewModel([]*schema.Relation{rel})
+}
+
+// TestRelationCommentAnnotatesOperations pins the v14 comment pipeline on a
+// relation: the first comment line becomes every operation's summary, the
+// rest the description, and the definition and body parameter carry the full
+// comment.
+func TestRelationCommentAnnotatesOperations(t *testing.T) {
+	doc := decode(t, commentedModel(), nil, sqliteCaps(), Options{})
+	films := doc["paths"].(map[string]any)["/films"].(map[string]any)
+	for _, op := range []string{"get", "post", "patch", "delete"} {
+		o := films[op].(map[string]any)
+		if o["summary"] != "The films catalog" {
+			t.Errorf("%s summary = %v", op, o["summary"])
+		}
+		if o["description"] != "Every film we know about, one row each." {
+			t.Errorf("%s description = %v", op, o["description"])
+		}
+	}
+	def := doc["definitions"].(map[string]any)["films"].(map[string]any)
+	if def["description"] != "The films catalog\nEvery film we know about, one row each." {
+		t.Errorf("definition description = %v", def["description"])
+	}
+	body := doc["parameters"].(map[string]any)["body.films"].(map[string]any)
+	if body["description"] != "The films catalog\nEvery film we know about, one row each." {
+		t.Errorf("body.films description = %v", body["description"])
+	}
+}
+
+// TestUncommentedOperationsStayBare checks an uncommented relation emits no
+// summary or description at all, matching v14's omission.
+func TestUncommentedOperationsStayBare(t *testing.T) {
+	doc := decode(t, filmsModel(), nil, sqliteCaps(), Options{})
+	get := doc["paths"].(map[string]any)["/films"].(map[string]any)["get"].(map[string]any)
+	if _, ok := get["summary"]; ok {
+		t.Errorf("summary should be omitted, got %v", get["summary"])
+	}
+	if _, ok := get["description"]; ok {
+		t.Errorf("description should be omitted, got %v", get["description"])
+	}
+}
+
+// TestColumnCommentInPropertyAndRowFilter pins the column comment's two
+// surfaces: ahead of the key notes in the definition property, and ahead of
+// the operator advertisement in the rowFilter parameter.
+func TestColumnCommentInPropertyAndRowFilter(t *testing.T) {
+	rel := &schema.Relation{
+		Name: "films", Kind: schema.KindTable,
+		Columns: []*schema.Column{
+			{Name: "id", Type: "integer", Nullable: false, Position: 1, Comment: "the film identifier"},
+		},
+		PrimaryKey: []string{"id"},
+	}
+	doc := decode(t, schema.NewModel([]*schema.Relation{rel}), nil, sqliteCaps(), Options{})
+
+	prop := doc["definitions"].(map[string]any)["films"].(map[string]any)["properties"].(map[string]any)["id"].(map[string]any)
+	if prop["description"] != "the film identifier\n\nNote:\nThis is a Primary Key.<pk/>" {
+		t.Errorf("property description = %q", prop["description"])
+	}
+
+	desc := rowFilterDesc(t, doc, "films", "id")
+	if !strings.HasPrefix(desc, "the film identifier\n\n") {
+		t.Errorf("rowFilter description = %q, want the comment first", desc)
+	}
+	if !containsToken(desc, "eq") {
+		t.Errorf("rowFilter description lost the operator list: %q", desc)
+	}
+}
+
+// TestFunctionCommentAnnotatesRPC pins the same split on an rpc path, sourced
+// from the registry declaration's comment field.
+func TestFunctionCommentAnnotatesRPC(t *testing.T) {
+	reg := rpc.NewStaticRegistry([]*rpc.Function{{
+		Name:       "add",
+		Comment:    "Add two numbers\nReturns the sum of a and b.",
+		Params:     []rpc.Param{{Name: "a", Type: "int4"}, {Name: "b", Type: "int4"}},
+		Returns:    rpc.ReturnShape{Kind: rpc.ReturnScalar, Type: "int4"},
+		Volatility: rpc.Immutable,
+	}})
+	doc := decode(t, filmsModel(), reg, sqliteCaps(), Options{})
+	add := doc["paths"].(map[string]any)["/rpc/add"].(map[string]any)
+	for _, op := range []string{"get", "post"} {
+		o := add[op].(map[string]any)
+		if o["summary"] != "Add two numbers" {
+			t.Errorf("%s summary = %v", op, o["summary"])
+		}
+		if o["description"] != "Returns the sum of a and b." {
+			t.Errorf("%s description = %v", op, o["description"])
+		}
 	}
 }
 

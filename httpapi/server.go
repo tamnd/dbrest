@@ -32,12 +32,12 @@ const maxBodyBytes = 16 << 20 // 16 MiB
 // verifier, when set, resolves the request role from the JWT; with none, every
 // request runs as the static default role.
 type Server struct {
-	backend      backend.Backend
-	model        *schema.Model
-	searchPath   []string
-	role         string
-	verifier     *auth.Verifier
-	authz        *authz.Registry
+	backend         backend.Backend
+	model           *schema.Model
+	searchPath      []string
+	role            string
+	verifier        *auth.Verifier
+	authz           *authz.Registry
 	openapiMode     string
 	openapiProxy    string
 	openapiSecurity bool

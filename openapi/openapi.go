@@ -189,11 +189,16 @@ func rootPath() *pathItem {
 func relationPath(rel *schema.Relation, acts Actions) *pathItem {
 	filters := rowFilterRefs(rel)
 	body := refs("body." + rel.Name)
+	// The relation's database comment annotates every operation of the path:
+	// first line as the summary, the rest as the description, as v14 emits it.
+	summary, description := splitComment(rel.Comment)
 	p := &pathItem{}
 	if acts.Get {
 		p.Get = &operation{
-			Tags:       []string{rel.Name},
-			Parameters: concat(filters, refs("select", "order", "range", "rangeUnit", "offset", "limit", "preferCount")),
+			Tags:        []string{rel.Name},
+			Summary:     summary,
+			Description: description,
+			Parameters:  concat(filters, refs("select", "order", "range", "rangeUnit", "offset", "limit", "preferCount")),
 			Responses: map[string]*response{
 				"200": {Description: "OK", Schema: &schemaObject{
 					Type:  "array",
@@ -206,27 +211,41 @@ func relationPath(rel *schema.Relation, acts Actions) *pathItem {
 	if rel.Kind == schema.KindTable {
 		if acts.Post {
 			p.Post = &operation{
-				Tags:       []string{rel.Name},
-				Parameters: concat(body, refs("select", "preferPost")),
-				Responses:  okResponses("201", "Created"),
+				Tags:        []string{rel.Name},
+				Summary:     summary,
+				Description: description,
+				Parameters:  concat(body, refs("select", "preferPost")),
+				Responses:   okResponses("201", "Created"),
 			}
 		}
 		if acts.Patch {
 			p.Patch = &operation{
-				Tags:       []string{rel.Name},
-				Parameters: concat(filters, body, refs("preferReturn")),
-				Responses:  okResponses("204", "No Content"),
+				Tags:        []string{rel.Name},
+				Summary:     summary,
+				Description: description,
+				Parameters:  concat(filters, body, refs("preferReturn")),
+				Responses:   okResponses("204", "No Content"),
 			}
 		}
 		if acts.Delete {
 			p.Delete = &operation{
-				Tags:       []string{rel.Name},
-				Parameters: concat(filters, refs("preferReturn")),
-				Responses:  okResponses("204", "No Content"),
+				Tags:        []string{rel.Name},
+				Summary:     summary,
+				Description: description,
+				Parameters:  concat(filters, refs("preferReturn")),
+				Responses:   okResponses("204", "No Content"),
 			}
 		}
 	}
 	return p
+}
+
+// splitComment divides a database comment the way v14 reads it: the first
+// line becomes the summary, everything after the first newline the
+// description, both empty when there is no comment.
+func splitComment(comment string) (summary, description string) {
+	summary, description, _ = strings.Cut(comment, "\n")
+	return summary, strings.TrimSpace(description)
 }
 
 // relationDefinition builds the schema object for a relation from its columns.
@@ -235,7 +254,7 @@ func relationPath(rel *schema.Relation, acts Actions) *pathItem {
 // still required, matching v14); the primary key and foreign keys surface in
 // the property descriptions the way PostgREST annotates them.
 func relationDefinition(rel *schema.Relation) *schemaObject {
-	def := &schemaObject{Type: "object", Properties: map[string]*propertySchema{}}
+	def := &schemaObject{Type: "object", Properties: map[string]*propertySchema{}, Description: rel.Comment}
 	pk := map[string]bool{}
 	for _, c := range rel.PrimaryKey {
 		pk[c] = true
@@ -243,7 +262,7 @@ func relationDefinition(rel *schema.Relation) *schemaObject {
 	for _, col := range rel.Columns {
 		typ, format := swaggerType(col.Type)
 		prop := &propertySchema{Type: typ, Format: format}
-		prop.Description = columnNote(col.Name, pk, rel.ForeignKeys)
+		prop.Description = columnDescription(col, pk, rel.ForeignKeys)
 		def.Properties[col.Name] = prop
 		if !col.Nullable {
 			def.Required = append(def.Required, col.Name)
@@ -258,18 +277,25 @@ func relationDefinition(rel *schema.Relation) *schemaObject {
 // parameters for a read-only function (stable or immutable); a volatile
 // function is POST only. See spec 12.
 func functionPath(fn *rpc.Function) *pathItem {
+	// The function's database comment annotates its operations the same way a
+	// relation's does: first line as the summary, the rest as the description.
+	summary, description := splitComment(fn.Comment)
 	p := &pathItem{}
 	if fn.Volatility.ReadOnly() {
 		p.Get = &operation{
-			Tags:       []string{"(rpc) " + fn.Name},
-			Produces:   rpcMediaTypes,
-			Parameters: functionQueryParams(fn),
-			Responses:  okResponses("200", "OK"),
+			Tags:        []string{"(rpc) " + fn.Name},
+			Summary:     summary,
+			Description: description,
+			Produces:    rpcMediaTypes,
+			Parameters:  functionQueryParams(fn),
+			Responses:   okResponses("200", "OK"),
 		}
 	}
 	p.Post = &operation{
-		Tags:     []string{"(rpc) " + fn.Name},
-		Produces: rpcMediaTypes,
+		Tags:        []string{"(rpc) " + fn.Name},
+		Summary:     summary,
+		Description: description,
+		Produces:    rpcMediaTypes,
 		Parameters: concat(
 			[]*parameter{{In: "body", Name: "args", Required: boolPtr(true), Schema: functionBodySchema(fn)}},
 			refs("preferParams"),
@@ -302,25 +328,36 @@ func functionBodySchema(fn *rpc.Function) *schemaObject {
 
 // addRelationParameters defines the shared per-relation parameters operations
 // reference: one rowFilter.<table>.<col> per column and, for a table, the
-// body.<table> payload. The rowFilter description carries the operator
-// grammar the backend can actually serve, dbrest's capability advertisement
-// (spec 19); v14 leaves the field empty, so the addition is tooling-safe.
+// body.<table> payload. A rowFilter's description starts with the column's
+// database comment the way v14 emits it, then carries the operator grammar
+// the backend can actually serve, dbrest's capability advertisement (spec
+// 19); v14 puts nothing after the comment, so the addition is tooling-safe.
+// The body parameter's description is the relation comment, v14's fallback
+// to the bare name when there is none.
 func addRelationParameters(params map[string]*parameter, rel *schema.Relation, ops string) {
 	for _, col := range rel.Columns {
+		desc := ops
+		if col.Comment != "" {
+			desc = col.Comment + "\n\n" + ops
+		}
 		params["rowFilter."+rel.Name+"."+col.Name] = &parameter{
 			Name:        col.Name,
 			In:          "query",
 			Required:    boolPtr(false),
 			Type:        "string",
-			Description: ops,
+			Description: desc,
 		}
 	}
 	if rel.Kind == schema.KindTable {
+		bodyDesc := rel.Name
+		if rel.Comment != "" {
+			bodyDesc = rel.Comment
+		}
 		params["body."+rel.Name] = &parameter{
 			Name:        rel.Name,
 			In:          "body",
 			Required:    boolPtr(false),
-			Description: rel.Name,
+			Description: bodyDesc,
 			Schema:      &schemaObject{Ref: "#/definitions/" + rel.Name},
 		}
 	}
@@ -415,10 +452,25 @@ func swaggerType(canonical string) (typ, format string) {
 	}
 }
 
-// columnNote builds the PostgREST property annotation: a primary-key note, a
-// foreign-key note, or both. Each note carries the machine-readable <pk/> or
+// columnDescription builds the property description the way v14 lays it out:
+// the column's database comment first, then the key annotations, a blank line
+// between them. Each note carries the machine-readable <pk/> or
 // <fk table='...' column='...'/> marker tooling parses out of the v14
-// documents. An unannotated column gets an empty description.
+// documents. An uncommented, unannotated column gets an empty description.
+func columnDescription(col *schema.Column, pk map[string]bool, fks []*schema.ForeignKey) string {
+	note := columnNote(col.Name, pk, fks)
+	switch {
+	case col.Comment == "":
+		return note
+	case note == "":
+		return col.Comment
+	default:
+		return col.Comment + "\n\n" + note
+	}
+}
+
+// columnNote builds the PostgREST key annotation: a primary-key note, a
+// foreign-key note, or both, empty for a plain column.
 func columnNote(name string, pk map[string]bool, fks []*schema.ForeignKey) string {
 	var notes []string
 	if pk[name] {

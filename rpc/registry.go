@@ -80,8 +80,12 @@ type Param struct {
 // this slice implements the portable Query (native discovery from an engine
 // catalog is a later slice).
 type Function struct {
-	Name       string
-	Params     []Param
+	Name   string
+	Params []Param
+	// Comment is the database comment on the function (COMMENT ON FUNCTION,
+	// or the registry declaration's comment field). The OpenAPI generator
+	// splits it into the rpc operation's summary and description, as v14 does.
+	Comment    string
 	Returns    ReturnShape
 	Volatility Volatility
 	Security   SecurityMode
@@ -229,6 +233,7 @@ func exactMatch(f *Function, args ArgSet) bool {
 //
 //	name        string           required; bare function name
 //	sql         string           required; parameterized SQL with :name placeholders
+//	comment     string           optional; surfaces in the OpenAPI document
 //	params      []{name, type, optional?, default?}
 //	returns     {kind: "scalar"|"setof"|"table", type?, columns?}
 //	volatility  "volatile"|"stable"|"immutable"   (default: volatile)
@@ -257,6 +262,7 @@ func ParseRegistry(rawJSON string) (*StaticRegistry, error) {
 	type fnDecl struct {
 		Name       string      `json:"name"`
 		SQL        string      `json:"sql"`
+		Comment    string      `json:"comment"`
 		Params     []paramDecl `json:"params"`
 		Returns    returnDecl  `json:"returns"`
 		Volatility string      `json:"volatility"`
@@ -307,6 +313,7 @@ func ParseRegistry(rawJSON string) (*StaticRegistry, error) {
 		fns = append(fns, &Function{
 			Name:       name,
 			Params:     params,
+			Comment:    d.Comment,
 			Returns:    ret,
 			Volatility: vol,
 			Query:      &PortableQuery{SQL: d.SQL},

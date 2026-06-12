@@ -49,9 +49,13 @@ func (m *Model) SchemaComment(schemaName string) string {
 
 // Relation is one table or view in the exposed schema.
 type Relation struct {
-	Schema     string
-	Name       string
-	Kind       Kind
+	Schema string
+	Name   string
+	Kind   Kind
+	// Comment is the database comment on the relation (COMMENT ON TABLE, or
+	// the declared-schema equivalent). The OpenAPI generator splits it into
+	// the operation summary (first line) and description (rest), as v14 does.
+	Comment    string
 	Columns    []*Column
 	PrimaryKey []string // column names forming the PK, in order; may be empty
 	// ForeignKeys are the relation's outgoing foreign keys, the raw material the
@@ -68,8 +72,12 @@ type Relation struct {
 
 // Column is one attribute of a relation.
 type Column struct {
-	Name       string
-	Type       string // canonical PG type name (spec 16)
+	Name string
+	Type string // canonical PG type name (spec 16)
+	// Comment is the database comment on the column. The OpenAPI generator
+	// surfaces it on the column's rowFilter parameter and ahead of the pk/fk
+	// notes in the definition property, matching v14.
+	Comment    string
 	Nullable   bool
 	HasDefault bool
 	// Identity reports whether the column is an auto-generated identity/serial
