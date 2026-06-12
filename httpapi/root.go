@@ -55,7 +55,8 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request, id identity,
 		SecurityActive: s.openapiSecurity,
 		ActiveSchema:   activeSchema,
 	}
-	if comment := s.model.SchemaComment(activeSchema); comment != "" {
+	model := s.Model()
+	if comment := model.SchemaComment(activeSchema); comment != "" {
 		// The database comment on the active schema names the API: the first
 		// line is the info title, the rest the description, as v14 reads it.
 		title, rest, _ := strings.Cut(comment, "\n")
@@ -80,7 +81,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request, id identity,
 			}
 		}
 	}
-	body, err := openapi.Generate(s.model, s.backend.Functions(), s.backend.Capabilities(), opts)
+	body, err := openapi.Generate(model, s.backend.Functions(), s.backend.Capabilities(), opts)
 	if err != nil {
 		writeError(w, pgerr.ErrInternal(err.Error()))
 		return

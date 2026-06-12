@@ -5,6 +5,7 @@
 package httpapi
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -33,7 +34,7 @@ const maxBodyBytes = 16 << 20 // 16 MiB
 // request runs as the static default role.
 type Server struct {
 	backend         backend.Backend
-	model           *schema.Model
+	cache           *schema.Cache
 	searchPath      []string
 	role            string
 	verifier        *auth.Verifier
@@ -48,7 +49,27 @@ type Server struct {
 // schema search path (the exposed schemas, in resolution order). It runs every
 // request as the anon role until a verifier is attached with SetVerifier.
 func NewServer(b backend.Backend, model *schema.Model, searchPath []string) *Server {
-	return &Server{backend: b, model: model, searchPath: searchPath, role: "anon"}
+	return &Server{backend: b, cache: schema.NewCache(model), searchPath: searchPath, role: "anon"}
+}
+
+// Model returns the current schema model snapshot. A handler loads it once at
+// entry so one request never straddles a reload.
+func (s *Server) Model() *schema.Model { return s.cache.Load() }
+
+// Reload re-runs introspection and publishes the fresh model, the schema
+// cache reload PostgREST performs on SIGUSR1 and on NOTIFY over the
+// db-channel. In-flight requests keep the snapshot they started with; a
+// failed introspection leaves the old model published, so a transient
+// database error never takes the running cache down. The OpenAPI document is
+// generated per request from the published model and needs no separate
+// regeneration.
+func (s *Server) Reload(ctx context.Context) error {
+	model, err := s.backend.Introspect(ctx)
+	if err != nil {
+		return err
+	}
+	s.cache.Store(model)
+	return nil
 }
 
 // SetOpenAPI configures the root document. mode is the openapi-mode option:
@@ -395,7 +416,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity,
 		}
 	}
 
-	planned, apiErr := plan.Read(s.model, q, []string{activeSchema})
+	planned, apiErr := plan.Read(s.Model(), q, []string{activeSchema})
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
@@ -471,7 +492,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.Que
 	}
 	q.Singular = media == mediaObject
 
-	planned, apiErr := plan.Write(s.model, q, []string{activeSchema})
+	planned, apiErr := plan.Write(s.Model(), q, []string{activeSchema})
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
