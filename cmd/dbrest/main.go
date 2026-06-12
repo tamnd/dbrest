@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -16,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/tamnd/dbrest/adminapi"
@@ -289,6 +291,22 @@ func applyPoolConfig(be backend.Backend, cfg *config.Config) {
 	db.SetConnMaxLifetime(cfg.DBPoolMaxLifetime)
 }
 
+// jwtSecretBytes returns the key material configured in jwt-secret. With
+// jwt-secret-is-base64 set, the value is URL-safe base64 (padding optional)
+// and an undecodable value is a boot error; silently keying the verifier with
+// the wrong bytes would lock every valid token out.
+func jwtSecretBytes(cfg *config.Config) ([]byte, error) {
+	if !cfg.JWTSecretIsBase64 {
+		return []byte(cfg.JWTSecret), nil
+	}
+	trimmed := strings.TrimRight(strings.TrimSpace(cfg.JWTSecret), "=")
+	b, err := base64.RawURLEncoding.DecodeString(trimmed)
+	if err != nil {
+		return nil, fmt.Errorf("jwt-secret-is-base64 is set but jwt-secret is not valid URL-safe base64: %w", err)
+	}
+	return b, nil
+}
+
 // attachAuth wires a JWT verifier onto the server when a key is configured.
 // With no key material the server runs every request as the static anon role,
 // which is the PostgREST behavior for an unconfigured jwt-secret.
@@ -296,8 +314,12 @@ func attachAuth(srv *httpapi.Server, cfg *config.Config) error {
 	if cfg.JWTSecret == "" && cfg.JWKSet == "" {
 		return nil
 	}
+	secret, err := jwtSecretBytes(cfg)
+	if err != nil {
+		return err
+	}
 	v, err := auth.NewVerifier(auth.Config{
-		Secret:          []byte(cfg.JWTSecret),
+		Secret:          secret,
 		Audience:        cfg.JWTAud,
 		RoleClaimKey:    cfg.JWTRoleClaimKey,
 		AnonRole:        cfg.AnonRole,

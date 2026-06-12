@@ -443,7 +443,7 @@ var unenforcedOptions = []string{
 	"db-pool-acquisition-timeout", "db-pool-automatic-recovery",
 	"db-pre-config", "db-pre-request", "pre-request",
 	"db-prepared-statements", "db-root-spec", "root-spec", "db-tx-end",
-	"jwt-secret-is-base64", "secret-is-base64", "log-query",
+	"log-query",
 	"openapi-security-active", "server-trace-header", "server-timing-enabled",
 }
 
