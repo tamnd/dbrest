@@ -51,6 +51,34 @@ func TestDBURIRequired(t *testing.T) {
 	}
 }
 
+// TestDBURIDefaultsOnPostgres pins the upstream stock workflow: with the
+// postgres backend an unset db-uri becomes "postgresql://", the empty URI the
+// driver fills from the PG* environment. Every other engine keeps the hard
+// requirement.
+func TestDBURIDefaultsOnPostgres(t *testing.T) {
+	c, err := FromMap(map[string]string{"db-backend": "postgres"})
+	if err != nil {
+		t.Fatalf("postgres without db-uri should boot: %v", err)
+	}
+	if c.DBURI != "postgresql://" {
+		t.Errorf("db-uri = %q, want postgresql://", c.DBURI)
+	}
+
+	for _, be := range []string{"sqlite", "mysql", "sqlserver", "mongodb"} {
+		if _, err := FromMap(map[string]string{"db-backend": be}); err == nil {
+			t.Errorf("%s without db-uri should be rejected", be)
+		}
+	}
+
+	c, err = FromMap(map[string]string{"db-backend": "postgres", "db-uri": "postgresql://u@h/db"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.DBURI != "postgresql://u@h/db" {
+		t.Errorf("explicit db-uri lost: %q", c.DBURI)
+	}
+}
+
 func TestFileParsing(t *testing.T) {
 	path := writeConf(t, `
 # dbrest configuration

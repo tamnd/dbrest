@@ -233,6 +233,13 @@ func fromRaw(raw map[string]string) (*Config, error) {
 	if v, ok := get("db-uri"); ok {
 		c.DBURI = v
 	}
+	// PostgREST defaults db-uri to "postgresql://", an empty URI libpq fills
+	// from PGHOST/PGUSER/PGDATABASE and friends, so a bare server with PG*
+	// environment variables just works. Only the postgres backend can
+	// self-configure that way; every other engine keeps db-uri mandatory.
+	if strings.TrimSpace(c.DBURI) == "" && c.Backend == BackendPostgres {
+		c.DBURI = "postgresql://"
+	}
 	// An @path value loads the option from a file, the documented way to keep
 	// secrets out of config files. Upstream supports it for exactly two
 	// options: db-uri (trimmed of surrounding whitespace) and jwt-secret
