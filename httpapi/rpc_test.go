@@ -273,3 +273,39 @@ func BenchmarkRPCGetScalar(b *testing.B) {
 		}
 	}
 }
+
+// TestRPCScalarJSONReturnsRaw pins the declared-json contract: a function
+// returning json emits the document itself, not a quoted string, the way a
+// PostgreSQL json function behaves through PostgREST. An expression carries
+// no column type, so the declared return type drives the conversion.
+func TestRPCScalarJSONReturnsRaw(t *testing.T) {
+	dsn := "file:" + strings.ReplaceAll(t.Name(), "/", "_") + "?mode=memory&cache=shared"
+	be, err := sqlite.Open(dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { be.Close() })
+	be.Register(rpc.NewStaticRegistry([]*rpc.Function{{
+		Name:       "payload",
+		Returns:    rpc.ReturnShape{Kind: rpc.ReturnScalar, Type: "json"},
+		Volatility: rpc.Stable,
+		Query:      &rpc.PortableQuery{SQL: `SELECT json_object('a', 1)`},
+	}}))
+	model, err := be.Introspect(context.Background())
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+	srv := httpapi.NewServer(be, model, nil)
+
+	resp := do(t, srv, http.MethodGet, "/rpc/payload", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var doc map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		t.Fatalf("the body should be a JSON object, not a quoted string: %v", err)
+	}
+	if doc["a"] != float64(1) {
+		t.Errorf("body = %v", doc)
+	}
+}
