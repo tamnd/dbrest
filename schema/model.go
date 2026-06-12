@@ -27,6 +27,24 @@ type Model struct {
 	relations map[string]*Relation
 	// order preserves a deterministic relation order for OpenAPI and tests.
 	order []string
+	// schemaComments holds the database comment on each exposed schema, the
+	// source of the OpenAPI info title and description (first line and rest).
+	schemaComments map[string]string
+}
+
+// SetSchemaComment records a schema's database comment. It is called during
+// introspection, before the model is published; readers use SchemaComment.
+func (m *Model) SetSchemaComment(schemaName, comment string) {
+	if m.schemaComments == nil {
+		m.schemaComments = make(map[string]string)
+	}
+	m.schemaComments[schemaName] = comment
+}
+
+// SchemaComment returns the database comment on the named schema, or "" when
+// none was recorded.
+func (m *Model) SchemaComment(schemaName string) string {
+	return m.schemaComments[schemaName]
 }
 
 // Relation is one table or view in the exposed schema.

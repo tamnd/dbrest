@@ -211,7 +211,8 @@ func TestRootFollowPrivilegesFiltersDocument(t *testing.T) {
 		}
 	}
 
-	// Anon holds no grants: the document is empty, not an enumeration.
+	// Anon holds no grants: nothing is enumerated. Only the "/" entry that
+	// describes the document itself remains, as in v14.
 	resp = do(t, srv, http.MethodGet, "/", nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("anon status = %d, want 200", resp.StatusCode)
@@ -220,8 +221,14 @@ func TestRootFollowPrivilegesFiltersDocument(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(doc.Paths) != 0 || len(doc.Definitions) != 0 {
-		t.Errorf("anon sees paths %v definitions %v, want none", doc.Paths, doc.Definitions)
+	if len(doc.Paths) != 1 {
+		t.Errorf("anon sees paths %v, want only the root entry", doc.Paths)
+	}
+	if _, ok := doc.Paths["/"]; !ok {
+		t.Errorf("anon paths = %v, want the root entry", doc.Paths)
+	}
+	if len(doc.Definitions) != 0 {
+		t.Errorf("anon sees definitions %v, want none", doc.Definitions)
 	}
 }
 
@@ -329,21 +336,20 @@ func TestRootAdvertisesServedOperators(t *testing.T) {
 	var doc map[string]any
 	json.NewDecoder(resp.Body).Decode(&doc)
 
-	params := doc["paths"].(map[string]any)["/films"].(map[string]any)["get"].(map[string]any)["parameters"].([]any)
-	for _, p := range params {
-		pm := p.(map[string]any)
-		if pm["name"] != "title" {
-			continue
+	// Operations reference the shared rowFilter parameters; the operator list
+	// lives on the definition in the document's parameters map.
+	title, ok := doc["parameters"].(map[string]any)["rowFilter.films.title"].(map[string]any)
+	if !ok {
+		t.Fatal("document is missing the rowFilter.films.title parameter")
+	}
+	desc := title["description"].(string)
+	// match/imatch and fts are served on SQLite; the range operators are not.
+	for _, want := range []string{"match", "fts"} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("expected %q advertised; desc = %q", want, desc)
 		}
-		desc := pm["description"].(string)
-		// match/imatch and fts are served on SQLite; the range operators are not.
-		for _, want := range []string{"match", "fts"} {
-			if !strings.Contains(desc, want) {
-				t.Errorf("expected %q advertised; desc = %q", want, desc)
-			}
-		}
-		if strings.Contains(desc, " sl,") || strings.Contains(desc, " adj.") {
-			t.Errorf("range operators should not be advertised on SQLite; desc = %q", desc)
-		}
+	}
+	if strings.Contains(desc, " sl,") || strings.Contains(desc, " adj.") {
+		t.Errorf("range operators should not be advertised on SQLite; desc = %q", desc)
 	}
 }

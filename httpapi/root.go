@@ -48,6 +48,13 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request, id identity,
 		SecurityActive: s.openapiSecurity,
 		ActiveSchema:   activeSchema,
 	}
+	if comment := s.model.SchemaComment(activeSchema); comment != "" {
+		// The database comment on the active schema names the API: the first
+		// line is the info title, the rest the description, as v14 reads it.
+		title, rest, _ := strings.Cut(comment, "\n")
+		opts.Title = title
+		opts.Description = strings.TrimSpace(rest)
+	}
 	if s.openapiProxy != "" {
 		applyProxyURI(&opts, s.openapiProxy)
 	}
