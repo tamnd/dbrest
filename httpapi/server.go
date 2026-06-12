@@ -38,6 +38,7 @@ type Server struct {
 	role         string
 	verifier     *auth.Verifier
 	authz        *authz.Registry
+	preRequest   string
 	openapiMode  string
 	openapiProxy string
 }
@@ -76,6 +77,12 @@ func (s *Server) SetDefaultRole(role string) {
 // before any query runs. With no verifier the server keeps the static role.
 func (s *Server) SetVerifier(v *auth.Verifier) { s.verifier = v }
 
+// SetPreRequest names the db-pre-request function carried to the backend on
+// every request context. The backend invokes it after the request context is
+// in place and before the main statement (spec 13); the caller is responsible
+// for refusing the option at startup on a backend that cannot honor it.
+func (s *Server) SetPreRequest(fn string) { s.preRequest = fn }
+
 // SetAuthz attaches an authorization registry. Once set, every read and write is
 // gated by the registry's table and column privileges and has any Row Level
 // Security policy injected before execution (spec 14). On a backend whose engine
@@ -108,21 +115,22 @@ type identity struct {
 // boundary (method, path, headers, cookies, and the selected schema). The
 // frontend builds it once after authentication; on the emulated backend the
 // values a policy references are later bound as parameters (spec 15).
-func buildContext(r *http.Request, id identity) *reqctx.Context {
+func (s *Server) buildContext(r *http.Request, id identity) *reqctx.Context {
 	cookies := r.Cookies()
 	jar := make(map[string]string, len(cookies))
 	for _, c := range cookies {
 		jar[c.Name] = c.Value
 	}
 	return &reqctx.Context{
-		Role:      id.role,
-		Anonymous: id.anonymous,
-		Claims:    id.claims,
-		Method:    r.Method,
-		Path:      r.URL.Path,
-		Headers:   r.Header,
-		Cookies:   jar,
-		Schema:    requestSchema(r),
+		Role:       id.role,
+		Anonymous:  id.anonymous,
+		Claims:     id.claims,
+		Method:     r.Method,
+		Path:       r.URL.Path,
+		Headers:    r.Header,
+		Cookies:    jar,
+		Schema:     requestSchema(r),
+		PreRequest: s.preRequest,
 	}
 }
 
@@ -273,7 +281,7 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 		}
 	}
 
-	rc := buildContext(r, id)
+	rc := s.buildContext(r, id)
 	res, err := s.backend.Execute(r.Context(), planned, rc)
 	if err != nil {
 		writeError(w, mapExecError(s.backend, err, id.anonymous))
@@ -360,7 +368,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity)
 		return
 	}
 
-	rc := buildContext(r, id)
+	rc := s.buildContext(r, id)
 
 	if apiErr := s.authorize(rc, planned); apiErr != nil {
 		writeError(w, apiErr)
@@ -436,7 +444,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.Que
 		return
 	}
 
-	rc := buildContext(r, id)
+	rc := s.buildContext(r, id)
 	if apiErr := s.authorize(rc, planned); apiErr != nil {
 		writeError(w, apiErr)
 		return

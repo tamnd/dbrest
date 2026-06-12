@@ -121,6 +121,33 @@ func TestContextWriteUsesContentProfile(t *testing.T) {
 	}
 }
 
+func TestContextCarriesPreRequest(t *testing.T) {
+	srv, cap := captureServer(t)
+	srv.SetPreRequest("check_request")
+
+	srv.ServeHTTP(newRecorder(), newReq(http.MethodGet, "/films?select=id"))
+	if cap.got == nil || cap.got.PreRequest != "check_request" {
+		t.Fatalf("read context PreRequest = %v, want check_request", cap.got)
+	}
+
+	cap.got = nil
+	srv.ServeHTTP(newRecorder(), newReqBody(http.MethodPost, "/films", `{"id":6,"title":"Heat"}`))
+	if cap.got == nil || cap.got.PreRequest != "check_request" {
+		t.Fatalf("write context PreRequest = %v, want check_request", cap.got)
+	}
+}
+
+func TestContextHasNoPreRequestByDefault(t *testing.T) {
+	srv, cap := captureServer(t)
+	srv.ServeHTTP(newRecorder(), newReq(http.MethodGet, "/films?select=id"))
+	if cap.got == nil {
+		t.Fatal("Execute never received a context")
+	}
+	if cap.got.PreRequest != "" {
+		t.Errorf("PreRequest = %q, want empty with none configured", cap.got.PreRequest)
+	}
+}
+
 func TestResponseControlStatusOverridesReadDefault(t *testing.T) {
 	srv, cap := captureServer(t)
 	// A backend that overrides the read status, as a function or policy would.
