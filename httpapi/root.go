@@ -19,14 +19,22 @@ import (
 // serve and never promises an operator the next request would reject. HEAD
 // returns the headers with no body. See spec 19.
 func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request, id identity, activeSchema string) {
+	if r.Method == http.MethodOptions {
+		// OPTIONS on the root answers with the verb set, the way PostgREST's
+		// info response does, with no body and no media type.
+		w.Header().Set("Allow", rootAllow)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		writeError(w, pgerr.ErrUnsupported(r.Method+" requests on the root", "dbrest"))
+		w.Header().Set("Allow", rootAllow)
+		writeError(w, errRootMethod(r.Method))
 		return
 	}
 	if s.openapiMode == config.OpenAPIDisabled {
 		// openapi-mode=disabled turns the self-describing root off entirely; a
-		// request there is a plain 404, as PostgREST returns.
-		writeError(w, pgerr.New(http.StatusNotFound, "", "openapi is disabled"))
+		// request there is PostgREST's 404 PGRST126.
+		writeError(w, errRootDisabled())
 		return
 	}
 	if !rootAcceptable(r.Header.Values("Accept")) {
@@ -69,6 +77,24 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request, id identity,
 	if r.Method != http.MethodHead {
 		w.Write(body)
 	}
+}
+
+// rootAllow is the verb set the root serves: the Allow value OPTIONS answers
+// with and the one a 405 carries so the rejected caller knows what would work.
+const rootAllow = "OPTIONS,GET,HEAD"
+
+// errRootMethod is PostgREST's PGRST117: a verb the root does not answer, a
+// 405 naming the method. The general PGRST117 verb handling is item 02.11;
+// this local constructor covers the root until pgerr grows the shared one.
+func errRootMethod(method string) *pgerr.APIError {
+	return pgerr.New(http.StatusMethodNotAllowed, "PGRST117", "Unsupported HTTP method: "+method)
+}
+
+// errRootDisabled is PostgREST's PGRST126: the root metadata endpoint turned
+// off by openapi-mode=disabled (or an unset db-root-spec in that mode), a 404
+// with an explicit code rather than a bare not-found.
+func errRootDisabled() *pgerr.APIError {
+	return pgerr.New(http.StatusNotFound, "PGRST126", "Root endpoint metadata is disabled")
 }
 
 // rootAcceptable reports whether the Accept header admits the root document.

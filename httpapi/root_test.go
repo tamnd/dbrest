@@ -98,13 +98,77 @@ func TestRootNegotiatesAccept(t *testing.T) {
 	}
 }
 
-// TestRootDisabledIs404 checks openapi-mode=disabled turns the root off.
+// TestRootDisabledIs404 checks openapi-mode=disabled turns the root off with
+// PostgREST's explicit PGRST126 code, not a bare not-found.
 func TestRootDisabledIs404(t *testing.T) {
 	srv := newServer(t)
 	srv.SetOpenAPI(config.OpenAPIDisabled, "", false)
 	resp := do(t, srv, http.MethodGet, "/", nil)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+	var e struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&e); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if e.Code != "PGRST126" {
+		t.Errorf("code = %q, want PGRST126", e.Code)
+	}
+	if e.Message != "Root endpoint metadata is disabled" {
+		t.Errorf("message = %q", e.Message)
+	}
+}
+
+// TestRootMethodNotAllowed pins the verb gate at the root: anything besides
+// GET, HEAD, and OPTIONS is 405 PGRST117 naming the method, with the Allow
+// header listing what the root serves. The gate runs before the disabled
+// check, so the answer is the same in every openapi-mode.
+func TestRootMethodNotAllowed(t *testing.T) {
+	srv := newServer(t)
+	for _, mode := range []string{config.OpenAPIFollowPrivileges, config.OpenAPIDisabled} {
+		srv.SetOpenAPI(mode, "", false)
+		for _, method := range []string{http.MethodDelete, http.MethodPatch, http.MethodPost, http.MethodPut, "TRACE"} {
+			resp := do(t, srv, method, "/", nil)
+			if resp.StatusCode != http.StatusMethodNotAllowed {
+				t.Fatalf("mode %s %s /: status = %d, want 405", mode, method, resp.StatusCode)
+			}
+			if allow := resp.Header.Get("Allow"); allow != "OPTIONS,GET,HEAD" {
+				t.Errorf("%s /: Allow = %q, want OPTIONS,GET,HEAD", method, allow)
+			}
+			var e struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&e); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if e.Code != "PGRST117" {
+				t.Errorf("%s /: code = %q, want PGRST117", method, e.Code)
+			}
+			if e.Message != "Unsupported HTTP method: "+method {
+				t.Errorf("%s /: message = %q", method, e.Message)
+			}
+		}
+	}
+}
+
+// TestRootOptionsAnswersAllow checks OPTIONS / is 200 with the verb set and
+// no body, the way PostgREST's info response answers it.
+func TestRootOptionsAnswersAllow(t *testing.T) {
+	srv := newServer(t)
+	resp := do(t, srv, http.MethodOptions, "/", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if allow := resp.Header.Get("Allow"); allow != "OPTIONS,GET,HEAD" {
+		t.Errorf("Allow = %q, want OPTIONS,GET,HEAD", allow)
+	}
+	buf := make([]byte, 1)
+	if n, _ := resp.Body.Read(buf); n != 0 {
+		t.Error("OPTIONS / should have no body")
 	}
 }
 

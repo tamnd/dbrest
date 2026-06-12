@@ -217,6 +217,43 @@ func TestDottedPathDoesNotEscapeSchema(t *testing.T) {
 	})
 }
 
+// ── 06.5 root verb handling ────────────────────────────────────────────────
+
+// A verb the root does not serve is 405 PGRST117 naming the method.
+func TestRootUnsupportedVerb(t *testing.T) {
+	onBoth(t, func(t *testing.T, base string) {
+		for _, method := range []string{"DELETE", "PATCH", "PUT", "TRACE"} {
+			res := doRequest(t, base, compatCase{method: method, path: "/"})
+			if res.status != http.StatusMethodNotAllowed {
+				t.Fatalf("%s /: status = %d, want 405\n%s", method, res.status, res.body)
+			}
+			e := decodeErr(t, res.body)
+			if e.Code != "PGRST117" {
+				t.Errorf("%s /: code = %q, want PGRST117", method, e.Code)
+			}
+			if e.Message != "Unsupported HTTP method: "+method {
+				t.Errorf("%s /: message = %q", method, e.Message)
+			}
+		}
+	})
+}
+
+// OPTIONS on the root answers 200 with the verb set in Allow and no body.
+func TestRootOptionsAllow(t *testing.T) {
+	onBoth(t, func(t *testing.T, base string) {
+		res := doRequest(t, base, compatCase{method: "OPTIONS", path: "/"})
+		if res.status != http.StatusOK {
+			t.Fatalf("status = %d, want 200\n%s", res.status, res.body)
+		}
+		if allow := res.header.Get("Allow"); allow != "OPTIONS,GET,HEAD" {
+			t.Errorf("Allow = %q, want OPTIONS,GET,HEAD", allow)
+		}
+		if len(res.body) != 0 {
+			t.Errorf("body = %q, want empty", res.body)
+		}
+	})
+}
+
 // TestRootSecurityInactiveByDefault pins the default openapi-security-active
 // shape: with it off the document carries neither securityDefinitions nor a
 // security requirement, even though both servers authenticate JWTs.
