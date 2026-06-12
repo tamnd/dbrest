@@ -145,7 +145,7 @@ func (b *builder) argValue(fn *rpc.Function, name string, args map[string]ir.Val
 		return "", pgerr.ErrInternal("rpc body references undeclared parameter :" + name)
 	}
 	if v, ok := args[name]; ok {
-		return b.bind(callArg(v)), nil
+		return b.bind(callArg(b.d, v)), nil
 	}
 	if p.Optional {
 		return b.bind(p.Default), nil
@@ -180,9 +180,9 @@ func singleObjectArgs(fn *rpc.Function, args map[string]ir.Value) map[string]ir.
 // decoded JSON value (numbers preserved, objects/arrays re-encoded to text); a
 // GET argument is the raw query-string text. Type coercion to the declared
 // parameter type lands with the types subsystem (spec 16).
-func callArg(v ir.Value) any {
+func callArg(d Dialect, v ir.Value) any {
 	if v.JSON != nil {
-		return writeArg(v)
+		return writeArg(d, v)
 	}
 	if v.Text != "" {
 		return v.Text

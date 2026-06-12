@@ -170,6 +170,11 @@ func (dialect) ArrayLiteral(pgText string) string {
 	return "[" + strings.Join(quoted, ",") + "]"
 }
 
+// ArrayArg stores a payload array as its JSON text: SQLite has no array
+// columns, so a JSON-typed column holds the array and reads it back as JSON.
+// A PostgreSQL {a,b} literal here would corrupt the column.
+func (dialect) ArrayArg(elems []any) any { return sqlgen.JSONArrayArg(elems) }
+
 // ArrayOp implements array containment/overlap via SQLite's json_each(). The
 // column must be declared as JSON type and store a JSON array (e.g.
 // '["cat","work"]'). For any other column type the operator is unsupported

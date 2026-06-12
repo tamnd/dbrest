@@ -287,3 +287,8 @@ func (Dialect) ArrayLiteral(pgText string) string {
 	}
 	return "[" + strings.Join(quoted, ",") + "]"
 }
+
+// ArrayArg stores a payload array as its JSON text: SQL Server has no array
+// columns, so an nvarchar column holds the array and reads it back as JSON.
+// A PostgreSQL {a,b} literal here would corrupt the column.
+func (Dialect) ArrayArg(elems []any) any { return sqlgen.JSONArrayArg(elems) }

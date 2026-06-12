@@ -195,7 +195,7 @@ func CompileInsert(d Dialect, q *ir.Query, returning []string) (*Statement, *pge
 					b.sb.WriteString(", ")
 				}
 				if val, ok := row[c]; ok {
-					b.sb.WriteString(b.bind(writeArg(val)))
+					b.sb.WriteString(b.bind(writeArg(b.d, val)))
 				} else if w.Missing == ir.MissingNull {
 					b.sb.WriteString(b.bind(nil))
 				} else {
@@ -236,7 +236,7 @@ func CompileUpdate(d Dialect, q *ir.Query, returning []string) (*Statement, *pge
 		}
 		b.sb.WriteString(d.QuoteIdent(c))
 		b.sb.WriteString(" = ")
-		b.sb.WriteString(b.bind(writeArg(w.Set[c])))
+		b.sb.WriteString(b.bind(writeArg(b.d, w.Set[c])))
 	}
 	if q.Where != nil {
 		b.sb.WriteString(" WHERE ")
@@ -313,14 +313,16 @@ func (b *builder) writeReturning(cols []string) *pgerr.APIError {
 }
 
 // WriteArg converts a decoded JSON payload value to a driver argument. Numbers
-// arrive as json.Number (the decoder preserves integer precision); objects and
-// arrays are re-encoded to their JSON text so they land in a json/text column.
-// It is exported for backends (e.g. the COPY path) that need the same coercion
-// without going through the SQL builder.
-func WriteArg(v ir.Value) any { return writeArg(v) }
+// arrive as json.Number (the decoder preserves integer precision); objects are
+// re-encoded to their JSON text so they land in a json/text column; arrays go
+// through the dialect, which knows whether the engine wants a PostgreSQL
+// {a,b} array literal or JSON text. It is exported for backends (e.g. the
+// MERGE path) that need the same coercion without going through the SQL
+// builder.
+func WriteArg(d Dialect, v ir.Value) any { return writeArg(d, v) }
 
 // writeArg is the unexported implementation used by the builder methods.
-func writeArg(v ir.Value) any {
+func writeArg(d Dialect, v ir.Value) any {
 	switch x := v.JSON.(type) {
 	case nil:
 		return nil
@@ -333,10 +335,7 @@ func writeArg(v ir.Value) any {
 		}
 		return x.String()
 	case []any:
-		// PostgreSQL array columns use {elem1,elem2} input syntax, not JSON
-		// ["elem1","elem2"]. Build the array literal so the server-side cast
-		// from text to text[]/int4[]/etc. succeeds with or without type OIDs.
-		return pgArrayLiteral(x)
+		return d.ArrayArg(x)
 	case map[string]any:
 		bs, err := json.Marshal(x)
 		if err != nil {
@@ -348,13 +347,26 @@ func writeArg(v ir.Value) any {
 	}
 }
 
-// pgArrayLiteral converts a JSON array into a PostgreSQL array literal string
+// JSONArrayArg re-encodes a decoded JSON array to its JSON text. It is the
+// ArrayArg implementation for engines without array columns, where a write
+// payload array lands in a json/text column and must read back as JSON.
+func JSONArrayArg(elems []any) any {
+	bs, err := json.Marshal(elems)
+	if err != nil {
+		return nil
+	}
+	return string(bs)
+}
+
+// PGArrayLiteral converts a JSON array into a PostgreSQL array literal string
 // of the form {elem1,"elem with spaces",NULL}. Elements that are plain
 // alphanumeric strings (and json.Number/bool) are emitted unquoted; strings
 // that contain commas, braces, backslashes, double-quotes, or whitespace are
 // double-quoted with internal backslash escaping, matching PostgreSQL's own
-// array output format.
-func pgArrayLiteral(elems []any) string {
+// array output format. It is the PostgreSQL Dialect's ArrayArg: the literal
+// text lets the server-side cast from text to text[]/int4[]/etc. succeed with
+// or without type OIDs.
+func PGArrayLiteral(elems []any) string {
 	var sb strings.Builder
 	sb.WriteByte('{')
 	for i, e := range elems {

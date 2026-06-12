@@ -266,7 +266,7 @@ func (b *Backend) executeUpsert(
 			if ci > 0 {
 				sb.WriteString(",")
 			}
-			sb.WriteString(bind(sqlgen.WriteArg(row[c])))
+			sb.WriteString(bind(sqlgen.WriteArg(d, row[c])))
 		}
 		sb.WriteString(")")
 	}

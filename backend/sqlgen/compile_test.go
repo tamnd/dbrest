@@ -80,6 +80,7 @@ func (stub) ArrayOp(col, op, val, _ string) (string, bool) {
 	return col + " " + op + " " + val, true
 }
 func (stub) ArrayLiteral(s string) string         { return s }
+func (stub) ArrayArg(e []any) any                 { return JSONArrayArg(e) }
 func (stub) ILike(col, val string) (string, bool) { return col + " ILIKE " + val, true }
 func (stub) BoolValue(v bool) string {
 	if v {
@@ -451,5 +452,60 @@ func TestCompileAggregateRejected(t *testing.T) {
 	})
 	if err == nil || err.Code != "PGRST127" {
 		t.Fatalf("want PGRST127 for aggregate, got %v", err)
+	}
+}
+
+// A payload array goes through the dialect on the write path: the stub (like
+// every engine without array columns) binds the JSON text, never a PostgreSQL
+// {a,b} literal. This is what lets a JSON column round-trip ["go","sql"].
+func TestCompileUpdateArrayBindsDialectForm(t *testing.T) {
+	st, err := CompileUpdate(stub{}, &ir.Query{
+		Relation: ir.Ref{Name: "todos"},
+		Write: &ir.WriteSpec{Set: map[string]ir.Value{
+			"tags": {JSON: []any{"go", "sql"}},
+		}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("CompileUpdate: %v", err)
+	}
+	if len(st.Args) != 1 || st.Args[0] != `["go","sql"]` {
+		t.Errorf("Args = %#v, want JSON text", st.Args)
+	}
+}
+
+func TestCompileInsertArrayBindsDialectForm(t *testing.T) {
+	st, err := CompileInsert(stub{}, &ir.Query{
+		Relation: ir.Ref{Name: "todos"},
+		Write: &ir.WriteSpec{
+			Columns: []string{"tags"},
+			Rows:    []map[string]ir.Value{{"tags": {JSON: []any{json.Number("1"), "two words"}}}},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("CompileInsert: %v", err)
+	}
+	if len(st.Args) != 1 || st.Args[0] != `[1,"two words"]` {
+		t.Errorf("Args = %#v, want JSON text", st.Args)
+	}
+}
+
+// PGArrayLiteral is the PostgreSQL form of the same payload: bare elements
+// unquoted, strings with spaces or quotes double-quoted and escaped, NULL for
+// JSON null.
+func TestPGArrayLiteral(t *testing.T) {
+	cases := []struct {
+		in   []any
+		want string
+	}{
+		{[]any{"go", "sql"}, `{go,sql}`},
+		{[]any{json.Number("1"), json.Number("2.5")}, `{1,2.5}`},
+		{[]any{"two words", `qu"ote`, nil}, `{"two words","qu\"ote",NULL}`},
+		{[]any{true, false}, `{t,f}`},
+		{[]any{}, `{}`},
+	}
+	for _, c := range cases {
+		if got := PGArrayLiteral(c.in); got != c.want {
+			t.Errorf("PGArrayLiteral(%v) = %q, want %q", c.in, got, c.want)
+		}
 	}
 }

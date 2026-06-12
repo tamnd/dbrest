@@ -244,3 +244,8 @@ func (Dialect) IsBool(string, bool) (string, bool) { return "", false }
 // ArrayLiteral returns the PostgreSQL {a,b} array literal unchanged; PostgreSQL
 // accepts it natively.
 func (Dialect) ArrayLiteral(pgText string) string { return pgText }
+
+// ArrayArg renders a payload array as the {a,b} array-literal text so the
+// server-side cast from text to text[]/int4[]/etc. succeeds with or without
+// type OIDs.
+func (Dialect) ArrayArg(elems []any) any { return sqlgen.PGArrayLiteral(elems) }

@@ -560,3 +560,86 @@ func TestReloadPublishesNewSchema(t *testing.T) {
 		t.Error("the document should describe the new table after reload")
 	}
 }
+
+// newJSONColumnServer builds a server over a table with a JSON column, the
+// shape the array round-trip tests need (films has none).
+func newJSONColumnServer(t testing.TB) *httpapi.Server {
+	t.Helper()
+	dsn := "file:" + strings.ReplaceAll(t.Name(), "/", "_") + "?mode=memory&cache=shared"
+	be, err := sqlite.Open(dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { be.Close() })
+	_, err = be.DB().Exec(`
+		CREATE TABLE todos (
+			id   INTEGER PRIMARY KEY,
+			task TEXT NOT NULL,
+			tags JSON
+		);
+		INSERT INTO todos (id, task, tags) VALUES (1, 'write spec', '["pets"]');
+	`)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	model, err := be.Introspect(context.Background())
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+	srv := httpapi.NewServer(be, model, nil)
+	srv.SetDefaultRole("anon")
+	return srv
+}
+
+// A JSON array in a write payload must land in a JSON column as JSON text and
+// read back as the same array, not as PostgreSQL {a,b} literal text. This was
+// the bug that corrupted tags columns on every PATCH/POST carrying an array.
+func TestPatchJSONArrayRoundTrips(t *testing.T) {
+	srv := newJSONColumnServer(t)
+	resp := send(t, srv, http.MethodPatch, "/todos?id=eq.1", `{"tags":["go","sql"]}`, map[string]string{
+		"Prefer": "return=representation",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("patch status = %d, want 200", resp.StatusCode)
+	}
+	rows := decodeArray(t, resp)
+	if len(rows) != 1 {
+		t.Fatalf("patch rows = %v", rows)
+	}
+	assertTags := func(stage string, v any) {
+		t.Helper()
+		tags, ok := v.([]any)
+		if !ok || len(tags) != 2 || tags[0] != "go" || tags[1] != "sql" {
+			t.Fatalf("%s tags = %#v, want [go sql]", stage, v)
+		}
+	}
+	assertTags("representation", rows[0]["tags"])
+
+	resp = do(t, srv, http.MethodGet, "/todos?id=eq.1", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("get status = %d", resp.StatusCode)
+	}
+	rows = decodeArray(t, resp)
+	if len(rows) != 1 {
+		t.Fatalf("get rows = %v", rows)
+	}
+	assertTags("stored", rows[0]["tags"])
+}
+
+func TestPostJSONArrayRoundTrips(t *testing.T) {
+	srv := newJSONColumnServer(t)
+	resp := send(t, srv, http.MethodPost, "/todos", `{"id":2,"task":"pack","tags":["home",2]}`, map[string]string{
+		"Prefer": "return=representation",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("post status = %d, want 201", resp.StatusCode)
+	}
+	rows := decodeArray(t, resp)
+	if len(rows) != 1 {
+		t.Fatalf("post rows = %v", rows)
+	}
+	tags, ok := rows[0]["tags"].([]any)
+	if !ok || len(tags) != 2 || tags[0] != "home" || tags[1] != float64(2) {
+		t.Fatalf("tags = %#v, want [home 2]", rows[0]["tags"])
+	}
+}

@@ -107,6 +107,14 @@ type Dialect interface {
 	// do not support arrays may return the text unchanged (they never reach
 	// ArrayOp either).
 	ArrayLiteral(pgText string) string
+
+	// ArrayArg converts a decoded JSON array from a write payload into the
+	// bound driver argument the engine expects. PostgreSQL renders the
+	// {elem1,elem2} array-literal text so the server-side cast to
+	// text[]/int4[]/etc. succeeds; engines without array columns (SQLite,
+	// MySQL, SQL Server) keep the JSON text so a json/text column stores the
+	// array unchanged and reads it back as a JSON array.
+	ArrayArg(elems []any) any
 }
 
 // PatternMark is the sentinel a Dialect.Regex fragment carries where the bound
