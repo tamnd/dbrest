@@ -60,3 +60,53 @@ func TestAttachPreRequestAcceptsSupportingBackend(t *testing.T) {
 		t.Fatalf("attachPreRequest on a supporting backend = %v, want nil", err)
 	}
 }
+
+func TestAttachAuthzNoopWhenUnset(t *testing.T) {
+	be := openTestBackend(t)
+	srv := httpapi.NewServer(be, nil, nil)
+	if err := attachAuthz(srv, &config.Config{Backend: "sqlite"}); err != nil {
+		t.Fatalf("attachAuthz with no registry = %v, want nil", err)
+	}
+}
+
+func TestAttachAuthzWiresParsedRegistry(t *testing.T) {
+	be := openTestBackend(t)
+	srv := httpapi.NewServer(be, nil, nil)
+	cfg := &config.Config{Backend: "sqlite", PolicyRegistry: `{
+		"grants": [{"role": "web_user", "relation": "todos", "actions": ["select"]}]
+	}`}
+	if err := attachAuthz(srv, cfg); err != nil {
+		t.Fatalf("attachAuthz with a valid registry = %v, want nil", err)
+	}
+}
+
+func TestAttachAuthzRefusesBadRegistry(t *testing.T) {
+	// The registry is the security boundary on the emulated backends, so a
+	// declaration the parser cannot fully understand must stop the boot.
+	be := openTestBackend(t)
+	srv := httpapi.NewServer(be, nil, nil)
+	cfg := &config.Config{Backend: "sqlite", PolicyRegistry: `{"grants": [{"role": "r"}]}`}
+	err := attachAuthz(srv, cfg)
+	if err == nil {
+		t.Fatal("attachAuthz = nil, want a startup refusal on an unparseable registry")
+	}
+	if !strings.Contains(err.Error(), "policy-registry") {
+		t.Errorf("error %q does not name the policy-registry option", err)
+	}
+}
+
+func TestAttachAuthzRefusesPostgres(t *testing.T) {
+	// Postgres enforces grants and RLS in the engine; a registry there would
+	// suggest a second enforcement layer that does not exist, so it is a
+	// misconfiguration rather than a silent no-op.
+	be := openTestBackend(t)
+	srv := httpapi.NewServer(be, nil, nil)
+	cfg := &config.Config{Backend: "postgres", PolicyRegistry: `{}`}
+	err := attachAuthz(srv, cfg)
+	if err == nil {
+		t.Fatal("attachAuthz = nil, want a refusal on the postgres backend")
+	}
+	if !strings.Contains(err.Error(), "policy-registry") {
+		t.Errorf("error %q does not name the policy-registry option", err)
+	}
+}

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/tamnd/dbrest/auth"
+	"github.com/tamnd/dbrest/authz"
 	"github.com/tamnd/dbrest/backend"
 	_ "github.com/tamnd/dbrest/backend/mongo"
 	_ "github.com/tamnd/dbrest/backend/mysql"
@@ -65,6 +66,9 @@ func run() error {
 	if err := attachPreRequest(srv, be, cfg); err != nil {
 		return err
 	}
+	if err := attachAuthz(srv, cfg); err != nil {
+		return err
+	}
 
 	log.Printf("dbrest listening on %s (backend %s, %d relations)", cfg.ServerAddr(), cfg.Backend, model.Len())
 	if err := http.ListenAndServe(cfg.ServerAddr(), srv); err != nil {
@@ -112,6 +116,28 @@ func attachPreRequest(srv *httpapi.Server, be backend.Backend, cfg *config.Confi
 		return nil
 	}
 	return fmt.Errorf("db-pre-request: the %s backend cannot run a pre-request function; unset the option", cfg.Backend)
+}
+
+// attachAuthz wires the emulated authorization layer from the policy-registry
+// option. With no registry configured the gate stays off, which mirrors a
+// database where every role holds every privilege; declaring a registry flips
+// the model, and from then on the absence of a grant is a denial. A registry
+// the parser cannot fully understand is a startup error, never a silently
+// thinner rule set. Postgres delegates privileges and RLS to the engine, so a
+// registry configured there is a misconfiguration and is refused too.
+func attachAuthz(srv *httpapi.Server, cfg *config.Config) error {
+	if cfg.PolicyRegistry == "" {
+		return nil
+	}
+	if cfg.Backend == "postgres" {
+		return fmt.Errorf("policy-registry: the postgres backend enforces grants and RLS natively; manage them in the database and unset the option")
+	}
+	reg, err := authz.ParseRegistry(cfg.PolicyRegistry)
+	if err != nil {
+		return err
+	}
+	srv.SetAuthz(reg)
+	return nil
 }
 
 // attachAuth wires a JWT verifier onto the server. The verifier is always
