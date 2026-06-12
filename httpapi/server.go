@@ -43,6 +43,9 @@ type Server struct {
 	corsOrigins  []string // server-cors-allowed-origins; empty means any
 	maxRows      int      // db-max-rows; 0 means no cap
 	planEnabled  bool     // db-plan-enabled; plans are off by default
+	preRequest   string   // db-pre-request, carried to the backend per request
+	appSettings  map[string]string
+	logQuery     bool // log-query, carried to the backend per request
 }
 
 // NewServer builds a Server over a backend, its introspected model, and the
@@ -108,6 +111,19 @@ func (s *Server) SetCORSAllowedOrigins(origins []string) { s.corsOrigins = origi
 // unproducible media type.
 func (s *Server) SetPlanEnabled(on bool) { s.planEnabled = on }
 
+// SetPreRequest names the db-pre-request function carried to the backend on
+// every request context; the backend invokes it inside the request
+// transaction where the engine supports it.
+func (s *Server) SetPreRequest(fn string) { s.preRequest = fn }
+
+// SetAppSettings carries the app.settings.* options to the backend on every
+// request context, to be applied as transaction settings.
+func (s *Server) SetAppSettings(settings map[string]string) { s.appSettings = settings }
+
+// SetLogQuery asks backends to echo the statements they execute, the
+// log-query option.
+func (s *Server) SetLogQuery(on bool) { s.logQuery = on }
+
 // SetVerifier attaches a JWT verifier. Once set, the role and claims of each
 // request come from its bearer token (spec 13), and a bad token is rejected
 // before any query runs. With no verifier the server keeps the static role.
@@ -142,24 +158,29 @@ type identity struct {
 
 // buildContext assembles the per-request context the backend receives: the
 // resolved identity plus the request metadata that crosses the HTTP/query
-// boundary (method, path, headers, cookies, and the selected schema). The
-// frontend builds it once after authentication; on the emulated backend the
-// values a policy references are later bound as parameters (spec 15).
-func buildContext(r *http.Request, id identity) *reqctx.Context {
+// boundary (method, path, headers, cookies, and the selected schema), and the
+// configured transaction-scoped settings (db-pre-request, app.settings.*,
+// log-query). The frontend builds it once after authentication; on the
+// emulated backend the values a policy references are later bound as
+// parameters (spec 15).
+func (s *Server) buildContext(r *http.Request, id identity) *reqctx.Context {
 	cookies := r.Cookies()
 	jar := make(map[string]string, len(cookies))
 	for _, c := range cookies {
 		jar[c.Name] = c.Value
 	}
 	return &reqctx.Context{
-		Role:      id.role,
-		Anonymous: id.anonymous,
-		Claims:    id.claims,
-		Method:    r.Method,
-		Path:      r.URL.Path,
-		Headers:   r.Header,
-		Cookies:   jar,
-		Schema:    requestSchema(r),
+		Role:        id.role,
+		Anonymous:   id.anonymous,
+		Claims:      id.claims,
+		Method:      r.Method,
+		Path:        r.URL.Path,
+		Headers:     r.Header,
+		Cookies:     jar,
+		Schema:      requestSchema(r),
+		PreRequest:  s.preRequest,
+		AppSettings: s.appSettings,
+		LogQuery:    s.logQuery,
 	}
 }
 
@@ -391,7 +412,7 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 		}
 	}
 
-	rc := buildContext(r, id)
+	rc := s.buildContext(r, id)
 	res, err := s.backend.Execute(r.Context(), planned, rc)
 	if err != nil {
 		writeError(w, mapExecError(s.backend, err, id.anonymous))
@@ -485,7 +506,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity)
 		return
 	}
 
-	rc := buildContext(r, id)
+	rc := s.buildContext(r, id)
 
 	if apiErr := s.authorize(rc, planned); apiErr != nil {
 		writeError(w, apiErr)
@@ -567,7 +588,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.Que
 		return
 	}
 
-	rc := buildContext(r, id)
+	rc := s.buildContext(r, id)
 	if apiErr := s.authorize(rc, planned); apiErr != nil {
 		writeError(w, apiErr)
 		return

@@ -44,6 +44,20 @@ type Context struct {
 	// introspection subsystem's job (spec 08); this field carries the choice.
 	Schema string
 
+	// PreRequest names the db-pre-request function. A backend that can call
+	// functions invokes it inside the request transaction after the context
+	// settings are in place, the upstream hook point; empty means no hook.
+	PreRequest string
+
+	// AppSettings are the app.settings.* options, keys without the prefix. A
+	// backend applies them as transaction settings (GUCs on PostgreSQL) next
+	// to the request context.
+	AppSettings map[string]string
+
+	// LogQuery asks the backend to echo the statements it executes for this
+	// request, the log-query option.
+	LogQuery bool
+
 	controls ResponseControls
 }
 

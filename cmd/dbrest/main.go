@@ -239,9 +239,7 @@ func openBackend(cfg *config.Config) (backend.Backend, error) {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
 	applyPoolConfig(be, cfg)
-	if sc, ok := be.(interface{ SetSchemas([]string) }); ok {
-		sc.SetSchemas(cfg.Schemas)
-	}
+	applySchemaConfig(be, cfg)
 	// Wire declared function registry for backends that cannot discover
 	// functions from an engine catalog (NativeRPC=false: SQLite, MySQL, …).
 	if cfg.FunctionRegistry != "" {
@@ -254,6 +252,20 @@ func openBackend(cfg *config.Config) (backend.Backend, error) {
 		}
 	}
 	return be, nil
+}
+
+// applySchemaConfig pushes the schema-shaped options onto a backend that
+// accepts them: the exposed schemas and db-extra-search-path, which extends
+// type and function resolution without exposing the schemas. It runs at open
+// and again on a config reload. Backends that have no schema notion ignore
+// both by not implementing the setters.
+func applySchemaConfig(be any, cfg *config.Config) {
+	if sc, ok := be.(interface{ SetSchemas([]string) }); ok {
+		sc.SetSchemas(cfg.Schemas)
+	}
+	if sp, ok := be.(interface{ SetExtraSearchPath([]string) }); ok {
+		sp.SetExtraSearchPath(cfg.ExtraSearchPath)
+	}
 }
 
 // applyPoolConfig sizes the connection pool on the engines built over

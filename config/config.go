@@ -423,11 +423,12 @@ func (c *Config) validate(errs *[]string) {
 // turn anything yet. An entry leaves this list when its subsystem ships.
 var unenforcedOptions = []string{
 	"db-aggregates-enabled", "db-channel", "db-channel-enabled", "db-config",
-	"db-hoisted-tx-settings", "db-pool-acquisition-timeout",
-	"db-pool-automatic-recovery", "db-pre-config",
+	"db-extra-search-path", "db-hoisted-tx-settings",
+	"db-pool-acquisition-timeout", "db-pool-automatic-recovery",
+	"db-pre-config", "db-pre-request", "pre-request",
 	"db-prepared-statements", "db-root-spec", "root-spec", "db-tx-end",
-	"jwt-secret-is-base64", "secret-is-base64", "openapi-security-active",
-	"server-trace-header", "server-timing-enabled",
+	"jwt-secret-is-base64", "secret-is-base64", "log-query",
+	"openapi-security-active", "server-trace-header", "server-timing-enabled",
 }
 
 // unenforcedWarnings returns one warning per explicitly set option that parses

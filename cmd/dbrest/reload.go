@@ -95,9 +95,7 @@ func (a *app) reloadConfig(environ []string) error {
 		log.Printf("dbrest: warning: %s", w)
 	}
 	a.cfg = merged
-	if sc, ok := a.be.(interface{ SetSchemas([]string) }); ok {
-		sc.SetSchemas(merged.Schemas)
-	}
+	applySchemaConfig(a.be, merged)
 	return a.rebuildLocked()
 }
 
@@ -110,6 +108,9 @@ func (a *app) rebuildLocked() error {
 	srv.SetCORSAllowedOrigins(a.cfg.CORSAllowedOrigins)
 	srv.SetMaxRows(a.cfg.MaxRows)
 	srv.SetPlanEnabled(a.cfg.PlanEnabled)
+	srv.SetPreRequest(a.cfg.PreRequest)
+	srv.SetAppSettings(a.cfg.AppSettings)
+	srv.SetLogQuery(a.cfg.LogQuery)
 	if err := attachAuth(srv, a.cfg); err != nil {
 		return err
 	}
