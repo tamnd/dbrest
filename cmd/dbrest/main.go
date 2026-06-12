@@ -128,7 +128,8 @@ func run() error {
 		return fmt.Errorf("listen on %s: %w", where, err)
 	}
 	log.Printf("dbrest listening on %s (backend %s, %d relations)", ln.Addr(), cfg.Backend, a.Model().Len())
-	if err := http.Serve(ln, a); err != nil {
+	logged := &requestLogger{next: a, level: a.logLevel, out: log.Default()}
+	if err := http.Serve(ln, logged); err != nil {
 		return fmt.Errorf("serve: %w", err)
 	}
 	return nil

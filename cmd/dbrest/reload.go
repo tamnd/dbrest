@@ -50,6 +50,14 @@ func (a *app) Model() *schema.Model {
 	return a.model
 }
 
+// logLevel is the log-level currently in force; the request logger reads it
+// per request so a config reload changes it live.
+func (a *app) logLevel() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.cfg.LogLevel
+}
+
 // reloadSchema re-introspects the database and swaps in a frontend built on
 // the fresh cache. It is both the boot-time load and the SIGUSR1 handler; on
 // failure the old cache stays in service.
