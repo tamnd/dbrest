@@ -525,8 +525,15 @@ func listenSpecs(host string, port int) []ListenSpec {
 	}
 }
 
-// Listeners are the API listener candidates, in preference order.
-func (c *Config) Listeners() []ListenSpec { return listenSpecs(c.ServerHost, c.ServerPort) }
+// Listeners are the API listener candidates, in preference order. Setting
+// server-unix-socket replaces the TCP listener entirely, as it does upstream;
+// the admin server stays on TCP either way.
+func (c *Config) Listeners() []ListenSpec {
+	if c.ServerUnixSocket != "" {
+		return []ListenSpec{{"unix", c.ServerUnixSocket}}
+	}
+	return listenSpecs(c.ServerHost, c.ServerPort)
+}
 
 // AdminListeners are the admin listener candidates, in preference order.
 func (c *Config) AdminListeners() []ListenSpec {

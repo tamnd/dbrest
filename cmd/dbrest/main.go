@@ -7,12 +7,15 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/tamnd/dbrest/adminapi"
@@ -116,15 +119,46 @@ func run() error {
 		startAdmin(cfg, be, a, metrics)
 	}
 
-	ln, err := listenFirst(cfg.Listeners())
+	ln, err := listenAPI(cfg)
 	if err != nil {
-		return fmt.Errorf("listen on %s: %w", cfg.ServerAddr(), err)
+		where := cfg.ServerAddr()
+		if cfg.ServerUnixSocket != "" {
+			where = cfg.ServerUnixSocket
+		}
+		return fmt.Errorf("listen on %s: %w", where, err)
 	}
 	log.Printf("dbrest listening on %s (backend %s, %d relations)", ln.Addr(), cfg.Backend, a.Model().Len())
 	if err := http.Serve(ln, a); err != nil {
 		return fmt.Errorf("serve: %w", err)
 	}
 	return nil
+}
+
+// listenAPI binds the API listener. With server-unix-socket set the socket
+// replaces TCP entirely, the upstream behavior: a stale socket file from a
+// previous run is removed, the socket is bound, and server-unix-socket-mode
+// (already validated at load) is applied to it.
+func listenAPI(cfg *config.Config) (net.Listener, error) {
+	if cfg.ServerUnixSocket == "" {
+		return listenFirst(cfg.Listeners())
+	}
+	if err := os.Remove(cfg.ServerUnixSocket); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+	ln, err := net.Listen("unix", cfg.ServerUnixSocket)
+	if err != nil {
+		return nil, err
+	}
+	mode, err := strconv.ParseUint(cfg.ServerUnixSocketMode, 8, 32)
+	if err != nil {
+		ln.Close()
+		return nil, fmt.Errorf("server-unix-socket-mode: %w", err)
+	}
+	if err := os.Chmod(cfg.ServerUnixSocket, os.FileMode(mode)); err != nil {
+		ln.Close()
+		return nil, err
+	}
+	return ln, nil
 }
 
 // listenFirst binds the first candidate that works, in the preference order

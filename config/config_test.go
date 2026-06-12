@@ -593,6 +593,27 @@ func TestListenSpecs(t *testing.T) {
 	}
 }
 
+// TestUnixSocketReplacesTCP pins the listener selection: with
+// server-unix-socket set the only candidate is the socket, and the admin
+// listeners stay TCP.
+func TestUnixSocketReplacesTCP(t *testing.T) {
+	c, err := FromMap(map[string]string{
+		"db-uri": "x", "server-unix-socket": "/tmp/dbrest.sock", "admin-server-port": "3001",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := c.Listeners()
+	if len(got) != 1 || got[0] != (ListenSpec{"unix", "/tmp/dbrest.sock"}) {
+		t.Errorf("Listeners = %v, want the unix socket only", got)
+	}
+	for _, spec := range c.AdminListeners() {
+		if spec.Network == "unix" {
+			t.Errorf("admin listener went to the socket: %v", spec)
+		}
+	}
+}
+
 // TestSchemasDefaultFollowsBackend pins the engine-aware db-schemas default:
 // public on postgres, main on sqlite, the backend's own default elsewhere,
 // with an explicit value always winning and an explicitly empty one rejected.
