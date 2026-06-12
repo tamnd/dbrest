@@ -69,12 +69,30 @@ func TestAuthzGrantedReadSucceeds(t *testing.T) {
 	}
 }
 
-func TestAuthzColumnGrantHidesUngrantedColumn(t *testing.T) {
+func TestAuthzColumnGrantRejectsStarProjection(t *testing.T) {
 	srv := authzServer(t, []authz.Grant{
 		{Role: "web_user", Relation: "films", Action: authz.Select, Columns: []string{"id", "title"}},
 	}, nil)
-	// A star projection is narrowed to the granted columns.
+	// No select parameter is SELECT *, which a column-limited grant does not
+	// cover: PostgreSQL raises 42501, PostgREST surfaces 403, and so do we.
 	resp := do(t, srv, http.MethodGet, "/films?id=eq.2", map[string]string{
+		"Authorization": "Bearer " + userToken(t, "web_user", "alice"),
+	})
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", resp.StatusCode)
+	}
+	var env map[string]any
+	json.NewDecoder(resp.Body).Decode(&env)
+	if env["code"] != "42501" {
+		t.Errorf("code = %v, want 42501", env["code"])
+	}
+}
+
+func TestAuthzColumnGrantAllowsNamedColumns(t *testing.T) {
+	srv := authzServer(t, []authz.Grant{
+		{Role: "web_user", Relation: "films", Action: authz.Select, Columns: []string{"id", "title"}},
+	}, nil)
+	resp := do(t, srv, http.MethodGet, "/films?select=id,title&id=eq.2", map[string]string{
 		"Authorization": "Bearer " + userToken(t, "web_user", "alice"),
 	})
 	if resp.StatusCode != http.StatusOK {
@@ -83,9 +101,6 @@ func TestAuthzColumnGrantHidesUngrantedColumn(t *testing.T) {
 	rows := decodeArray(t, resp)
 	if len(rows) != 1 {
 		t.Fatalf("rows = %d, want 1", len(rows))
-	}
-	if _, ok := rows[0]["rating"]; ok {
-		t.Error("rating is not granted and must not appear")
 	}
 	if _, ok := rows[0]["title"]; !ok {
 		t.Error("title is granted and should appear")
