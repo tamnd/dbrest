@@ -35,6 +35,32 @@ var optionKeys = []string{
 	"policy-registry", "capability-overrides",
 }
 
+// nativeOptionKeys are the dbrest extensions inside optionKeys: options
+// PostgREST does not have. They stay out of the PGRST_ environment namespace
+// so a future upstream release adding a key with the same name cannot
+// silently change dbrest behavior; the environment spelling is DBREST_ only,
+// and the file accepts both the bare name (the documented extension list) and
+// an explicit dbrest. prefix.
+var nativeOptionKeys = []string{
+	"db-backend", "jwk-set", "max-rows",
+	"declared-schema", "declared-relationships",
+	"function-registry", "policy-registry", "capability-overrides",
+}
+
+// isNativeKey reports whether key is a dbrest extension rather than a
+// PostgREST-compatible option.
+var isNativeKey = func() map[string]bool {
+	m := make(map[string]bool, len(nativeOptionKeys))
+	for _, k := range nativeOptionKeys {
+		m[k] = true
+	}
+	return m
+}()
+
+// nativeFilePrefix is the explicit file spelling for a dbrest extension,
+// "dbrest.max-rows" for "max-rows".
+const nativeFilePrefix = "dbrest."
+
 // appSettingsPrefix is the dynamic option namespace: any app.settings.<name>
 // key is accepted and carried to the backend as a transaction setting.
 const appSettingsPrefix = "app.settings."
@@ -66,9 +92,19 @@ func overlayEnv(raw map[string]string, environ []string) []string {
 	for _, k := range optionKeys {
 		known[envSuffix(k)] = true
 	}
+	nativeSuffix := map[string]bool{}
+	for _, k := range nativeOptionKeys {
+		nativeSuffix[envSuffix(k)] = true
+	}
 	var warnings []string
 	for _, prefix := range []string{"PGRST_", "DBREST_"} {
 		for _, key := range optionKeys {
+			// dbrest extensions never bind from the PGRST namespace, so a
+			// future upstream option with the same name cannot change dbrest
+			// behavior through an existing deployment's environment.
+			if prefix == "PGRST_" && isNativeKey[key] {
+				continue
+			}
 			if v, ok := env[prefix+envSuffix(key)]; ok {
 				raw[key] = v
 			}
@@ -82,6 +118,10 @@ func overlayEnv(raw map[string]string, environ []string) []string {
 			}
 			if setting, ok := strings.CutPrefix(suffix, appSettingsEnvPrefix); ok && setting != "" {
 				raw[appSettingsPrefix+strings.ToLower(setting)] = v
+				continue
+			}
+			if prefix == "PGRST_" && nativeSuffix[suffix] {
+				warnings = append(warnings, fmt.Sprintf("ignoring %s: %q is a dbrest extension; set DBREST_%s instead", name, strings.ToLower(strings.ReplaceAll(suffix, "_", "-")), suffix))
 				continue
 			}
 			if !known[suffix] {
@@ -122,6 +162,12 @@ func parseFile(path string) (map[string]string, []string, error) {
 		}
 		key := strings.TrimSpace(rawKey)
 		val := strings.TrimSpace(rawVal)
+		// "dbrest.<key>" is the explicit file spelling for an extension; it
+		// maps onto the bare key, and a non-extension name under the prefix
+		// falls through to the unknown-option warning below.
+		if name, ok := strings.CutPrefix(key, nativeFilePrefix); ok && isNativeKey[name] {
+			key = name
+		}
 		if !known[key] && !strings.HasPrefix(key, appSettingsPrefix) {
 			warnings = append(warnings, fmt.Sprintf("%s line %d: ignoring unknown option %q", path, i+1, key))
 			key = ""

@@ -336,6 +336,76 @@ func TestMaxRowsAlias(t *testing.T) {
 	}
 }
 
+// TestNativeKeysScopedToDBREST pins the namespace split: a dbrest extension
+// does not bind from the PGRST_ environment prefix (a future PostgREST
+// release adding the same name must not change dbrest behavior), it warns
+// there instead, and the DBREST_ spelling keeps working.
+func TestNativeKeysScopedToDBREST(t *testing.T) {
+	c, err := Load("", []string{"DBREST_DB_URI=x", "PGRST_DB_BACKEND=postgres", "PGRST_MAX_ROWS=5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Backend != BackendSQLite {
+		t.Errorf("backend = %q, PGRST_DB_BACKEND must not bind", c.Backend)
+	}
+	if c.MaxRows != 0 {
+		t.Errorf("max-rows = %d, PGRST_MAX_ROWS must not bind", c.MaxRows)
+	}
+	joined := strings.Join(c.Warnings, "\n")
+	for _, name := range []string{"PGRST_DB_BACKEND", "PGRST_MAX_ROWS"} {
+		if !strings.Contains(joined, name) {
+			t.Errorf("expected a warning naming %s, got %q", name, c.Warnings)
+		}
+	}
+
+	c, err = Load("", []string{"DBREST_DB_URI=x", "DBREST_DB_BACKEND=postgres"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Backend != BackendPostgres {
+		t.Errorf("backend = %q, DBREST_DB_BACKEND should bind", c.Backend)
+	}
+}
+
+// TestNativeKeysFilePrefix covers the explicit dbrest. file spelling: it maps
+// onto the bare extension key, and a non-extension name under the prefix gets
+// the unknown-option warning.
+func TestNativeKeysFilePrefix(t *testing.T) {
+	path := writeConf(t, `
+db-uri = "x"
+dbrest.max-rows = 25
+dbrest.function-registry = "fns.json"
+dbrest.server-port = 9999
+`)
+	c, err := Load(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.MaxRows != 25 || c.FunctionRegistry != "fns.json" {
+		t.Errorf("dbrest. prefixed keys did not bind: max-rows=%d registry=%q", c.MaxRows, c.FunctionRegistry)
+	}
+	if c.ServerPort != 3000 {
+		t.Errorf("server-port = %d, dbrest.server-port is not an extension and must not bind", c.ServerPort)
+	}
+	if !strings.Contains(strings.Join(c.Warnings, "\n"), "dbrest.server-port") {
+		t.Errorf("expected an unknown-option warning for dbrest.server-port, got %q", c.Warnings)
+	}
+}
+
+// TestNativeKeysAreKnown guards the extension list: every native key must be
+// a real option, so a rename cannot silently orphan the scoping.
+func TestNativeKeysAreKnown(t *testing.T) {
+	known := map[string]bool{}
+	for _, k := range optionKeys {
+		known[k] = true
+	}
+	for _, k := range nativeOptionKeys {
+		if !known[k] {
+			t.Errorf("native key %q is not in optionKeys", k)
+		}
+	}
+}
+
 func TestUnknownEnvKeyIgnored(t *testing.T) {
 	// A typo in the variable name is not a known option, so it must not leak in.
 	c, err := Load("", []string{"PGRST_DB_URY=typo", "DBREST_DB_URI=file:real.db"})
