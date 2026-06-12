@@ -168,6 +168,11 @@ func (v *Verifier) Authenticate(authHeader string) (*Result, *pgerr.APIError) {
 	if !ok {
 		return v.anon()
 	}
+	if raw == "" {
+		// A bearer scheme with nothing after it is a malformed credential, not
+		// an anonymous request: PostgREST answers PGRST301 with this message.
+		return nil, pgerr.ErrJWTDecode("Empty JWT is sent in Authorization header")
+	}
 	if !v.hasKeys {
 		return nil, pgerr.ErrJWTSecretMissing()
 	}
@@ -408,15 +413,20 @@ func (v *Verifier) audMatches(aud string) bool {
 }
 
 // resolve reads the role from the claims and applies the anon fallback and the
-// permitted-role check. A valid token that resolves to no role and has no anon
-// fallback is refused; a role outside the permitted set is a 403.
+// permitted-role check. Only a genuinely absent role claim falls back to the
+// anonymous role: a present claim of any other type is rendered to text and
+// used as the role name, exactly as PostgREST does (the engine or the authz
+// registry then denies a role that does not exist, rather than the client
+// being silently downgraded to anonymous data). A valid token that resolves
+// to no role and has no anon fallback is refused; a role outside the
+// permitted set is a 403.
 func (v *Verifier) resolve(claims map[string]any) (*Result, *pgerr.APIError) {
-	role := roleFromClaims(claims, v.roleKeyPath)
-	if role == "" {
+	role, present := roleFromClaims(claims, v.roleKeyPath)
+	if !present {
 		role = v.anonRole
-	}
-	if role == "" {
-		return nil, errAnonDisabled()
+		if role == "" {
+			return nil, errAnonDisabled()
+		}
 	}
 	if apiErr := v.checkPermitted(role); apiErr != nil {
 		return nil, apiErr
@@ -503,29 +513,49 @@ func (v *Verifier) resolveMethods(allowed []string) ([]string, error) {
 	return methods, nil
 }
 
-// bearer extracts the token from an Authorization header value, accepting the
-// "Bearer" scheme case-insensitively. It reports false for any other header.
+// bearer extracts the token from an Authorization header value, mirroring the
+// wai-extra extractBearerAuth PostgREST uses: the first whitespace ends the
+// scheme word, the comparison is case-insensitive, and the token is whatever
+// follows the leading whitespace, possibly empty. It reports false only when
+// the credentials are not a bearer scheme at all, which is the anonymous
+// path; "Bearer" with an empty token reports true so the caller can answer
+// PGRST301 instead of downgrading the client to anon.
 func bearer(header string) (string, bool) {
-	const scheme = "bearer "
-	if len(header) < len(scheme) || !strings.EqualFold(header[:len(scheme)], scheme) {
+	scheme, rest := header, ""
+	if i := strings.IndexAny(header, " \t"); i >= 0 {
+		scheme, rest = header[:i], header[i+1:]
+	}
+	if !strings.EqualFold(scheme, "Bearer") {
 		return "", false
 	}
-	tok := strings.TrimSpace(header[len(scheme):])
-	return tok, tok != ""
+	return strings.TrimLeft(rest, " \t"), true
 }
 
-// roleFromClaims walks the role-claim JSPath over the claim set and returns the
-// string value it resolves to, or "" if the path resolves to nothing or to a
-// non-string value.
-func roleFromClaims(claims map[string]any, path []jsPathExp) string {
+// roleFromClaims walks the role-claim JSPath over the claim set, reporting
+// whether the path resolved to a value at all. A resolved value is rendered
+// the way PostgREST renders a claim where text is expected: a string is taken
+// bare, anything else (a number, bool, null, array, or object) becomes its
+// compact JSON text and is used as the role name verbatim.
+func roleFromClaims(claims map[string]any, path []jsPathExp) (string, bool) {
 	val, ok := walkJSPath(claims, path)
 	if !ok {
-		return ""
+		return "", false
 	}
+	return unquoted(val), true
+}
+
+// unquoted renders a claim value as the text PostgREST would use it as: a
+// string stays bare, every other JSON value is its compact rendering ("null",
+// "42", "true", "[\"a\"]").
+func unquoted(val any) string {
 	if s, ok := val.(string); ok {
 		return s
 	}
-	return ""
+	b, err := json.Marshal(val)
+	if err != nil {
+		return fmt.Sprint(val)
+	}
+	return string(b)
 }
 
 // presentClaim reports a claim's value when it is present and non-null. An

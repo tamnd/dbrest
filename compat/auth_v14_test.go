@@ -137,3 +137,20 @@ func TestV14ClaimValidation(t *testing.T) {
 			token: emptyAud, wantStatus: 200},
 	})
 }
+
+// The token edge cases (item 03.7): a bearer scheme with an empty token is a
+// 401 PGRST301, never a silent anon downgrade, while credentials of another
+// scheme are not a token at all and run anonymous. The non-string role claim
+// half of the item is covered in auth's unit tests: its observable error
+// ("role ... does not exist") comes from the engine's role catalog, which the
+// emulated stack does not have.
+func TestV14TokenEdgeCases(t *testing.T) {
+	runAuthCases(t, []authCase{
+		{name: "empty bearer is 401 PGRST301", method: http.MethodGet, path: "/todos",
+			header: map[string]string{"Authorization": "Bearer"}, wantStatus: 401},
+		{name: "blank bearer is 401 PGRST301", method: http.MethodGet, path: "/todos",
+			header: map[string]string{"Authorization": "Bearer   "}, wantStatus: 401},
+		{name: "basic credentials run anonymous", method: http.MethodGet, path: "/todos",
+			header: map[string]string{"Authorization": "Basic d2ViX3VzZXI6cHc="}, wantStatus: 200},
+	})
+}

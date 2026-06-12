@@ -90,6 +90,89 @@ func TestBearerSchemeCaseInsensitive(t *testing.T) {
 	}
 }
 
+func TestNonBearerSchemeRunsAnon(t *testing.T) {
+	// Credentials of another scheme are not bearer tokens at all; PostgREST
+	// ignores them and the request runs anonymous.
+	v := hmacVerifier(t, Config{})
+	res, err := v.Authenticate("Basic d2ViX3VzZXI6cHc=")
+	if err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+	if res.Role != anonRole || !res.Anonymous {
+		t.Fatalf("non-bearer credentials = %+v, want anon", res)
+	}
+}
+
+func TestEmptyBearerIs301(t *testing.T) {
+	// "Authorization: Bearer" with no token is a malformed credential, not an
+	// anonymous request: PostgREST answers 401 PGRST301 with this exact
+	// message and the invalid_token challenge.
+	v := hmacVerifier(t, Config{})
+	for _, header := range []string{"Bearer", "Bearer ", "Bearer    ", "bearer\t"} {
+		_, err := v.Authenticate(header)
+		if err == nil || err.Code != "PGRST301" || err.HTTPStatus != 401 {
+			t.Fatalf("Authenticate(%q) = %v, want 401 PGRST301", header, err)
+		}
+		if err.Message != "Empty JWT is sent in Authorization header" {
+			t.Errorf("Authenticate(%q) message = %q, want the exact PostgREST text", header, err.Message)
+		}
+		want := `Bearer error="invalid_token", error_description="Empty JWT is sent in Authorization header"`
+		if err.WWWAuthenticate != want {
+			t.Errorf("Authenticate(%q) WWW-Authenticate = %q, want %q", header, err.WWWAuthenticate, want)
+		}
+	}
+}
+
+func TestEmptyBearerBeatsMissingSecret(t *testing.T) {
+	// The empty-credential check answers before the key-material check: an
+	// empty bearer is the client's malformed request either way.
+	v, err := NewVerifier(Config{AnonRole: anonRole}) // no keys
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+	_, aerr := v.Authenticate("Bearer ")
+	if aerr == nil || aerr.Code != "PGRST301" {
+		t.Fatalf("empty bearer with no keys = %v, want PGRST301", aerr)
+	}
+}
+
+func TestNonStringRoleClaimUsedVerbatim(t *testing.T) {
+	// PostgREST renders a non-string role claim to its compact JSON text and
+	// uses it as the role name; the engine (or the authz registry) then denies
+	// a role that does not exist. The client is never silently downgraded to
+	// the anonymous role. Verified against postgrest/14.12: role 123 yields
+	// `role "123" does not exist`, role null yields `role "null" does not
+	// exist`, and so on.
+	cases := []struct {
+		name  string
+		claim any
+		want  string
+	}{
+		{"number", 123, "123"},
+		{"float", 12.5, "12.5"},
+		{"bool", true, "true"},
+		{"null", nil, "null"},
+		{"array", []any{"web_user"}, `["web_user"]`},
+		{"object", map[string]any{"a": 1}, `{"a":1}`},
+	}
+	v := hmacVerifier(t, Config{})
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tok := signHS(t, jwt.MapClaims{"role": c.claim})
+			res, err := v.Authenticate("Bearer " + tok)
+			if err != nil {
+				t.Fatalf("Authenticate: %v", err)
+			}
+			if res.Role != c.want {
+				t.Errorf("role = %q, want %q (no anon downgrade)", res.Role, c.want)
+			}
+			if res.Anonymous {
+				t.Error("a present role claim must not be anonymous")
+			}
+		})
+	}
+}
+
 func TestTokenWithNoRoleFallsBackToAnon(t *testing.T) {
 	v := hmacVerifier(t, Config{})
 	tok := signHS(t, jwt.MapClaims{"sub": "123"})
