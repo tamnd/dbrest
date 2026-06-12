@@ -41,6 +41,7 @@ type Server struct {
 	openapiMode     string
 	openapiProxy    string
 	openapiSecurity bool
+	rootSpec        string
 }
 
 // NewServer builds a Server over a backend, its introspected model, and the
@@ -63,6 +64,11 @@ func (s *Server) SetOpenAPI(mode, proxyURI string, securityActive bool) {
 	s.openapiProxy = proxyURI
 	s.openapiSecurity = securityActive
 }
+
+// SetRootSpec names the function whose JSON result replaces the generated
+// OpenAPI document, the db-root-spec option. Empty keeps the generated
+// document. The function is called like GET /rpc/<fn> with no arguments.
+func (s *Server) SetRootSpec(fn string) { s.rootSpec = fn }
 
 // SetDefaultRole overrides the static role used for unauthenticated requests
 // when no verifier is configured. It should be called with the db-anon-role

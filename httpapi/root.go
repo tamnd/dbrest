@@ -9,6 +9,7 @@ import (
 	"github.com/tamnd/dbrest/ir"
 	"github.com/tamnd/dbrest/openapi"
 	"github.com/tamnd/dbrest/pgerr"
+	"github.com/tamnd/dbrest/plan"
 	"github.com/tamnd/dbrest/reqctx"
 	"github.com/tamnd/dbrest/schema"
 )
@@ -39,6 +40,12 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request, id identity,
 	}
 	if !rootAcceptable(r.Header.Values("Accept")) {
 		writeError(w, pgerr.ErrNotAcceptable(acceptedList(r.Header.Values("Accept"))))
+		return
+	}
+	if s.rootSpec != "" {
+		// db-root-spec replaces the generated document with the named
+		// function's result, upstream's escape hatch for a custom spec.
+		s.serveRootSpec(w, r, id, activeSchema)
 		return
 	}
 
@@ -83,6 +90,48 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request, id identity,
 	w.WriteHeader(http.StatusOK)
 	if r.Method != http.MethodHead {
 		w.Write(body)
+	}
+}
+
+// serveRootSpec invokes the db-root-spec function and serves its JSON result
+// in place of the generated document. The call runs exactly like GET
+// /rpc/<fn> with no arguments, the same planning and execution path, so role
+// switching and error mapping behave identically; only the response media
+// type differs, staying the root's openapi+json.
+func (s *Server) serveRootSpec(w http.ResponseWriter, r *http.Request, id identity, activeSchema string) {
+	call, apiErr := ir.ParseCall(s.rootSpec, "", nil, true, "", nil)
+	if apiErr != nil {
+		writeError(w, apiErr)
+		return
+	}
+
+	var planned *ir.Plan
+	if s.backend.Capabilities().NativeRPC {
+		planned = &ir.Plan{Call: call, ReadOnly: true}
+	} else {
+		planned, apiErr = plan.Call(s.backend.Functions(), call, true, []string{activeSchema})
+		if apiErr != nil {
+			writeError(w, apiErr)
+			return
+		}
+	}
+
+	rc := buildContext(r, id, activeSchema)
+	res, err := s.backend.Execute(r.Context(), planned, rc)
+	if err != nil {
+		writeError(w, mapExecError(s.backend, err, id.anonymous))
+		return
+	}
+	out, apiErr := renderCall(mediaJSON, res, planned.Func, s.rootSpec)
+	if apiErr != nil {
+		writeError(w, apiErr)
+		return
+	}
+
+	w.Header().Set("Content-Type", openapi.MediaType+"; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		w.Write(out.body)
 	}
 }
 

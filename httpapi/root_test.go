@@ -1,6 +1,7 @@
 package httpapi_test
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -8,7 +9,10 @@ import (
 
 	"github.com/tamnd/dbrest/auth"
 	"github.com/tamnd/dbrest/authz"
+	"github.com/tamnd/dbrest/backend/sqlite"
 	"github.com/tamnd/dbrest/config"
+	"github.com/tamnd/dbrest/httpapi"
+	"github.com/tamnd/dbrest/rpc"
 )
 
 // TestRootServesOpenAPI checks GET / returns the OpenAPI document with the
@@ -351,5 +355,76 @@ func TestRootAdvertisesServedOperators(t *testing.T) {
 	}
 	if strings.Contains(desc, " sl,") || strings.Contains(desc, " adj.") {
 		t.Errorf("range operators should not be advertised on SQLite; desc = %q", desc)
+	}
+}
+
+// newRootSpecServer builds a server whose registry carries a custom-spec
+// function and points db-root-spec at it.
+func newRootSpecServer(t *testing.T) *httpapi.Server {
+	t.Helper()
+	dsn := "file:" + strings.ReplaceAll(t.Name(), "/", "_") + "?mode=memory&cache=shared"
+	be, err := sqlite.Open(dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { be.Close() })
+	if _, err := be.DB().Exec(`CREATE TABLE films (id INTEGER PRIMARY KEY, title TEXT NOT NULL);`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	be.Register(rpc.NewStaticRegistry([]*rpc.Function{{
+		Name:       "custom_spec",
+		Returns:    rpc.ReturnShape{Kind: rpc.ReturnScalar, Type: "json"},
+		Volatility: rpc.Stable,
+		Query:      &rpc.PortableQuery{SQL: `SELECT json_object('swagger', '2.0', 'info', json_object('title', 'My Custom API'))`},
+	}}))
+	model, err := be.Introspect(context.Background())
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+	srv := httpapi.NewServer(be, model, nil)
+	srv.SetRootSpec("custom_spec")
+	return srv
+}
+
+// TestRootSpecOverridesDocument pins db-root-spec: the named function's JSON
+// result replaces the generated document, served with the root's media type.
+func TestRootSpecOverridesDocument(t *testing.T) {
+	srv := newRootSpecServer(t)
+	resp := do(t, srv, http.MethodGet, "/", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/openapi+json; charset=utf-8" {
+		t.Errorf("Content-Type = %q", ct)
+	}
+	var doc map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if doc["swagger"] != "2.0" {
+		t.Errorf("swagger = %v", doc["swagger"])
+	}
+	info, ok := doc["info"].(map[string]any)
+	if !ok || info["title"] != "My Custom API" {
+		t.Errorf("info = %v, want the custom title", doc["info"])
+	}
+	if _, generated := doc["paths"]; generated {
+		t.Error("the generated document should be fully replaced")
+	}
+}
+
+// TestRootSpecDisabledStaysOff checks openapi-mode=disabled wins over
+// db-root-spec: the root stays a 404 PGRST126.
+func TestRootSpecDisabledStaysOff(t *testing.T) {
+	srv := newRootSpecServer(t)
+	srv.SetOpenAPI(config.OpenAPIDisabled, "", false)
+	resp := do(t, srv, http.MethodGet, "/", nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+	var env map[string]any
+	json.NewDecoder(resp.Body).Decode(&env)
+	if env["code"] != "PGRST126" {
+		t.Errorf("code = %v, want PGRST126", env["code"])
 	}
 }
