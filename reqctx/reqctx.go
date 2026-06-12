@@ -50,6 +50,15 @@ type Context struct {
 	// response controls it writes are applied at render time.
 	PreRequest string
 
+	// AppSettings are the app.settings.* options, keys without the prefix. A
+	// backend applies them as transaction settings (GUCs on PostgreSQL) next
+	// to the request context.
+	AppSettings map[string]string
+
+	// LogQuery asks the backend to echo the statements it executes for this
+	// request, the log-query option.
+	LogQuery bool
+
 	controls ResponseControls
 }
 

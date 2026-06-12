@@ -38,9 +38,14 @@ type Server struct {
 	role         string
 	verifier     *auth.Verifier
 	authz        *authz.Registry
-	preRequest   string
 	openapiMode  string
 	openapiProxy string
+	corsOrigins  []string // server-cors-allowed-origins; empty means any
+	maxRows      int      // db-max-rows; 0 means no cap
+	planEnabled  bool     // db-plan-enabled; plans are off by default
+	preRequest   string   // db-pre-request, carried to the backend per request
+	appSettings  map[string]string
+	logQuery     bool // log-query, carried to the backend per request
 }
 
 // NewServer builds a Server over a backend, its introspected model, and the
@@ -71,6 +76,49 @@ func (s *Server) SetDefaultRole(role string) {
 		s.role = role
 	}
 }
+
+// SetMaxRows applies the db-max-rows option: a hard cap on the rows any read
+// or RPC response may return, enforced as an implicit LIMIT at plan time. Zero
+// means no cap. Mutation representations are exempt, matching PostgREST v10+.
+func (s *Server) SetMaxRows(n int) { s.maxRows = n }
+
+// MaxRows reports the configured db-max-rows cap (0 when uncapped). The
+// count=estimated logic uses it as the exactness threshold.
+func (s *Server) MaxRows() int { return s.maxRows }
+
+// capLimit lowers *limit to the db-max-rows cap, installing the cap as the
+// limit when the client did not ask for one. It returns the (possibly
+// replaced) pointer so callers can assign it back into the query.
+func (s *Server) capLimit(limit *int) *int {
+	if s.maxRows <= 0 {
+		return limit
+	}
+	if limit == nil || *limit > s.maxRows {
+		capped := s.maxRows
+		return &capped
+	}
+	return limit
+}
+
+// SetCORSAllowedOrigins restricts cross-origin requests to the given origin
+// list (the server-cors-allowed-origins option). With an empty list the server
+// keeps the PostgREST default: any origin is accepted.
+func (s *Server) SetCORSAllowedOrigins(origins []string) { s.corsOrigins = origins }
+
+// SetPlanEnabled applies the db-plan-enabled option. Execution plans leak
+// schema and statistics detail, so PostgREST only honors the
+// application/vnd.pgrst.plan+json media type when the option is on; the
+// default is off, and a plan request then fails the same way as any other
+// unproducible media type.
+func (s *Server) SetPlanEnabled(on bool) { s.planEnabled = on }
+
+// SetAppSettings carries the app.settings.* options to the backend on every
+// request context, to be applied as transaction settings.
+func (s *Server) SetAppSettings(settings map[string]string) { s.appSettings = settings }
+
+// SetLogQuery asks backends to echo the statements they execute, the
+// log-query option.
+func (s *Server) SetLogQuery(on bool) { s.logQuery = on }
 
 // SetVerifier attaches a JWT verifier. Once set, the role and claims of each
 // request come from its bearer token (spec 13), and a bad token is rejected
@@ -112,9 +160,11 @@ type identity struct {
 
 // buildContext assembles the per-request context the backend receives: the
 // resolved identity plus the request metadata that crosses the HTTP/query
-// boundary (method, path, headers, cookies, and the selected schema). The
-// frontend builds it once after authentication; on the emulated backend the
-// values a policy references are later bound as parameters (spec 15).
+// boundary (method, path, headers, cookies, and the selected schema), and the
+// configured transaction-scoped settings (db-pre-request, app.settings.*,
+// log-query). The frontend builds it once after authentication; on the
+// emulated backend the values a policy references are later bound as
+// parameters (spec 15).
 func (s *Server) buildContext(r *http.Request, id identity) *reqctx.Context {
 	cookies := r.Cookies()
 	jar := make(map[string]string, len(cookies))
@@ -122,15 +172,17 @@ func (s *Server) buildContext(r *http.Request, id identity) *reqctx.Context {
 		jar[c.Name] = c.Value
 	}
 	return &reqctx.Context{
-		Role:       id.role,
-		Anonymous:  id.anonymous,
-		Claims:     id.claims,
-		Method:     r.Method,
-		Path:       r.URL.Path,
-		Headers:    r.Header,
-		Cookies:    jar,
-		Schema:     requestSchema(r),
-		PreRequest: s.preRequest,
+		Role:        id.role,
+		Anonymous:   id.anonymous,
+		Claims:      id.claims,
+		Method:      r.Method,
+		Path:        r.URL.Path,
+		Headers:     r.Header,
+		Cookies:     jar,
+		Schema:      requestSchema(r),
+		PreRequest:  s.preRequest,
+		AppSettings: s.appSettings,
+		LogQuery:    s.logQuery,
 	}
 }
 
@@ -184,6 +236,9 @@ func (s *Server) authenticate(r *http.Request) (identity, *pgerr.APIError) {
 // PATCH updates; PUT upserts; DELETE deletes. RPC and OpenAPI arrive with their
 // subsystems; an unhandled method gets an honest error.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.serveCORS(w, r) {
+		return
+	}
 	id, apiErr := s.authenticate(r)
 	if apiErr != nil {
 		writeError(w, apiErr)
@@ -211,6 +266,87 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, pgerr.ErrUnsupported(r.Method+" requests", "dbrest"))
 	}
+}
+
+// corsExposedHeaders is the Access-Control-Expose-Headers value PostgREST
+// returns on every cross-origin request.
+const corsExposedHeaders = "Content-Encoding, Content-Location, Content-Range, Content-Type, " +
+	"Date, Location, Server, Transfer-Encoding, Range-Unit"
+
+// corsAllowedMethods is the Access-Control-Allow-Methods value PostgREST
+// returns on a preflight.
+const corsAllowedMethods = "GET, POST, PATCH, PUT, DELETE, OPTIONS, HEAD"
+
+// serveCORS answers CORS the way PostgREST v14 does and reports whether the
+// request was fully handled (a preflight). A request without an Origin header
+// is untouched. With server-cors-allowed-origins unset any origin is accepted
+// with Access-Control-Allow-Origin: *; with the option set, a listed origin is
+// reflected with Access-Control-Allow-Credentials: true and an unlisted one
+// falls through to normal handling with no CORS headers (the browser enforces
+// the denial). A preflight (OPTIONS with Access-Control-Request-Method) is
+// answered directly with the allowed methods, the requested headers, and a
+// one-day max age, before authentication and routing.
+func (s *Server) serveCORS(w http.ResponseWriter, r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return false
+	}
+	allowOrigin := "*"
+	credentials := false
+	if len(s.corsOrigins) > 0 {
+		found := false
+		for _, o := range s.corsOrigins {
+			if o == origin {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+		allowOrigin = origin
+		credentials = true
+	}
+
+	h := w.Header()
+	h.Set("Access-Control-Allow-Origin", allowOrigin)
+	if credentials {
+		h.Set("Access-Control-Allow-Credentials", "true")
+	}
+
+	if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+		h.Set("Access-Control-Allow-Methods", corsAllowedMethods)
+		h.Set("Access-Control-Allow-Headers", corsAllowedHeaders(r.Header.Get("Access-Control-Request-Headers")))
+		h.Set("Access-Control-Max-Age", "86400")
+		w.WriteHeader(http.StatusOK)
+		return true
+	}
+
+	h.Set("Access-Control-Expose-Headers", corsExposedHeaders)
+	return false
+}
+
+// corsAllowedHeaders builds the preflight Access-Control-Allow-Headers value:
+// Authorization, then the headers the client asked for, then the simple
+// headers, deduplicated case-insensitively. The order matches PostgREST.
+func corsAllowedHeaders(requested string) string {
+	out := []string{"Authorization"}
+	seen := map[string]bool{"authorization": true}
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[strings.ToLower(name)] {
+			return
+		}
+		seen[strings.ToLower(name)] = true
+		out = append(out, name)
+	}
+	for _, name := range strings.Split(requested, ",") {
+		add(name)
+	}
+	for _, name := range []string{"Accept", "Accept-Language", "Content-Language"} {
+		add(name)
+	}
+	return strings.Join(out, ", ")
 }
 
 // rpcName extracts the function name from an /rpc/<fn> path, reporting false for
@@ -263,6 +399,8 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 		return
 	}
 	call.Singular = media == mediaObject
+	// db-max-rows caps an RPC response like a read (an implicit LIMIT).
+	call.Limit = s.capLimit(call.Limit)
 
 	var planned *ir.Plan
 	if s.backend.Capabilities().NativeRPC {
@@ -362,6 +500,13 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity)
 		}
 	}
 
+	// db-max-rows is a hard cap on every read: the effective window is
+	// min(requested limit, max-rows), applied before planning so Content-Range
+	// and the 200/206 decision see the limit that actually ran. Mutation
+	// representations are exempt (PostgREST v10+), so this stays off the
+	// write path.
+	q.Limit = s.capLimit(q.Limit)
+
 	planned, apiErr := plan.Read(s.model, q, s.searchPath)
 	if apiErr != nil {
 		writeError(w, apiErr)
@@ -376,7 +521,13 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity)
 	}
 
 	// vnd.pgrst.plan+json: return EXPLAIN JSON when the backend supports it.
+	// The db-plan-enabled gate comes first: with the option off the media
+	// type is not producible at all, whatever the backend can do.
 	if media == mediaPlan {
+		if !s.planEnabled {
+			writeError(w, pgerr.ErrNotAcceptable(mediaPlan))
+			return
+		}
 		exp, supported := s.backend.(backend.Explainer)
 		if !supported {
 			writeError(w, pgerr.ErrNotAcceptable(mediaPlan))
