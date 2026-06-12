@@ -367,6 +367,15 @@ func fromRaw(raw map[string]string) (*Config, error) {
 
 	c.Warnings = append(c.Warnings, unenforcedWarnings(raw)...)
 
+	// Anonymous access should be a choice, not an accident. With neither an
+	// anon role nor JWT key material every request runs anonymously with no
+	// role at all, so say so loudly at startup; upstream's docs treat this
+	// posture as something the operator confirms explicitly.
+	if c.AnonRole == "" && c.JWTSecret == "" && c.JWKSet == "" {
+		c.Warnings = append(c.Warnings,
+			"neither db-anon-role nor a JWT key (jwt-secret, jwk-set) is configured; every request will run anonymously with no role")
+	}
+
 	c.DeclaredSchema = raw["declared-schema"]
 	c.DeclaredRelationships = raw["declared-relationships"]
 	c.FunctionRegistry = raw["function-registry"]

@@ -414,6 +414,38 @@ func BenchmarkLoad(b *testing.B) {
 	}
 }
 
+// TestAllAnonymousPostureWarns covers the startup validation gap: a config
+// with neither db-anon-role nor JWT key material boots, but says what that
+// means. Configuring either side silences the warning.
+func TestAllAnonymousPostureWarns(t *testing.T) {
+	hasAnonWarning := func(c *Config) bool {
+		return strings.Contains(strings.Join(c.Warnings, "\n"), "anonymously with no role")
+	}
+
+	c, err := FromMap(map[string]string{"db-uri": "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasAnonWarning(c) {
+		t.Errorf("expected the all-anonymous warning, got %q", c.Warnings)
+	}
+
+	silenced := []map[string]string{
+		{"db-uri": "x", "db-anon-role": "web_anon"},
+		{"db-uri": "x", "jwt-secret": "reallyreallyreallyreallyverysafe"},
+		{"db-uri": "x", "jwk-set": `{"keys":[]}`},
+	}
+	for _, raw := range silenced {
+		c, err := FromMap(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hasAnonWarning(c) {
+			t.Errorf("warning should be silent for %v, got %q", raw, c.Warnings)
+		}
+	}
+}
+
 // TestAdminPortCannotEqualServerPort mirrors the upstream boot failure: the
 // admin server cannot share the API port.
 func TestAdminPortCannotEqualServerPort(t *testing.T) {
