@@ -104,8 +104,8 @@ type Config struct {
 	// Pooling and limits (section 7).
 	DBPool                   int
 	DBPoolAcquisitionTimeout time.Duration
-	DBPoolMaxIdleTime        int // seconds
-	DBPoolMaxLifetime        int // seconds
+	DBPoolMaxIdleTime        time.Duration
+	DBPoolMaxLifetime        time.Duration
 	DBPoolAutomaticRecovery  bool
 
 	// Reload and in-database configuration.
@@ -177,14 +177,15 @@ func defaults() *Config {
 			"statement_timeout", "plan_filter.statement_cost_limit",
 			"default_transaction_isolation",
 		},
-		DBChannel:               "pgrst",
-		DBChannelEnabled:        true,
-		DBConfig:                true,
-		DBPreparedStatements:    true,
-		DBPoolMaxIdleTime:       30,
-		DBPoolMaxLifetime:       1800,
-		DBPoolAutomaticRecovery: true,
-		ServerUnixSocketMode:    "660",
+		DBChannel:                "pgrst",
+		DBChannelEnabled:         true,
+		DBConfig:                 true,
+		DBPreparedStatements:     true,
+		DBPoolAcquisitionTimeout: 10 * time.Second,
+		DBPoolMaxIdleTime:        30 * time.Second,
+		DBPoolMaxLifetime:        1800 * time.Second,
+		DBPoolAutomaticRecovery:  true,
+		ServerUnixSocketMode:     "660",
 	}
 }
 
@@ -321,9 +322,9 @@ func fromRaw(raw map[string]string) (*Config, error) {
 	}
 
 	c.DBPool = pickInt(raw, &errs, c.DBPool, "db-pool")
-	c.DBPoolAcquisitionTimeout = pickDuration(raw, &errs, c.DBPoolAcquisitionTimeout, "db-pool-acquisition-timeout")
-	c.DBPoolMaxIdleTime = pickInt(raw, &errs, c.DBPoolMaxIdleTime, "db-pool-max-idletime", "db-pool-timeout")
-	c.DBPoolMaxLifetime = pickInt(raw, &errs, c.DBPoolMaxLifetime, "db-pool-max-lifetime")
+	c.DBPoolAcquisitionTimeout = pickSeconds(raw, &errs, c.DBPoolAcquisitionTimeout, "db-pool-acquisition-timeout")
+	c.DBPoolMaxIdleTime = pickSeconds(raw, &errs, c.DBPoolMaxIdleTime, "db-pool-max-idletime", "db-pool-timeout")
+	c.DBPoolMaxLifetime = pickSeconds(raw, &errs, c.DBPoolMaxLifetime, "db-pool-max-lifetime")
 	c.DBPoolAutomaticRecovery = pickBool(raw, &errs, c.DBPoolAutomaticRecovery, "db-pool-automatic-recovery")
 
 	if v, ok := get("db-channel"); ok {
@@ -422,8 +423,8 @@ func (c *Config) validate(errs *[]string) {
 // turn anything yet. An entry leaves this list when its subsystem ships.
 var unenforcedOptions = []string{
 	"db-aggregates-enabled", "db-channel", "db-channel-enabled", "db-config",
-	"db-hoisted-tx-settings", "db-pool-automatic-recovery",
-	"db-pool-max-idletime", "db-pool-max-lifetime", "db-pre-config",
+	"db-hoisted-tx-settings", "db-pool-acquisition-timeout",
+	"db-pool-automatic-recovery", "db-pre-config",
 	"db-prepared-statements", "db-root-spec", "root-spec", "db-tx-end",
 	"jwt-secret-is-base64", "secret-is-base64", "openapi-security-active",
 	"server-trace-header", "server-timing-enabled",

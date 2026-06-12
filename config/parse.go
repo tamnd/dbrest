@@ -309,17 +309,25 @@ func pickBool(raw map[string]string, errs *[]string, def bool, keys ...string) b
 	return def
 }
 
-// pickDuration reads key as a Go duration (for example "10s"), recording a
-// validation error on a malformed value and falling back to def.
-func pickDuration(raw map[string]string, errs *[]string, def time.Duration, key string) time.Duration {
-	v, ok := raw[key]
-	if !ok {
+// pickSeconds reads the first present key as an integer number of seconds,
+// the unit upstream uses for the pool timeouts (`db-pool-acquisition-timeout
+// = 10`). A Go duration string ("500ms") is also accepted, a dbrest extension
+// for sub-second values.
+func pickSeconds(raw map[string]string, errs *[]string, def time.Duration, keys ...string) time.Duration {
+	for _, key := range keys {
+		v, ok := raw[key]
+		if !ok {
+			continue
+		}
+		s := strings.TrimSpace(v)
+		if n, err := strconv.Atoi(s); err == nil {
+			return time.Duration(n) * time.Second
+		}
+		if d, err := time.ParseDuration(s); err == nil {
+			return d
+		}
+		*errs = append(*errs, fmt.Sprintf("%s %q is not a number of seconds", key, v))
 		return def
 	}
-	d, err := time.ParseDuration(strings.TrimSpace(v))
-	if err != nil {
-		*errs = append(*errs, fmt.Sprintf("%s %q is not a duration", key, v))
-		return def
-	}
-	return d
+	return def
 }

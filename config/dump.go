@@ -5,7 +5,18 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
+
+// seconds renders a pool timeout the way upstream's config does: a bare
+// integer of seconds, falling back to the duration extension form below one
+// second so the value round-trips.
+func seconds(d time.Duration) string {
+	if d%time.Second == 0 {
+		return strconv.Itoa(int(d / time.Second))
+	}
+	return strconv.Quote(d.String())
+}
 
 // Dump renders the resolved configuration in the config-file syntax, the
 // answer to --dump-config: every option with its effective value, defaults
@@ -32,9 +43,9 @@ func (c *Config) Dump() string {
 		"db-pre-config":               q(c.DBPreConfig),
 		"db-prepared-statements":      strconv.FormatBool(c.DBPreparedStatements),
 		"db-pool":                     strconv.Itoa(c.DBPool),
-		"db-pool-acquisition-timeout": q(c.DBPoolAcquisitionTimeout.String()),
-		"db-pool-max-idletime":        strconv.Itoa(c.DBPoolMaxIdleTime),
-		"db-pool-max-lifetime":        strconv.Itoa(c.DBPoolMaxLifetime),
+		"db-pool-acquisition-timeout": seconds(c.DBPoolAcquisitionTimeout),
+		"db-pool-max-idletime":        seconds(c.DBPoolMaxIdleTime),
+		"db-pool-max-lifetime":        seconds(c.DBPoolMaxLifetime),
 		"db-pool-automatic-recovery":  strconv.FormatBool(c.DBPoolAutomaticRecovery),
 		"jwt-secret":                  q(c.JWTSecret),
 		"jwt-secret-is-base64":        strconv.FormatBool(c.JWTSecretIsBase64),

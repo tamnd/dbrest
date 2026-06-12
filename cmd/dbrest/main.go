@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -202,6 +203,7 @@ func openBackend(cfg *config.Config) (backend.Backend, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
+	applyPoolConfig(be, cfg)
 	if sc, ok := be.(interface{ SetSchemas([]string) }); ok {
 		sc.SetSchemas(cfg.Schemas)
 	}
@@ -217,6 +219,27 @@ func openBackend(cfg *config.Config) (backend.Backend, error) {
 		}
 	}
 	return be, nil
+}
+
+// applyPoolConfig sizes the connection pool on the engines built over
+// database/sql (mysql, sqlserver). SQLite is left alone: its backend pins the
+// pool to one connection so the foreign-key PRAGMA stays in effect, and
+// resizing or recycling that connection would silently drop FK enforcement.
+// The pgx-based postgres backend builds its pool inside Open and the
+// acquisition timeout has no database/sql knob; both stay with the backend
+// drivers as the per-driver remainder of the pool item.
+func applyPoolConfig(be backend.Backend, cfg *config.Config) {
+	if cfg.Backend == config.BackendSQLite {
+		return
+	}
+	d, ok := be.(interface{ DB() *sql.DB })
+	if !ok {
+		return
+	}
+	db := d.DB()
+	db.SetMaxOpenConns(cfg.DBPool)
+	db.SetConnMaxIdleTime(cfg.DBPoolMaxIdleTime)
+	db.SetConnMaxLifetime(cfg.DBPoolMaxLifetime)
 }
 
 // attachAuth wires a JWT verifier onto the server when a key is configured.

@@ -176,8 +176,8 @@ server-unix-socket-mode = "770"
 	if c.DBChannel != "custom" || c.DBChannelEnabled || c.DBConfig || c.DBPreparedStatements || c.DBPoolAutomaticRecovery {
 		t.Error("channel/config/pool options did not parse")
 	}
-	if c.DBPoolMaxIdleTime != 60 || c.DBPoolMaxLifetime != 600 {
-		t.Errorf("pool times = %d/%d", c.DBPoolMaxIdleTime, c.DBPoolMaxLifetime)
+	if c.DBPoolMaxIdleTime != 60*time.Second || c.DBPoolMaxLifetime != 600*time.Second {
+		t.Errorf("pool times = %v/%v", c.DBPoolMaxIdleTime, c.DBPoolMaxLifetime)
 	}
 	if c.TxEnd != "rollback-allow-override" {
 		t.Errorf("db-tx-end = %q", c.TxEnd)
@@ -201,8 +201,11 @@ func TestV14Defaults(t *testing.T) {
 	if c.DBChannel != "pgrst" || !c.DBChannelEnabled || !c.DBConfig || !c.DBPreparedStatements {
 		t.Error("channel/config defaults wrong")
 	}
-	if c.DBPoolMaxIdleTime != 30 || c.DBPoolMaxLifetime != 1800 || !c.DBPoolAutomaticRecovery {
+	if c.DBPoolMaxIdleTime != 30*time.Second || c.DBPoolMaxLifetime != 1800*time.Second || !c.DBPoolAutomaticRecovery {
 		t.Error("pool defaults wrong")
+	}
+	if c.DBPoolAcquisitionTimeout != 10*time.Second {
+		t.Errorf("db-pool-acquisition-timeout default = %v, want 10s", c.DBPoolAcquisitionTimeout)
 	}
 	if c.TxEnd != "commit" || c.ServerUnixSocketMode != "660" {
 		t.Errorf("tx-end/socket-mode defaults = %q/%q", c.TxEnd, c.ServerUnixSocketMode)
@@ -230,7 +233,7 @@ func TestV14Aliases(t *testing.T) {
 	if !slices.Equal(c.Schemas, []string{"api"}) {
 		t.Errorf("db-schema alias = %v", c.Schemas)
 	}
-	if !c.JWTSecretIsBase64 || c.DBPoolMaxIdleTime != 55 {
+	if !c.JWTSecretIsBase64 || c.DBPoolMaxIdleTime != 55*time.Second {
 		t.Error("secret-is-base64 or db-pool-timeout alias did not parse")
 	}
 }
