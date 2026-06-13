@@ -939,11 +939,12 @@ func parseOrder(s string) ([]OrderTerm, *pgerr.APIError) {
 		// before the modifier list is split (item 01.2).
 		colPart, modPart, hasMods := cutIdentAware(p, '.')
 		var t OrderTerm
-		path, _, perr := parsePath(colPart)
+		path, last, perr := parsePath(colPart)
 		if perr != nil {
 			return nil, perr
 		}
 		t.Path = path
+		t.Last = last
 		var mods []string
 		if hasMods {
 			mods = strings.Split(modPart, ".")
@@ -1010,12 +1011,12 @@ func parseFilters(vals url.Values) (*Cond, *pgerr.APIError) {
 		if reservedKeys[key] {
 			continue
 		}
-		path, _, perr := parsePath(key)
+		path, last, perr := parsePath(key)
 		if perr != nil {
 			return nil, perr
 		}
 		for _, v := range vals[key] {
-			cmp, perr := parseCompare(path, v)
+			cmp, perr := parseCompare(path, last, v)
 			if perr != nil {
 				return nil, perr
 			}
@@ -1075,11 +1076,11 @@ func parseLogical(op, raw string) (Cond, *pgerr.APIError) {
 		if !ok {
 			return nil, pgerr.ErrParse("malformed predicate in logical: " + p)
 		}
-		path, _, perr := parsePath(col)
+		path, last, perr := parsePath(col)
 		if perr != nil {
 			return nil, perr
 		}
-		cmp, perr := parseCompare(path, rest)
+		cmp, perr := parseCompare(path, last, rest)
 		if perr != nil {
 			return nil, perr
 		}
@@ -1098,8 +1099,8 @@ func parseLogical(op, raw string) (Cond, *pgerr.APIError) {
 }
 
 // parseCompare parses a "operator.operand" filter value against a column path.
-func parseCompare(path []string, raw string) (Compare, *pgerr.APIError) {
-	c := Compare{Path: path}
+func parseCompare(path []string, last JSONStep, raw string) (Compare, *pgerr.APIError) {
+	c := Compare{Path: path, Last: last}
 	if strings.HasPrefix(raw, "not.") {
 		c.Negate = true
 		raw = strings.TrimPrefix(raw, "not.")

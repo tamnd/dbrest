@@ -175,6 +175,28 @@ func (dialect) ArrayLiteral(pgText string) string {
 // A PostgreSQL {a,b} literal here would corrupt the column.
 func (dialect) ArrayArg(elems []any) any { return sqlgen.JSONArrayArg(elems) }
 
+// JSONPath lowers a JSON sub-path to SQLite's -> / ->> operators over a single
+// JSON path argument. SQLite's ->> returns the SQL text scalar and -> returns
+// the JSON representation, matching PostgreSQL's ->>/-> typing. Object keys
+// become quoted "label" segments and digit hops become [n] array subscripts, so
+// data->phones->0->>number renders as data ->> '$."phones"[0]."number"'.
+func (dialect) JSONPath(base string, hops []string, asText bool) (string, bool) {
+	var p strings.Builder
+	p.WriteString("$")
+	for _, h := range hops {
+		if sqlgen.IsJSONArrayIndex(h) {
+			p.WriteString("[" + h + "]")
+		} else {
+			p.WriteString(`."` + strings.ReplaceAll(h, `"`, `""`) + `"`)
+		}
+	}
+	op := "->"
+	if asText {
+		op = "->>"
+	}
+	return base + " " + op + " '" + strings.ReplaceAll(p.String(), "'", "''") + "'", true
+}
+
 // ArrayOp implements array containment/overlap via SQLite's json_each(). The
 // column must be declared as JSON type and store a JSON array (e.g.
 // '["cat","work"]'). For any other column type the operator is unsupported

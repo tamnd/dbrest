@@ -311,6 +311,7 @@ const (
 // Compare is a single column-operator-value predicate.
 type Compare struct {
 	Path   []string
+	Last   JSONStep // final JSON hop kind when Path carries a -> / ->> sub-path
 	Op     Op
 	Value  Value
 	Quant  Quant
@@ -382,6 +383,7 @@ type Value struct {
 // OrderTerm is one entry in the order list.
 type OrderTerm struct {
 	Path       []string
+	Last       JSONStep // final JSON hop kind when Path carries a -> / ->> sub-path
 	Desc       bool
 	NullsFirst *bool // nil = PG default (NULLS LAST asc, NULLS FIRST desc)
 }

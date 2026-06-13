@@ -109,7 +109,7 @@ func (b *builder) writeEmbeddedSelect(q *ir.Query, parentAlias string) *pgerr.AP
 			}
 			sep()
 			b.sb.WriteString(expr)
-			if name := v.Name(); name != "" && name != lastPath(v.Path) && !isStar(v) {
+			if name := v.Name(); name != "" && !isStar(v) && (name != lastPath(v.Path) || len(v.Path) > 1) {
 				b.sb.WriteString(" AS ")
 				b.sb.WriteString(b.d.QuoteIdent(name))
 			}

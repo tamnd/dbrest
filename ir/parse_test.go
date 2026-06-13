@@ -48,6 +48,34 @@ func TestParseSelectJSONPath(t *testing.T) {
 	}
 }
 
+// 07.1: a JSON-path filter keeps the base column and hops on Compare.Path and
+// records the final ->/->> on Last so the compiler can type the access.
+func TestParseFilterJSONPath(t *testing.T) {
+	q := mustRead(t, "data->phones->0->>number=eq.555")
+	cmp, ok := (*q.Where).(Compare)
+	if !ok {
+		t.Fatalf("where = %T, want Compare", *q.Where)
+	}
+	if !reflect.DeepEqual(cmp.Path, []string{"data", "phones", "0", "number"}) {
+		t.Errorf("path = %v", cmp.Path)
+	}
+	if cmp.Last != JSONArrow2 {
+		t.Errorf("last = %v, want JSONArrow2 (final ->>)", cmp.Last)
+	}
+}
+
+// 07.1: ordering by a JSON path records the path and the final hop kind.
+func TestParseOrderJSONPath(t *testing.T) {
+	q := mustRead(t, "order=data->>created_at.desc")
+	if len(q.Order) != 1 {
+		t.Fatalf("order terms = %d", len(q.Order))
+	}
+	o := q.Order[0]
+	if !reflect.DeepEqual(o.Path, []string{"data", "created_at"}) || o.Last != JSONArrow2 || !o.Desc {
+		t.Errorf("order = %v last=%v desc=%v", o.Path, o.Last, o.Desc)
+	}
+}
+
 func TestParseEmbed(t *testing.T) {
 	q := mustRead(t, "select=title,director(name,bio)")
 	if len(q.Embeds) != 1 {

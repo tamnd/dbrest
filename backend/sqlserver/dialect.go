@@ -296,3 +296,9 @@ func (Dialect) ArrayLiteral(pgText string) string {
 // columns, so an nvarchar column holds the array and reads it back as JSON.
 // A PostgreSQL {a,b} literal here would corrupt the column.
 func (Dialect) ArrayArg(elems []any) any { return sqlgen.JSONArrayArg(elems) }
+
+// JSONPath reports ok=false so the compiler raises PGRST127. SQL Server expresses
+// JSON access through JSON_VALUE/JSON_QUERY rather than ->/->>, and lowering them
+// to match PostgREST's typing needs a live server to verify; until then JSON
+// paths are an honest capability gap, the per-driver remainder.
+func (Dialect) JSONPath(string, []string, bool) (string, bool) { return "", false }

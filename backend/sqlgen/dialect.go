@@ -121,6 +121,16 @@ type Dialect interface {
 	// MySQL, SQL Server) keep the JSON text so a json/text column stores the
 	// array unchanged and reads it back as a JSON array.
 	ArrayArg(elems []any) any
+
+	// JSONPath lowers a JSON sub-path access into the engine's spelling. base is
+	// the already-qualified, quoted base column; hops are the path segments after
+	// it (data->phones->0->>number gives base data, hops {phones,0,number}); a
+	// segment that is all digits is an array index. asText reports whether the
+	// final hop was ->> (returns text) rather than -> (returns json). PostgreSQL
+	// emits its native ->/->> chain; SQLite emits the ->/->> operators over a
+	// JSON path. An engine without JSON paths returns ok=false and the compiler
+	// raises PGRST127.
+	JSONPath(base string, hops []string, asText bool) (frag string, ok bool)
 }
 
 // PatternMark is the sentinel a Dialect.Regex fragment carries where the bound

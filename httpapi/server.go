@@ -1095,12 +1095,22 @@ func locationHeader(rel *schema.Relation, relation string, res backend.Result) s
 // quoting their text. Nested embeds are already inside their parent's JSON blob,
 // so only the top level matters here.
 func embedKeys(q *ir.Query) map[string]bool {
-	if len(q.Embeds) == 0 {
-		return nil
+	var keys map[string]bool
+	add := func(k string) {
+		if keys == nil {
+			keys = make(map[string]bool)
+		}
+		keys[k] = true
 	}
-	keys := make(map[string]bool, len(q.Embeds))
 	for i := range q.Embeds {
-		keys[q.Embeds[i].OutKey] = true
+		add(q.Embeds[i].OutKey)
+	}
+	// A projection ending in -> (data->meta) yields JSON the renderer must splice
+	// verbatim, the same as an embed; a final ->> is text and renders normally.
+	for _, it := range q.Select {
+		if c, ok := it.(ir.Column); ok && c.Last == ir.JSONArrow {
+			add(c.Name())
+		}
 	}
 	return keys
 }

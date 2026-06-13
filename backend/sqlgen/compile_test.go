@@ -91,6 +91,24 @@ func (stub) BoolValue(v bool) string {
 func (stub) IsBool(string, bool) (string, bool) { return "", false }
 func (stub) IsUnknown(string) (string, bool)    { return "", false }
 
+// JSONPath mirrors the PostgreSQL native ->/->> chain so the shared compiler's
+// JSON-path routing is assertable without a real engine.
+func (stub) JSONPath(base string, hops []string, asText bool) (string, bool) {
+	expr := base
+	for i, h := range hops {
+		op := "->"
+		if asText && i == len(hops)-1 {
+			op = "->>"
+		}
+		if IsJSONArrayIndex(h) {
+			expr += op + h
+		} else {
+			expr += op + "'" + h + "'"
+		}
+	}
+	return expr, true
+}
+
 func compile(t *testing.T, q *ir.Query) *Statement {
 	t.Helper()
 	st, err := CompileRead(stub{}, q)

@@ -376,6 +376,23 @@ func writeArg(d Dialect, v ir.Value) any {
 	}
 }
 
+// IsJSONArrayIndex reports whether a JSON path segment is an array index: a
+// non-empty run of ASCII digits. PostgREST treats a digit hop (data->arr->0) as
+// an array subscript rather than an object key, and the dialects spell it as
+// one. A leading-zero or oversized run still counts as an index; the engine
+// decides what a missing element yields.
+func IsJSONArrayIndex(seg string) bool {
+	if seg == "" {
+		return false
+	}
+	for i := 0; i < len(seg); i++ {
+		if seg[i] < '0' || seg[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // JSONArrayArg re-encodes a decoded JSON array to its JSON text. It is the
 // ArrayArg implementation for engines without array columns, where a write
 // payload array lands in a json/text column and must read back as JSON.
@@ -496,9 +513,10 @@ func (b *builder) writeSelect(items []ir.SelectItem) *pgerr.APIError {
 			}
 			b.sb.WriteString(expr)
 			// Alias the output so the renderer sees the PostgREST key, not the raw
-			// column expression. Always alias when a cast is present (the expression
-			// differs from the bare column name) or when an explicit alias was set.
-			if name := v.Name(); name != "" && (name != lastPath(v.Path) || v.Cast != "") {
+			// column expression. Always alias when a cast is present, an explicit
+			// alias was set, or the column is a JSON path (data->>x names its column
+			// after the last hop, the way upstream does).
+			if name := v.Name(); name != "" && (name != lastPath(v.Path) || v.Cast != "" || len(v.Path) > 1) {
 				b.sb.WriteString(" AS ")
 				b.sb.WriteString(b.d.QuoteIdent(name))
 			}
@@ -541,8 +559,19 @@ func (b *builder) aggregateExpr(a ir.Aggregate) (string, *pgerr.APIError) {
 	return inner, nil
 }
 
-// columnExpr renders a base column with an optional cast. JSON sub-paths are a
-// later subsystem; a column carrying one is rejected explicitly.
+// jsonPathExpr lowers a base column carrying a JSON sub-path through the dialect.
+// hops are the segments after the base; last reports the final ->/->> kind. An
+// engine without JSON paths reports ok=false and the request is PGRST127.
+func (b *builder) jsonPathExpr(base string, hops []string, last ir.JSONStep) (string, *pgerr.APIError) {
+	frag, ok := b.d.JSONPath(base, hops, last == ir.JSONArrow2)
+	if !ok {
+		return "", pgerr.ErrUnsupported("JSON path", "sql")
+	}
+	return frag, nil
+}
+
+// columnExpr renders a base column with an optional cast, lowering a JSON
+// sub-path (col->a->>b) through the dialect when the column carries one.
 func (b *builder) columnExpr(c ir.Column) (string, *pgerr.APIError) {
 	if len(c.Path) == 1 && c.Path[0] == "*" && c.Last == ir.JSONNone && c.Cast == "" {
 		if b.qual == "" {
@@ -550,10 +579,16 @@ func (b *builder) columnExpr(c ir.Column) (string, *pgerr.APIError) {
 		}
 		return b.qual + ".*", nil
 	}
-	if len(c.Path) != 1 || c.Last != ir.JSONNone {
-		return "", pgerr.ErrUnsupported("JSON path projection", "sql")
+	var expr string
+	if len(c.Path) > 1 {
+		frag, err := b.jsonPathExpr(b.colRef(c.Path[0]), c.Path[1:], c.Last)
+		if err != nil {
+			return "", err
+		}
+		expr = frag
+	} else {
+		expr = b.colRef(c.Path[0])
 	}
-	expr := b.colRef(c.Path[0])
 	if c.Cast != "" {
 		expr = b.d.Cast(expr, c.Cast)
 	}
@@ -622,13 +657,18 @@ func (b *builder) writeLogical(kids []ir.Cond, sep string) *pgerr.APIError {
 	return nil
 }
 
-// writeCompare lowers a single column-operator-value predicate. The column is a
-// base column for now (JSON-path filters arrive with the JSON subsystem).
+// writeCompare lowers a single column-operator-value predicate. A column may
+// carry a JSON sub-path (data->>field), lowered through the dialect.
 func (b *builder) writeCompare(c ir.Compare) *pgerr.APIError {
-	if len(c.Path) != 1 {
-		return pgerr.ErrUnsupported("JSON path filters", "sql")
-	}
 	col := b.colRef(c.Path[0])
+	isJSON := len(c.Path) > 1
+	if isJSON {
+		frag, err := b.jsonPathExpr(col, c.Path[1:], c.Last)
+		if err != nil {
+			return err
+		}
+		col = frag
+	}
 
 	// A quantified filter (op(any)/op(all) over a {…} list) expands to a disjunction
 	// or conjunction of the real operator, one predicate per element (item 01.1).
@@ -655,7 +695,10 @@ func (b *builder) writeCompare(c ir.Compare) *pgerr.APIError {
 		// column literally holding the word "true") the words stay text, matching
 		// PostgreSQL's type-driven coercion (item 07.4). An unknown column type
 		// keeps the boolean rendering, the common ?col=is-not-the-point filter.
-		boolColumn := c.ColumnType == "" || pgtypes.ClassOf(c.ColumnType) == pgtypes.ClassBool
+		// A JSON ->>/-> extract is a text/json value, never a typed boolean column,
+		// so the words "true"/"false" bind as text and a JSON field holding the
+		// string still matches (the eq.true coercion is column-type driven).
+		boolColumn := !isJSON && (c.ColumnType == "" || pgtypes.ClassOf(c.ColumnType) == pgtypes.ClassBool)
 		switch {
 		case c.Value.Text == "true" && boolColumn:
 			frag = col + " " + binaryOp(c.Op) + " " + b.d.BoolValue(true)
@@ -848,10 +891,14 @@ func (b *builder) writeIs(col, text string) (string, *pgerr.APIError) {
 func (b *builder) writeOrder(terms []ir.OrderTerm) *pgerr.APIError {
 	var sortKeys, orderTerms []string
 	for _, t := range terms {
-		if len(t.Path) != 1 {
-			return pgerr.ErrUnsupported("JSON path ordering", "sql")
-		}
 		col := b.colRef(t.Path[0])
+		if len(t.Path) > 1 {
+			frag, err := b.jsonPathExpr(col, t.Path[1:], t.Last)
+			if err != nil {
+				return err
+			}
+			col = frag
+		}
 		dir := "ASC"
 		if t.Desc {
 			dir = "DESC"

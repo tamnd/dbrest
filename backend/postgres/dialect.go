@@ -252,3 +252,24 @@ func (Dialect) ArrayLiteral(pgText string) string { return pgText }
 // server-side cast from text to text[]/int4[]/etc. succeeds with or without
 // type OIDs.
 func (Dialect) ArrayArg(elems []any) any { return sqlgen.PGArrayLiteral(elems) }
+
+// JSONPath emits PostgreSQL's native -> / ->> operator chain: every hop is ->
+// (json) except the final one, which is ->> when the access was text. A digit
+// segment becomes an integer array index; any other segment is a quoted key.
+func (Dialect) JSONPath(base string, hops []string, asText bool) (string, bool) {
+	var b strings.Builder
+	b.WriteString(base)
+	for i, h := range hops {
+		op := "->"
+		if asText && i == len(hops)-1 {
+			op = "->>"
+		}
+		b.WriteString(op)
+		if sqlgen.IsJSONArrayIndex(h) {
+			b.WriteString(h)
+		} else {
+			b.WriteString("'" + strings.ReplaceAll(h, "'", "''") + "'")
+		}
+	}
+	return b.String(), true
+}

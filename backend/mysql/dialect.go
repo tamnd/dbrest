@@ -263,3 +263,9 @@ func (Dialect) ArrayLiteral(pgText string) string {
 // columns, so a JSON column holds the array and reads it back as JSON. A
 // PostgreSQL {a,b} literal here would corrupt the column.
 func (Dialect) ArrayArg(elems []any) any { return sqlgen.JSONArrayArg(elems) }
+
+// JSONPath reports ok=false so the compiler raises PGRST127. MySQL has ->/->>
+// operators, but lowering them faithfully needs a live server to verify against
+// and is tracked as the per-driver remainder; until then JSON paths are an
+// honest capability gap rather than an unverified spelling.
+func (Dialect) JSONPath(string, []string, bool) (string, bool) { return "", false }
