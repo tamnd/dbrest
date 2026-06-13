@@ -701,21 +701,22 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 	s.writeCall(w, r, call, out, res.ResponseControls())
 }
 
-// singleRawBodyParam reports the parameter name and type of a function whose
-// signature is a single unnamed argument, the form that takes the whole POST
-// body as one value decoded by Content-Type. It scans every overload of the
-// name and returns the first single-raw-body match; an absent or multi-parameter
-// function yields empty strings, leaving the normal named-arguments path. See
-// spec 12-rpc and the PostgREST single-unnamed-parameter rule.
 // rpcRegistry is the registry an RPC resolves against in the active schema. A
 // NativeRPC backend that introspects its functions (SchemaFunctioner) resolves
-// against that schema's native registry, so overload resolution, GET argument
-// partitioning, and the volatility-driven access mode all run through the shared
-// planner; any other backend uses the single portable registry for every schema.
+// against that schema's native registry merged with any declared portable
+// registry, so overload resolution, GET argument partitioning, and the
+// volatility-driven access mode all run through the shared planner over one
+// function set; any other backend uses the single portable registry for every
+// schema.
 func (s *Server) rpcRegistry(activeSchema string) rpc.Registry {
 	if s.backend.Capabilities().NativeRPC {
 		if sf, ok := s.backend.(backend.SchemaFunctioner); ok {
-			return sf.SchemaFunctions(activeSchema)
+			// A NativeRPC backend can also carry a declared portable registry
+			// (the documented escape hatch for functions with no native
+			// equivalent). Merge keeps both reachable through one Registry, with
+			// a declared function shadowing a same-signature native one, so the
+			// call path and the OpenAPI document agree on exactly one function set.
+			return rpc.Merge(s.backend.Functions(), sf.SchemaFunctions(activeSchema))
 		}
 	}
 	return s.backend.Functions()
@@ -735,6 +736,12 @@ func registryKnows(reg rpc.Registry, name string) bool {
 	return false
 }
 
+// singleRawBodyParam reports the parameter name and type of a function whose
+// signature is a single unnamed argument, the form that takes the whole POST
+// body as one value decoded by Content-Type. It scans every overload of the
+// name and returns the first single-raw-body match; an absent or multi-parameter
+// function yields empty strings, leaving the normal named-arguments path. See
+// spec 12-rpc and the PostgREST single-unnamed-parameter rule.
 func singleRawBodyParam(reg rpc.Registry, name string) (string, string) {
 	for _, fn := range reg.List() {
 		if fn.Name != name {

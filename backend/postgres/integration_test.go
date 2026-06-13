@@ -659,6 +659,108 @@ func keysOf(m map[string]json.RawMessage) []string {
 	return ks
 }
 
+// TestIntegrationMergedRegistry covers finding 03-P13: a declared portable
+// registry on postgres is reachable and shares one document with the native
+// catalog. The merged registry (portable plus native, the exact composition the
+// server builds per request) resolves both a portable function with no native
+// equivalent and a native function; the portable one executes through the SQL
+// compiler, and both appear in the OpenAPI document.
+func TestIntegrationMergedRegistry(t *testing.T) {
+	be := openBE(t)
+	be.SetSchemas([]string{"_dbrest_mrg"})
+	ctx := context.Background()
+
+	if _, err := be.Pool().Exec(ctx, `
+		CREATE SCHEMA IF NOT EXISTS _dbrest_mrg;
+		CREATE OR REPLACE FUNCTION _dbrest_mrg.native_add(a int, b int) RETURNS int
+			LANGUAGE sql IMMUTABLE AS $$ SELECT a + b $$`); err != nil {
+		t.Fatalf("seed function: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, "DROP SCHEMA IF EXISTS _dbrest_mrg CASCADE")
+	})
+
+	// A portable function with no native equivalent, declared the way an operator
+	// supplies one via Register.
+	be.Register(rpc.NewStaticRegistry([]*rpc.Function{{
+		Name:       "portable_mul",
+		Params:     []rpc.Param{{Name: "a", Type: "int"}, {Name: "b", Type: "int"}},
+		Returns:    rpc.ReturnShape{Kind: rpc.ReturnScalar, Type: "int"},
+		Volatility: rpc.Immutable,
+		Query:      &rpc.PortableQuery{SQL: "SELECT :a::int * :b::int"},
+	}}))
+
+	model, err := be.Introspect(ctx)
+	if err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+	merged := rpc.Merge(be.Functions(), be.SchemaFunctions("_dbrest_mrg"))
+	schemas := []string{"_dbrest_mrg"}
+
+	// The portable function resolves and runs through the SQL compiler.
+	t.Run("portable function is reachable", func(t *testing.T) {
+		call, apiErr := ir.ParseCall("portable_mul", "", nil, false, "application/json", []byte(`{"a":6,"b":7}`), "", "")
+		if apiErr != nil {
+			t.Fatalf("ParseCall: %v", apiErr)
+		}
+		plan, perr := planpkg.Call(merged, model, call, false, schemas)
+		if perr != nil {
+			t.Fatalf("plan.Call: %v", perr)
+		}
+		if plan.Func == nil || plan.Func.Query == nil {
+			t.Fatal("portable_mul should resolve to a portable function with a Query")
+		}
+		res, err := be.Execute(ctx, plan, &reqctx.Context{Method: "POST", Path: "/rpc/portable_mul"})
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		rs := res.Rows()
+		var got int
+		for rs.Next() {
+			vals, _ := rs.Values()
+			switch v := vals[0].(type) {
+			case int32:
+				got = int(v)
+			case int64:
+				got = int(v)
+			}
+		}
+		rs.Close()
+		if got != 42 {
+			t.Errorf("portable_mul(6,7) = %d, want 42", got)
+		}
+	})
+
+	// The native function still resolves through the same merged registry.
+	t.Run("native function is reachable", func(t *testing.T) {
+		if _, ok := merged.Lookup("native_add", rpc.ArgSet{"a": true, "b": true}); !ok {
+			t.Error("native_add should resolve in the merged registry")
+		}
+	})
+
+	// Both functions appear in the OpenAPI document.
+	t.Run("both appear in OpenAPI", func(t *testing.T) {
+		body, err := openapi.Generate(model, merged, be.Capabilities(), openapi.Options{
+			Host:         "localhost",
+			ActiveSchema: "_dbrest_mrg",
+		})
+		if err != nil {
+			t.Fatalf("openapi.Generate: %v", err)
+		}
+		var doc struct {
+			Paths map[string]json.RawMessage `json:"paths"`
+		}
+		if err := json.Unmarshal(body, &doc); err != nil {
+			t.Fatalf("unmarshal document: %v", err)
+		}
+		for _, want := range []string{"/rpc/portable_mul", "/rpc/native_add"} {
+			if _, ok := doc.Paths[want]; !ok {
+				t.Errorf("%s missing from OpenAPI paths; got %v", want, keysOf(doc.Paths))
+			}
+		}
+	})
+}
+
 // TestIntegrationNativeVolatileCount covers finding 03-P02: a POST to a VOLATILE
 // set-returning function with Prefer: count=exact returns the exact total over the
 // filtered set, and the function runs exactly once. The read path counts with a

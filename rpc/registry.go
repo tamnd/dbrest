@@ -393,6 +393,44 @@ func ParseRegistry(rawJSON string) (*StaticRegistry, error) {
 	return NewStaticRegistry(fns), nil
 }
 
+// Merge composes two registries into one, with primary taking precedence on an
+// exact-signature collision. It is how a NativeRPC backend exposes both a declared
+// portable registry and its introspected native functions through the single
+// Registry the frontend resolves against: a function declared via Register shadows
+// a native function of the same signature (the explicit declaration wins), while
+// every other native function and every distinct portable overload stays reachable.
+// Overload resolution then runs across the union in one place, so a wrong argument
+// set is PGRST202 and an ambiguous one PGRST203 regardless of which source an
+// overload came from. The signature key is the function's printed signature
+// (name plus parameter names and types), so two overloads that differ in any
+// parameter are kept as distinct candidates rather than one shadowing the other.
+//
+// When either side is empty the other is returned unchanged, so the common
+// case (no declared registry) costs nothing.
+func Merge(primary, secondary Registry) Registry {
+	pl := primary.List()
+	sl := secondary.List()
+	if len(pl) == 0 {
+		return secondary
+	}
+	if len(sl) == 0 {
+		return primary
+	}
+	seen := make(map[string]bool, len(pl))
+	merged := make([]*Function, 0, len(pl)+len(sl))
+	for _, f := range pl {
+		seen[f.Signature("")] = true
+		merged = append(merged, f)
+	}
+	for _, f := range sl {
+		if seen[f.Signature("")] {
+			continue // shadowed by a same-signature primary function
+		}
+		merged = append(merged, f)
+	}
+	return NewStaticRegistry(merged)
+}
+
 // EmptyRegistry is a registry with no functions; every Lookup misses. A backend
 // that has not been given any functions returns this so the frontend raises a
 // clean PGRST202 rather than dereferencing nil.
