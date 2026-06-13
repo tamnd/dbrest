@@ -114,6 +114,11 @@ func (b *Backend) Capabilities() backend.Capabilities {
 	return Capabilities(b.version)
 }
 
+// SupportsPreRequest reports that this backend runs the db-pre-request function.
+// queueSessionItems issues SELECT <fn>() in the request transaction after the
+// session settings, so main.go accepts the option here rather than refusing it.
+func (b *Backend) SupportsPreRequest() bool { return true }
+
 // Close releases the pool.
 func (b *Backend) Close() error {
 	b.pool.Close()

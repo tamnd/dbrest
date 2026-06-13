@@ -42,7 +42,27 @@ func queueSessionItems(batch *pgx.Batch, b *Backend, rc *reqctx.Context) int {
 		"request.headers", string(rc.HeadersJSON()),
 		"request.cookies", string(rc.CookiesJSON()),
 	)
-	return n + 1
+	n++
+	if rc.PreRequest != "" {
+		// db-pre-request runs after the transaction-scoped settings and before the
+		// main query, in the same transaction, so it sees the request context and
+		// can raise to abort or write response.status/response.headers. A raised
+		// error surfaces when the batch is drained and aborts the request.
+		batch.Queue("SELECT " + preRequestCall(rc.PreRequest) + "()")
+		n++
+	}
+	return n
+}
+
+// preRequestCall renders the db-pre-request function name as a quoted, possibly
+// schema-qualified callable, so a name like auth.check or one needing quoting is
+// safe to interpolate.
+func preRequestCall(fn string) string {
+	parts := strings.Split(fn, ".")
+	for i, p := range parts {
+		parts[i] = (Dialect{}).QuoteIdent(p)
+	}
+	return strings.Join(parts, ".")
 }
 
 // applySession sends the per-request GUC setup as a SINGLE batch within tx,

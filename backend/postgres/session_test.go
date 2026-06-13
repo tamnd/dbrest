@@ -56,3 +56,33 @@ func TestQueueSessionNoTimeZone(t *testing.T) {
 		}
 	}
 }
+
+// TestQueueSessionPreRequest checks db-pre-request becomes a SELECT of the quoted
+// function as the last session item, so it runs after the GUCs and before the
+// main query.
+func TestQueueSessionPreRequest(t *testing.T) {
+	b := &Backend{}
+	batch := &pgx.Batch{}
+	queueSessionItems(batch, b, &reqctx.Context{Role: "web_anon", PreRequest: "auth.check_request"})
+	last := queuedSQL(batch)
+	if len(last) == 0 {
+		t.Fatal("no items queued")
+	}
+	got := last[len(last)-1]
+	if got != `SELECT "auth"."check_request"()` {
+		t.Errorf("pre-request item = %q", got)
+	}
+}
+
+// TestQueueSessionNoPreRequest checks no pre-request item is queued when none is
+// configured.
+func TestQueueSessionNoPreRequest(t *testing.T) {
+	b := &Backend{}
+	batch := &pgx.Batch{}
+	queueSessionItems(batch, b, &reqctx.Context{Role: "web_anon"})
+	for _, sql := range queuedSQL(batch) {
+		if strings.HasPrefix(sql, "SELECT \"") {
+			t.Errorf("unexpected pre-request item: %q", sql)
+		}
+	}
+}
