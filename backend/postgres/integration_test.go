@@ -1396,6 +1396,102 @@ func TestIntegrationRelationKinds(t *testing.T) {
 	}
 }
 
+// TestIntegrationCatalogMetadata proves the introspector populates the catalog
+// metadata PostgREST's schema cache carries and dbrest's frontend already
+// consumes: unique constraints and unique indexes (one-to-one detection, P10),
+// identity columns folded into HasDefault with the Identity flag set (P15), and
+// table, column, and schema comments (P16). Before the fix none of these reached
+// the model: unique sets were empty, identity columns looked default-less, and the
+// model carried no descriptions.
+func TestIntegrationCatalogMetadata(t *testing.T) {
+	be := openBE(t)
+	ctx := context.Background()
+
+	if _, err := be.Pool().Exec(ctx, `
+		DROP TABLE IF EXISTS _dbrest_test_meta;
+		CREATE TABLE _dbrest_test_meta (
+			id    int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+			email text NOT NULL UNIQUE,
+			slug  text NOT NULL,
+			tenant int NOT NULL,
+			label text
+		);
+		CREATE UNIQUE INDEX _dbrest_test_meta_slug_tenant ON _dbrest_test_meta (slug, tenant);
+		COMMENT ON TABLE _dbrest_test_meta IS 'People records';
+		COMMENT ON COLUMN _dbrest_test_meta.email IS 'Primary contact email';
+		COMMENT ON SCHEMA public IS 'The default schema'`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, `DROP TABLE IF EXISTS _dbrest_test_meta;
+			COMMENT ON SCHEMA public IS NULL`)
+	})
+
+	model, err := be.Introspect(ctx)
+	if err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+	rel, ok := model.Lookup("_dbrest_test_meta", []string{"public"})
+	if !ok {
+		t.Fatal("_dbrest_test_meta not found")
+	}
+
+	// P15: the identity column is folded into HasDefault and flags Identity.
+	idCol, ok := rel.Column("id")
+	if !ok {
+		t.Fatal("id column missing")
+	}
+	if !idCol.Identity {
+		t.Error("id Identity = false, want true (GENERATED ALWAYS AS IDENTITY)")
+	}
+	if !idCol.HasDefault {
+		t.Error("id HasDefault = false, want true (identity column is server-generated)")
+	}
+
+	// P10: the single-column unique constraint on email and the composite unique
+	// index on (slug, tenant) both reach the model; the PK is not duplicated here.
+	hasUnique := func(want ...string) bool {
+		for _, u := range rel.Unique {
+			if len(u) == len(want) {
+				match := true
+				for i := range want {
+					if u[i] != want[i] {
+						match = false
+						break
+					}
+				}
+				if match {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if !hasUnique("email") {
+		t.Errorf("unique sets %v missing [email]", rel.Unique)
+	}
+	if !hasUnique("slug", "tenant") {
+		t.Errorf("unique sets %v missing [slug tenant]", rel.Unique)
+	}
+	for _, u := range rel.Unique {
+		if len(u) == 1 && u[0] == "id" {
+			t.Errorf("unique sets %v include the primary key, want it excluded", rel.Unique)
+		}
+	}
+
+	// P16: table, column, and schema comments are populated.
+	if rel.Comment != "People records" {
+		t.Errorf("table comment = %q, want %q", rel.Comment, "People records")
+	}
+	emailCol, _ := rel.Column("email")
+	if emailCol.Comment != "Primary contact email" {
+		t.Errorf("email comment = %q, want %q", emailCol.Comment, "Primary contact email")
+	}
+	if got := model.SchemaComment("public"); got != "The default schema" {
+		t.Errorf("schema comment = %q, want %q", got, "The default schema")
+	}
+}
+
 func condPtr(c ir.Cond) *ir.Cond { return &c }
 func intPtr(n int) *int          { return &n }
 
