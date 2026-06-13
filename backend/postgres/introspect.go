@@ -47,6 +47,15 @@ func (b *Backend) Introspect(ctx context.Context) (*schema.Model, error) {
 		return nil, err
 	}
 
+	// Computed relationships are functions taking a relation's row type and
+	// returning rows of another relation, exposed as embeddable edges (spec 11, the
+	// escape hatch for recursive embeds). Read here with the rest of the catalog and
+	// attached to their parent relation below.
+	computedRels, err := b.loadComputedRels(ctx, schemas)
+	if err != nil {
+		return nil, err
+	}
+
 	// Function volatility drives the native RPC transaction access mode (a STABLE
 	// or IMMUTABLE function runs read-only even on POST), so it is loaded here with
 	// the rest of the catalog and refreshed whenever the model is rebuilt.
@@ -105,16 +114,17 @@ func (b *Backend) Introspect(ctx context.Context) (*schema.Model, error) {
 			return nil, err
 		}
 		out = append(out, &schema.Relation{
-			Schema:      r.schemaName,
-			Name:        r.name,
-			Kind:        r.kind,
-			Comment:     r.comment,
-			Columns:     cols,
-			PrimaryKey:  pk,
-			Unique:      uniq,
-			ForeignKeys: fksByRel[r.oid],
-			ViewColumns: viewCols[r.oid],
-			Computed:    computed[r.oid],
+			Schema:       r.schemaName,
+			Name:         r.name,
+			Kind:         r.kind,
+			Comment:      r.comment,
+			Columns:      cols,
+			PrimaryKey:   pk,
+			Unique:       uniq,
+			ForeignKeys:  fksByRel[r.oid],
+			ViewColumns:  viewCols[r.oid],
+			Computed:     computed[r.oid],
+			ComputedRels: computedRels[r.oid],
 		})
 	}
 

@@ -67,6 +67,14 @@ type Relationship struct {
 	JLocal   []string
 	JForeign []string
 
+	// FuncSchema and FuncName, when set, mark a computed relationship: the edge is
+	// not a column join but a call to FuncSchema.FuncName(parent_row), which yields
+	// the target rows. Local/Foreign/Junction are unused for such an edge; the
+	// compiler renders the function call in the embed's FROM and correlates through
+	// the row argument instead of a join predicate (spec 11).
+	FuncSchema string
+	FuncName   string
+
 	// Cardinality is the four-way spelling PostgREST reports in a PGRST201 details
 	// array ("many-to-one", "one-to-one", "one-to-many", "many-to-many"), derived
 	// the way upstream derives it: a forward foreign key is many-to-one, or
@@ -177,7 +185,10 @@ func (m *Model) Relationships(parent *Relation, targetName string, searchPath []
 	// declared edge whose name equals a derived one overrides it, so a computed
 	// relationship can replace an auto-detected edge and a config-declared edge can
 	// disambiguate a self-referential FK that derivation leaves ambiguous (spec 09).
+	// Function-backed computed relationships (spec 11) join this set and override the
+	// same way: an edge named like a derived one replaces it.
 	declared := m.declaredEdges(parent, target)
+	declared = append(declared, computedRelEdges(parent, target)...)
 	if len(declared) > 0 {
 		overridden := make(map[string]bool, len(declared))
 		for _, d := range declared {
@@ -228,6 +239,59 @@ func (m *Model) declaredEdges(parent, target *Relation) []Relationship {
 			rel.Cardinality = "many-to-many"
 		}
 		out = append(out, rel)
+	}
+	return out
+}
+
+// ComputedRelByName resolves a computed relationship on parent by its edge name
+// (the function name), inferring the target relation from the function's return
+// type. PostgREST embeds a computed relationship by the function name, which need
+// not equal the target relation name, so the planner cannot resolve it by the
+// target-name path the way a foreign-key edge resolves. It returns the resolved
+// edge and whether a computed relationship of that name exists with its target in
+// the model.
+func (m *Model) ComputedRelByName(parent *Relation, name string, searchPath []string) (*Relationship, bool) {
+	for _, cr := range parent.ComputedRels {
+		if cr.Name != name {
+			continue
+		}
+		target, ok := m.Lookup(cr.TargetName, []string{cr.TargetSchema})
+		if !ok {
+			return nil, false
+		}
+		return &Relationship{
+			Name:        cr.Name,
+			Card:        cr.Card,
+			Cardinality: declaredCardinality(cr.Card),
+			Target:      target,
+			FuncSchema:  cr.FuncSchema,
+			FuncName:    cr.Name,
+			hints:       []string{cr.Name},
+		}, true
+	}
+	return nil, false
+}
+
+// computedRelEdges returns the function-backed edges from parent to target: each
+// computed relationship on the parent whose target is this relation, as a
+// Relationship carrying the function to call instead of join columns. The edge is
+// hintable by its name (the function name), matching how a derived edge is
+// hintable by its constraint name.
+func computedRelEdges(parent, target *Relation) []Relationship {
+	var out []Relationship
+	for _, cr := range parent.ComputedRels {
+		if cr.TargetName != target.Name || cr.TargetSchema != target.Schema {
+			continue
+		}
+		out = append(out, Relationship{
+			Name:        cr.Name,
+			Card:        cr.Card,
+			Cardinality: declaredCardinality(cr.Card),
+			Target:      target,
+			FuncSchema:  cr.FuncSchema,
+			FuncName:    cr.Name,
+			hints:       []string{cr.Name},
+		})
 	}
 	return out
 }

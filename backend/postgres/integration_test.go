@@ -758,6 +758,92 @@ func TestIntegrationComputedFields(t *testing.T) {
 	}
 }
 
+// TestIntegrationComputedRelationships covers finding 03-P11 (computed
+// relationships, the recursive-embed escape hatch): a function taking a
+// relation's row type and returning SETOF another (here the same) relation is
+// introspected as an embeddable edge, so a client can embed it by name. The
+// headline case is a self-referential tree, which a stored foreign key cannot
+// embed without an explicit hint; the computed relationship names the edge.
+// Before the fix introspection read no functions as relationships, so the embed
+// 400'd as an unknown relationship.
+func TestIntegrationComputedRelationships(t *testing.T) {
+	be := openBE(t)
+	be.SetSchemas([]string{"_p11cr"})
+	ctx := context.Background()
+
+	if _, err := be.Pool().Exec(ctx, `
+		DROP SCHEMA IF EXISTS _p11cr CASCADE;
+		CREATE SCHEMA _p11cr;
+		CREATE TABLE _p11cr.employees (id int PRIMARY KEY, name text, manager_id int);
+		INSERT INTO _p11cr.employees VALUES
+			(1,'Grace',NULL), (2,'Ada',1), (3,'Alan',1), (4,'Edsger',2);
+		-- a set-returning function over the row type is a to-many computed
+		-- relationship: the direct reports of the given employee.
+		CREATE FUNCTION _p11cr.reports(e _p11cr.employees) RETURNS SETOF _p11cr.employees
+			LANGUAGE sql STABLE AS $$
+				SELECT * FROM _p11cr.employees WHERE manager_id = e.id $$`); err != nil {
+		t.Fatalf("seed schema: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, "DROP SCHEMA IF EXISTS _p11cr CASCADE")
+	})
+
+	model, err := be.Introspect(ctx)
+	if err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+	rel, ok := model.Lookup("employees", []string{"_p11cr"})
+	if !ok {
+		t.Fatal("employees relation not found")
+	}
+	if len(rel.ComputedRels) != 1 {
+		t.Fatalf("computed relationships = %d, want 1: %+v", len(rel.ComputedRels), rel.ComputedRels)
+	}
+	cr := rel.ComputedRels[0]
+	if cr.Name != "reports" || cr.TargetName != "employees" || cr.Card != schema.CardToMany {
+		t.Errorf("computed rel = %+v, want {reports ... employees to-many}", cr)
+	}
+
+	// GET /employees?select=name,reports(name)&id=eq.1 embeds Grace's direct
+	// reports through the computed edge, the escape hatch a self-referential FK
+	// cannot offer on its own.
+	q, perr := ir.ParseRead("employees", "select=name,reports(name)&id=eq.1", nil)
+	if perr != nil {
+		t.Fatalf("parse: %v", perr)
+	}
+	rp, perr := planpkg.Read(model, q, []string{"_p11cr"}, planpkg.Options{})
+	if perr != nil {
+		t.Fatalf("plan.Read: %v", perr)
+	}
+	rp.Rel = rel
+
+	res, err := be.Execute(ctx, rp, &reqctx.Context{Method: "GET", Path: "/employees"})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	rs := res.Rows()
+	defer rs.Close()
+	var got []string
+	for rs.Next() {
+		vals, err := rs.Values()
+		if err != nil {
+			t.Fatalf("Values: %v", err)
+		}
+		// columns: name, reports (a JSON array of {name})
+		got = append(got, fmt.Sprintf("%v|%v", vals[0], vals[1]))
+	}
+	if err := rs.Err(); err != nil {
+		t.Fatalf("row error: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("rows = %d, want 1: %v", len(got), got)
+	}
+	// Grace's reports are Ada and Alan; the embed must carry both names.
+	if !strings.Contains(got[0], "Grace") || !strings.Contains(got[0], "Ada") || !strings.Contains(got[0], "Alan") {
+		t.Errorf("computed-rel embed = %q, want Grace with reports Ada and Alan", got[0])
+	}
+}
+
 // TestIntegrationMergedRegistry covers finding 03-P13: a declared portable
 // registry on postgres is reachable and shares one document with the native
 // catalog. The merged registry (portable plus native, the exact composition the

@@ -99,9 +99,29 @@ type Relation struct {
 	// their names where a real column is accepted and the compiler renders each as a
 	// function call on the row. Empty for engines or relations without any.
 	Computed []ComputedField
+	// ComputedRels are the relation's computed relationships: functions taking the
+	// relation's row type and returning a set (to-many) or a single row (to-one) of
+	// another relation, exposed as embeddable edges (PostgREST computed
+	// relationships, the escape hatch for recursive embeds). The planner resolves an
+	// embed name against them like a foreign-key edge and the compiler embeds by
+	// calling the function on the parent row. Empty for relations without any.
+	ComputedRels []ComputedRel
 
 	byName     map[string]*Column
 	byComputed map[string]*ComputedField
+}
+
+// ComputedRel is a function-backed embeddable edge: a function taking the parent
+// relation's row type and returning rows of a target relation. Name is the edge
+// name a client embeds by (the function name); FuncSchema is the schema the
+// function lives in; Target names the relation its rows belong to; Card is to-many
+// when the function is set-returning, to-one when it returns a single row.
+type ComputedRel struct {
+	Name         string
+	FuncSchema   string
+	TargetSchema string
+	TargetName   string
+	Card         Card
 }
 
 // ComputedField is a function-backed virtual column: a function taking the

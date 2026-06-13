@@ -202,7 +202,7 @@ func (b *builder) writeEmbed(emb *ir.Embed, parentAlias string) *pgerr.APIError 
 	if err != nil {
 		return err
 	}
-	from := b.qualify(ir.Ref{Schema: rel.Target.Schema, Name: rel.Target.Name}) + " " + alias
+	from, corr := b.embedSource(rel, alias, parentAlias)
 
 	if rel.Card == schema.CardToOne {
 		b.sb.WriteString("(SELECT ")
@@ -210,7 +210,7 @@ func (b *builder) writeEmbed(emb *ir.Embed, parentAlias string) *pgerr.APIError 
 		b.sb.WriteString(" FROM ")
 		b.sb.WriteString(from)
 		b.sb.WriteString(" WHERE ")
-		b.sb.WriteString(b.joinCond(alias, rel.Foreign, parentAlias, rel.Local))
+		b.sb.WriteString(corr)
 		if err := b.writeEmbedFilter(emb, alias); err != nil {
 			return err
 		}
@@ -248,7 +248,7 @@ func (b *builder) writeEmbed(emb *ir.Embed, parentAlias string) *pgerr.APIError 
 		b.sb.WriteString(b.joinCond(jx, rel.JLocal, parentAlias, rel.Local))
 	} else {
 		b.sb.WriteString(" WHERE ")
-		b.sb.WriteString(b.joinCond(alias, rel.Foreign, parentAlias, rel.Local))
+		b.sb.WriteString(corr)
 	}
 	if err := b.writeEmbedFilter(emb, alias); err != nil {
 		return err
@@ -281,6 +281,21 @@ func (b *builder) writeEmbed(emb *ir.Embed, parentAlias string) *pgerr.APIError 
 	return nil
 }
 
+// embedSource renders an embed's FROM entry and its correlation predicate. A
+// foreign-key edge selects the target relation aliased and correlates by a join
+// on the FK columns. A computed relationship (spec 11) instead calls the backing
+// function on the parent row, FuncSchema.FuncName(parentAlias) alias; the function
+// argument is the correlation, so the predicate is just TRUE and the embed's own
+// filters AND onto it the same way.
+func (b *builder) embedSource(rel *schema.Relationship, alias, parentAlias string) (from, corr string) {
+	if rel.FuncName != "" {
+		call := b.d.QuoteIdent(rel.FuncSchema) + "." + b.d.QuoteIdent(rel.FuncName) + "(" + parentAlias + ")"
+		return call + " " + alias, b.d.BoolValue(true)
+	}
+	from = b.qualify(ir.Ref{Schema: rel.Target.Schema, Name: rel.Target.Name}) + " " + alias
+	return from, b.joinCond(alias, rel.Foreign, parentAlias, rel.Local)
+}
+
 // writeEmbedExists emits the EXISTS predicate that an !inner embed adds to the
 // parent WHERE, so a parent row with no embedded match is excluded. The same
 // embedded filters apply, matching PostgREST's inner-join semantics.
@@ -288,7 +303,7 @@ func (b *builder) writeEmbedExists(emb *ir.Embed, parentAlias string) *pgerr.API
 	rel := emb.Rel
 	b.aliasN++
 	alias := "x" + strconv.Itoa(b.aliasN)
-	from := b.qualify(ir.Ref{Schema: rel.Target.Schema, Name: rel.Target.Name}) + " " + alias
+	from, corr := b.embedSource(rel, alias, parentAlias)
 
 	b.sb.WriteString("EXISTS (SELECT 1 FROM ")
 	b.sb.WriteString(from)
@@ -303,7 +318,7 @@ func (b *builder) writeEmbedExists(emb *ir.Embed, parentAlias string) *pgerr.API
 		b.sb.WriteString(b.joinCond(jx, rel.JLocal, parentAlias, rel.Local))
 	} else {
 		b.sb.WriteString(" WHERE ")
-		b.sb.WriteString(b.joinCond(alias, rel.Foreign, parentAlias, rel.Local))
+		b.sb.WriteString(corr)
 	}
 	if err := b.writeEmbedFilter(emb, alias); err != nil {
 		return err

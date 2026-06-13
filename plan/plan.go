@@ -135,6 +135,12 @@ func resolveEmbeds(model *schema.Model, parent *schema.Relation, q *ir.Query, se
 func resolveOne(model *schema.Model, parent *schema.Relation, emb *ir.Embed, searchPath []string) (*schema.Relationship, *pgerr.APIError) {
 	cands, found := model.Relationships(parent, emb.Target.Name, searchPath)
 	if !found || len(cands) == 0 {
+		// A computed relationship is embedded by the function name, which need not
+		// equal the target relation name, so the target-name path above cannot see
+		// it. Fall back to resolving the edge by name and inferring its target.
+		if rel, ok := model.ComputedRelByName(parent, emb.Target.Name, searchPath); ok {
+			return rel, nil
+		}
 		return nil, pgerr.ErrNoRelationship(parent.Name, emb.Target.Name, searchSchema(searchPath), emb.Hint)
 	}
 	if emb.Hint != "" {

@@ -1079,8 +1079,7 @@ func (b *builder) relatedOrderExpr(t ir.OrderTerm, parentAlias string) (string, 
 	b.qual = saved
 	b.computed, b.rootRow = savedC, savedR
 
-	from := b.qualify(ir.Ref{Schema: rel.Target.Schema, Name: rel.Target.Name}) + " " + alias
-	cond := b.joinCond(alias, rel.Foreign, parentAlias, rel.Local)
+	from, cond := b.embedSource(rel, alias, parentAlias)
 	return "(SELECT " + col + " FROM " + from + " WHERE " + cond + ")", nil
 }
 
