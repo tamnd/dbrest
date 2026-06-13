@@ -66,7 +66,7 @@ func run() error {
 		return err
 	}
 	if showVersion {
-		fmt.Println("dbrest " + versionString())
+		fmt.Println(versionLine())
 		return nil
 	}
 	if example {
