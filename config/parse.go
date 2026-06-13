@@ -16,7 +16,7 @@ import (
 var optionKeys = []string{
 	"db-backend", "db-uri", "db-schemas", "db-schema", "db-anon-role",
 	"db-pre-request", "pre-request",
-	"db-extra-search-path", "db-max-rows", "max-rows",
+	"db-extra-search-path", "db-max-rows", "max-rows", "max-request-body",
 	"db-aggregates-enabled", "db-root-spec", "root-spec",
 	"db-tx-end", "db-hoisted-tx-settings",
 	"db-channel", "db-channel-enabled", "db-config", "db-pre-config",
@@ -42,7 +42,7 @@ var optionKeys = []string{
 // and the file accepts both the bare name (the documented extension list) and
 // an explicit dbrest. prefix.
 var nativeOptionKeys = []string{
-	"db-backend", "jwk-set", "max-rows",
+	"db-backend", "jwk-set", "max-rows", "max-request-body",
 	"declared-schema", "declared-relationships",
 	"function-registry", "policy-registry", "capability-overrides",
 }

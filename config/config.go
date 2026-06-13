@@ -76,6 +76,7 @@ type Config struct {
 	MaxRows           int // 0 means no cap
 	AggregatesEnabled bool
 	RootSpec          string
+	MaxRequestBody    int // bytes; 0 means unlimited, matching PostgREST
 
 	// Transaction behavior.
 	TxEnd             string // commit / commit-allow-override / rollback / rollback-allow-override
@@ -269,6 +270,7 @@ func fromRaw(raw map[string]string) (*Config, error) {
 		c.ExtraSearchPath = splitList(v)
 	}
 	c.MaxRows = pickInt(raw, &errs, c.MaxRows, "db-max-rows", "max-rows")
+	c.MaxRequestBody = pickInt(raw, &errs, c.MaxRequestBody, "max-request-body")
 	c.AggregatesEnabled = pickBool(raw, &errs, c.AggregatesEnabled, "db-aggregates-enabled")
 	c.RootSpec = pickString(raw, c.RootSpec, "db-root-spec", "root-spec")
 
@@ -414,6 +416,9 @@ func (c *Config) validate(errs *[]string) {
 	}
 	if c.MaxRows < 0 {
 		*errs = append(*errs, "db-max-rows must not be negative")
+	}
+	if c.MaxRequestBody < 0 {
+		*errs = append(*errs, "max-request-body must not be negative")
 	}
 	if c.JWTCacheMaxEntries < 0 {
 		*errs = append(*errs, "jwt-cache-max-entries must not be negative")

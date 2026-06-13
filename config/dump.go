@@ -32,6 +32,7 @@ func (c *Config) Dump() string {
 		"db-pre-request":              q(c.PreRequest),
 		"db-extra-search-path":        q(strings.Join(c.ExtraSearchPath, ",")),
 		"db-max-rows":                 strconv.Itoa(c.MaxRows),
+		"dbrest.max-request-body":     strconv.Itoa(c.MaxRequestBody),
 		"db-aggregates-enabled":       strconv.FormatBool(c.AggregatesEnabled),
 		"db-root-spec":                q(c.RootSpec),
 		"db-tx-end":                   q(c.TxEnd),

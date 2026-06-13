@@ -43,11 +43,21 @@ const (
 	CodeAggregatesOff      = "PGRST123" // 400 aggregate functions used while db-aggregates-enabled is off
 	CodeUnsupported        = "PGRST127" // 400 feature not implemented on this backend
 	CodeInternal           = "PGRSTX00" // 500 internal error (upstream group X has only X00)
+	CodeBodyTooLarge       = "PGRSTX13" // 413 request body exceeds the configured max-request-body
 )
 
 // ErrParse is a query-string syntax error (bad operator, malformed logic tree).
 func ErrParse(msg string) *APIError {
 	return New(http.StatusBadRequest, CodeParse, msg)
+}
+
+// ErrBodyTooLarge reports a request body over the configured max-request-body
+// cap. PostgREST has no body-size limit, so this exists only when an operator
+// opts into one; the 413 and the explicit byte bound tell the client to split
+// the load rather than presenting it as a parse failure.
+func ErrBodyTooLarge(limit int64) *APIError {
+	return New(http.StatusRequestEntityTooLarge, CodeBodyTooLarge,
+		fmt.Sprintf("Request body exceeds the %d byte max-request-body limit", limit))
 }
 
 // ErrInvalidBody is an invalid request body (PostgREST's PGRST102, HTTP 400):

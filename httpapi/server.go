@@ -6,6 +6,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,8 +28,6 @@ import (
 // singularMediaType is the Accept value that asks for a single object.
 const singularMediaType = "application/vnd.pgrst.object+json"
 
-// maxBodyBytes caps a request body, so a runaway payload cannot exhaust memory.
-const maxBodyBytes = 16 << 20 // 16 MiB
 
 // Server holds the resolved schema model and the backend, and serves the API. A
 // verifier, when set, resolves the request role from the JWT; with none, every
@@ -46,6 +45,7 @@ type Server struct {
 	rootSpec        string
 	corsOrigins     []string // server-cors-allowed-origins; empty means any
 	maxRows         int      // db-max-rows; 0 means no cap
+	maxBody         int64    // max-request-body bytes; 0 means unlimited
 	planEnabled     bool     // db-plan-enabled; plans are off by default
 	aggregatesOn    bool     // db-aggregates-enabled; aggregates are off by default
 	preRequest      string   // db-pre-request, carried to the backend per request
@@ -118,6 +118,30 @@ func (s *Server) SetMaxRows(n int) { s.maxRows = n }
 // MaxRows reports the configured db-max-rows cap (0 when uncapped). The
 // count=estimated logic uses it as the exactness threshold.
 func (s *Server) MaxRows() int { return s.maxRows }
+
+// SetMaxRequestBody applies the max-request-body option: a byte cap on a
+// request body. Zero, the default, leaves bodies unlimited as PostgREST does;
+// a positive value is a runaway-payload guard that an operator opts into.
+func (s *Server) SetMaxRequestBody(n int) { s.maxBody = int64(n) }
+
+// readBody reads a request body, honoring the optional max-request-body cap. A
+// body over the cap is a 413 with the byte bound, not a parse error; a read
+// error under the cap stays the generic could-not-read parse error.
+func (s *Server) readBody(w http.ResponseWriter, r *http.Request) ([]byte, *pgerr.APIError) {
+	reader := r.Body
+	if s.maxBody > 0 {
+		reader = http.MaxBytesReader(w, r.Body, s.maxBody)
+	}
+	b, err := io.ReadAll(reader)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return nil, pgerr.ErrBodyTooLarge(s.maxBody)
+		}
+		return nil, pgerr.ErrParse("could not read request body")
+	}
+	return b, nil
+}
 
 // capLimit lowers *limit to the db-max-rows cap, installing the cap as the
 // limit when the client did not ask for one. It returns the (possibly
@@ -510,9 +534,9 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 
 	var body []byte
 	if r.Method == http.MethodPost {
-		b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
-		if err != nil {
-			writeError(w, pgerr.ErrParse("could not read request body"))
+		b, apiErr := s.readBody(w, r)
+		if apiErr != nil {
+			writeError(w, apiErr)
 			return
 		}
 		body = b
@@ -731,9 +755,9 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.Que
 
 	var body []byte
 	if kind != ir.Delete {
-		b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
-		if err != nil {
-			writeError(w, pgerr.ErrParse("could not read request body"))
+		b, apiErr := s.readBody(w, r)
+		if apiErr != nil {
+			writeError(w, apiErr)
 			return
 		}
 		body = b
