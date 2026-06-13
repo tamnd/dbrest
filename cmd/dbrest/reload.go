@@ -3,8 +3,9 @@
 // same by keeping the HTTP frontend behind an atomic handler and rebuilding
 // it from the new inputs; an in-flight request keeps the snapshot it started
 // with. A failed reload logs and keeps serving with the previous state, the
-// upstream behavior. The per-driver paths (LISTEN on db-channel, db-config,
-// db-pre-config) live with each backend and are not wired here yet.
+// upstream behavior. The signal handler is platform-specific and lives in
+// reload_signals_unix.go (the Unix signals do not exist on Windows); the
+// db-channel listener lives in watchDBChannel below.
 package main
 
 import (
@@ -12,10 +13,8 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/signal"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/tamnd/dbrest/adminapi"
@@ -200,29 +199,6 @@ func (a *app) watchDBChannel(ctx context.Context) {
 	go func() {
 		if err := l.Listen(ctx, channel, h); err != nil && ctx.Err() == nil {
 			log.Printf("dbrest: db-channel listener stopped: %v", err)
-		}
-	}()
-}
-
-// watchSignals installs the two reload signals. Reload failures log and keep
-// the previous state; they never terminate the process.
-func (a *app) watchSignals() {
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGUSR1, syscall.SIGUSR2)
-	go func() {
-		for s := range ch {
-			switch s {
-			case syscall.SIGUSR1:
-				log.Printf("dbrest: received SIGUSR1, reloading the schema cache")
-				if err := a.reloadSchema(); err != nil {
-					log.Printf("dbrest: schema cache reload failed, keeping the old cache: %v", err)
-				}
-			case syscall.SIGUSR2:
-				log.Printf("dbrest: received SIGUSR2, reloading the configuration")
-				if err := a.reloadConfig(os.Environ()); err != nil {
-					log.Printf("dbrest: config reload failed, keeping the old config: %v", err)
-				}
-			}
 		}
 	}()
 }

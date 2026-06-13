@@ -44,6 +44,25 @@ Early, and built subsystem by subsystem against a complete design spec. What wor
 
 The capability model, the backend SPI, and the error envelope are in place. The PostgreSQL dialect and its version-computed capabilities have landed (`backend/postgres`), the reference oracle the conformance harness diffs against. The MySQL/MariaDB dialect has landed too (`backend/mysql`), the first real divergence from the oracle: an explicit IS NULL sort key for NULL placement, a no-conflict-target upsert with a no-op ignore, restricted CAST targets, `REGEXP_LIKE`, and MATCH/AGAINST boolean-mode full text. The SQL Server (T-SQL) dialect has landed as well (`backend/sqlserver`), the quirkiest on syntax and the closest to the oracle on the security model: bracket-quoted identifiers, named `@pN` placeholders, OFFSET/FETCH paging that injects an ORDER BY when the client gave none, a CASE NULL sort key, OUTPUT in place of RETURNING, a multi-statement upsert that the data plane drives, and CONTAINS/FREETEXT full text, with native roles, RLS, and a session-context store. Each driver data plane (Execute and introspection over a live server) is a follow-on slice, since it needs a running database to test. The MongoDB backend has landed too (`backend/mongo`), and it is the one engine that does not use the SQL compiler: it lowers a filter to a `$match` query document, a read to a `$match`/`$sort`/`$skip`/`$limit`/`$project` pipeline, casts to `$convert`, and NULLS placement to an `$addFields` sort key, with the array and range operators Unsupported and the security model emulated app-side. Its live driver data plane (`$lookup`/`$graphLookup` embedding, writes, sampling-based introspection) is the follow-on slice. Each backend joins the conformance harness by adding its fixture and a CI job, with no harness changes.
 
+## Install
+
+Every release ships prebuilt binaries, Linux packages, and a container image. Grab the archive for your platform from the [releases page](https://github.com/tamnd/dbrest/releases), or pull the image:
+
+```sh
+docker run -p 3000:3000 \
+  -e DBREST_DB_BACKEND=sqlite \
+  -e DBREST_DB_URI='file:/data/example.sqlite' \
+  ghcr.io/tamnd/dbrest
+```
+
+On Debian or Red Hat, install the `.deb` or `.rpm` from the release. With the Go toolchain:
+
+```sh
+go install github.com/tamnd/dbrest/cmd/dbrest@latest
+```
+
+The Homebrew tap and Scoop bucket come online as those repositories are set up. Each release also carries a checksums file, a CycloneDX SBOM per archive, and a keyless cosign signature.
+
 ## Quick start
 
 Write a config file naming the backend and the database:

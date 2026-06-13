@@ -28,12 +28,35 @@ func resolveConfigPath(flagPath string, args []string) (string, error) {
 	return args[0], nil
 }
 
-// versionString is the module version when built with one, "dev" otherwise.
+// Build metadata. The release pipeline stamps these with -ldflags -X; an
+// unstamped build (go build, go run) leaves the defaults and falls back to the
+// module version recorded in the build info.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
+// versionString is the stamped release version, the module version when built
+// from a checkout that carries one, or "dev".
 func versionString() string {
+	if version != "dev" {
+		return version
+	}
 	if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
 		return bi.Main.Version
 	}
 	return "dev"
+}
+
+// versionLine is the full --version line. It adds the commit and build date
+// when the binary was stamped by the release pipeline.
+func versionLine() string {
+	v := "dbrest " + versionString()
+	if commit != "none" || date != "unknown" {
+		v += fmt.Sprintf(" (commit %s, built %s)", commit, date)
+	}
+	return v
 }
 
 // probeReady asks a running instance's admin server whether it is ready, the

@@ -2,6 +2,9 @@
 /dbrest
 /cmd/dbrest/dbrest
 
+# GoReleaser build output
+dist/
+
 # Local databases
 *.sqlite
 *.sqlite-shm
