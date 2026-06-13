@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"net/url"
 	"slices"
 	"sort"
@@ -185,6 +186,14 @@ func ParseWrite(kind QueryKind, relation, rawQuery string, preferHeaders []strin
 		if perr != nil {
 			return nil, perr
 		}
+		// Without an explicit columns= override, PostgREST requires every object
+		// in a bulk JSON array to carry exactly the first object's keys; columns=
+		// switches to RawJSON semantics and skips the check (item 01.15).
+		if vals.Get("columns") == "" && bodyFormat(contentType) == fmtJSON {
+			if perr := checkUniformKeys(objs); perr != nil {
+				return nil, perr
+			}
+		}
 		w.Rows, w.Columns = buildInsert(objs, vals.Get("columns"), header)
 	case Update:
 		obj, perr := decodeBodyObject(contentType, body)
@@ -317,7 +326,8 @@ func decodeBodyObjects(contentType string, body []byte) ([]map[string]any, []str
 }
 
 // decodeBodyObject decodes an update body into a single object of column
-// assignments. CSV is not a meaningful patch format and is rejected.
+// assignments. PostgREST accepts CSV for PATCH as well as POST, so a single-row
+// CSV body is decoded with the same NULL rule the insert path uses.
 func decodeBodyObject(contentType string, body []byte) (map[string]any, *pgerr.APIError) {
 	switch bodyFormat(contentType) {
 	case fmtJSON:
@@ -328,6 +338,15 @@ func decodeBodyObject(contentType string, body []byte) (map[string]any, *pgerr.A
 			return nil, pgerr.ErrParse("update body must be a JSON object")
 		}
 		return obj, nil
+	case fmtCSV:
+		objs, _, perr := decodeCSVObjects(body)
+		if perr != nil {
+			return nil, perr
+		}
+		if len(objs) != 1 {
+			return nil, pgerr.ErrInvalidBody("CSV update body must have exactly one data row")
+		}
+		return objs[0], nil
 	case fmtForm:
 		return decodeFormObject(body)
 	default:
@@ -363,13 +382,19 @@ func decodeJSONObjects(body []byte) ([]map[string]any, *pgerr.APIError) {
 }
 
 // decodeCSVObjects parses an RFC 4180 body into row objects keyed by the header
-// row. An empty field decodes to SQL NULL, matching PostgREST's default CSV null
-// handling (Go's csv reader does not distinguish a quoted empty string from an
-// unquoted empty field, so both map to null).
+// row, with PostgREST's CSV semantics: the unquoted literal string NULL becomes
+// SQL null and every other field, including an empty cell, becomes a string (an
+// empty cell inserts an empty string). Go's csv reader enforces a uniform field
+// count against the header, so a ragged row surfaces as PGRST102 "All lines must
+// have same number of fields".
 func decodeCSVObjects(body []byte) ([]map[string]any, []string, *pgerr.APIError) {
 	r := csv.NewReader(bytes.NewReader(body))
 	recs, err := r.ReadAll()
 	if err != nil {
+		var pe *csv.ParseError
+		if errors.As(err, &pe) && pe.Err == csv.ErrFieldCount {
+			return nil, nil, pgerr.ErrInvalidBody("All lines must have same number of fields")
+		}
 		return nil, nil, pgerr.ErrParse("malformed CSV body")
 	}
 	if len(recs) == 0 {
@@ -380,10 +405,13 @@ func decodeCSVObjects(body []byte) ([]map[string]any, []string, *pgerr.APIError)
 	for _, rec := range recs[1:] {
 		obj := make(map[string]any, len(header))
 		for i, h := range header {
-			if i < len(rec) && rec[i] != "" {
-				obj[h] = rec[i]
-			} else {
+			switch {
+			case i >= len(rec):
 				obj[h] = nil
+			case rec[i] == "NULL":
+				obj[h] = nil
+			default:
+				obj[h] = rec[i]
 			}
 		}
 		objs = append(objs, obj)
@@ -405,6 +433,28 @@ func decodeFormObject(body []byte) (map[string]any, *pgerr.APIError) {
 		}
 	}
 	return obj, nil
+}
+
+// checkUniformKeys enforces PostgREST's rule that every object in a bulk insert
+// shares the first object's exact key set; a mismatch is PGRST102 "All object
+// keys must match". A single object (or none) is trivially uniform. The columns=
+// parameter overrides the rule, so the caller skips this when it is present.
+func checkUniformKeys(objs []map[string]any) *pgerr.APIError {
+	if len(objs) < 2 {
+		return nil
+	}
+	first := objs[0]
+	for _, obj := range objs[1:] {
+		if len(obj) != len(first) {
+			return pgerr.ErrInvalidBody("All object keys must match")
+		}
+		for k := range first {
+			if _, ok := obj[k]; !ok {
+				return pgerr.ErrInvalidBody("All object keys must match")
+			}
+		}
+	}
+	return nil
 }
 
 // buildInsert turns decoded objects into write rows and resolves the column set.

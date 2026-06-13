@@ -3,15 +3,17 @@ package ir
 import "testing"
 
 // A CSV insert body decodes to one row per data line, keyed by the header. The
-// header order fixes the write column order, and an empty field is SQL NULL.
+// header order fixes the write column order. PostgREST's CSV null rule is that
+// only the unquoted literal NULL is SQL null; an empty cell is the empty string
+// (item 01.16).
 func TestParseWriteCSVBody(t *testing.T) {
-	body := []byte("title,year\nDune,2021\nArrival,\n")
+	body := []byte("title,year,note\nDune,2021,good\nArrival,,NULL\n")
 	q, err := ParseWrite(Insert, "films", "", nil, "text/csv", body)
 	if err != nil {
 		t.Fatalf("ParseWrite CSV: %v", err)
 	}
-	if got := q.Write.Columns; len(got) != 2 || got[0] != "title" || got[1] != "year" {
-		t.Fatalf("Columns = %v, want [title year] in header order", got)
+	if got := q.Write.Columns; len(got) != 3 || got[0] != "title" || got[1] != "year" {
+		t.Fatalf("Columns = %v, want [title year note] in header order", got)
 	}
 	if len(q.Write.Rows) != 2 {
 		t.Fatalf("Rows = %d, want 2", len(q.Write.Rows))
@@ -19,9 +21,22 @@ func TestParseWriteCSVBody(t *testing.T) {
 	if v := q.Write.Rows[0]["title"]; v.JSON != "Dune" {
 		t.Errorf("row0 title = %#v, want Dune", v.JSON)
 	}
-	// The empty year field on the second row is NULL, not the empty string.
-	if v := q.Write.Rows[1]["year"]; v.JSON != nil {
-		t.Errorf("row1 year = %#v, want nil (NULL)", v.JSON)
+	// The empty year cell on the second row is the empty string, not NULL.
+	if v := q.Write.Rows[1]["year"]; v.JSON != "" {
+		t.Errorf("row1 year = %#v, want the empty string", v.JSON)
+	}
+	// The literal NULL token is SQL null.
+	if v := q.Write.Rows[1]["note"]; v.JSON != nil {
+		t.Errorf("row1 note = %#v, want nil (NULL)", v.JSON)
+	}
+}
+
+// A CSV body whose data row has a different field count than the header is a
+// PGRST102 "All lines must have same number of fields" (item 01.16).
+func TestParseWriteCSVRaggedRejected(t *testing.T) {
+	_, err := ParseWrite(Insert, "films", "", nil, "text/csv", []byte("title,year\nDune\n"))
+	if err == nil || err.Code != "PGRST102" {
+		t.Fatalf("ragged CSV err = %v, want PGRST102", err)
 	}
 }
 
@@ -102,12 +117,34 @@ func TestParseWriteUnsupportedMediaType(t *testing.T) {
 	}
 }
 
-// CSV is not a patch format, so an update body in CSV is rejected as an
-// unsupported media type rather than silently parsed.
-func TestParseWriteUpdateCSVRejected(t *testing.T) {
-	_, err := ParseWrite(Update, "films", "id=eq.1", nil, "text/csv", []byte("rating\nPG\n"))
+// PostgREST accepts CSV for PATCH as well as POST, so a single-row CSV update
+// body decodes to the column assignments (item 01.16).
+func TestParseWriteUpdateCSVAccepted(t *testing.T) {
+	q, err := ParseWrite(Update, "films", "id=eq.1", nil, "text/csv", []byte("rating\nPG\n"))
+	if err != nil {
+		t.Fatalf("ParseWrite update CSV: %v", err)
+	}
+	if v := q.Write.Set["rating"]; v.JSON != "PG" {
+		t.Errorf("set rating = %#v, want PG", v.JSON)
+	}
+}
+
+// A bulk JSON insert whose objects do not share the first object's keys is
+// PGRST102 "All object keys must match" unless columns= overrides (item 01.15).
+func TestParseWriteRaggedJSONRejected(t *testing.T) {
+	body := []byte(`[{"title":"A","year":2020},{"title":"B"}]`)
+	_, err := ParseWrite(Insert, "films", "", nil, "application/json", body)
 	if err == nil || err.Code != "PGRST102" {
-		t.Fatalf("update with CSV err = %v, want PGRST102", err)
+		t.Fatalf("ragged JSON array err = %v, want PGRST102", err)
+	}
+}
+
+// With columns= present the ragged-array check is skipped (RawJSON semantics):
+// absent keys take the missing= behavior and extra keys are ignored.
+func TestParseWriteRaggedJSONWithColumnsOK(t *testing.T) {
+	body := []byte(`[{"title":"A","year":2020},{"title":"B"}]`)
+	if _, err := ParseWrite(Insert, "films", "columns=title,year", nil, "application/json", body); err != nil {
+		t.Fatalf("ParseWrite with columns= should accept a ragged array: %v", err)
 	}
 }
 
