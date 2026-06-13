@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"fmt"
 	"io"
 
 	"github.com/tamnd/dbrest/ir"
@@ -125,6 +126,26 @@ func EnforceMaxAffected(w *ir.WriteSpec, affected int64, hasAffected bool) *pger
 	}
 	if affected > *w.MaxRows {
 		return pgerr.ErrMaxAffected(affected)
+	}
+	return nil
+}
+
+// EnforceSingularWrite is the single-object guarantee a write makes when the
+// client negotiated application/vnd.pgrst.object+json (q.Singular): the mutation
+// must affect exactly one row. A zero-or-many result is PGRST116. Callers invoke
+// it after the affected count is known and before commit, so the failure rolls
+// the mutation back through the backend's deferred rollback rather than the
+// renderer noticing the wrong count after the write is already durable
+// (PostgREST's condemn discipline). The renderer keeps the same check for reads,
+// where there is no transaction to roll back. It is a no-op for a non-singular
+// request or when the count is unknown.
+func EnforceSingularWrite(singular bool, affected int64, hasAffected bool) *pgerr.APIError {
+	if !singular || !hasAffected {
+		return nil
+	}
+	if affected != 1 {
+		return pgerr.ErrSingularZeroMany().
+			WithDetails(fmt.Sprintf("The result contains %d rows", affected))
 	}
 	return nil
 }

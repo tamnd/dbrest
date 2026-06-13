@@ -214,6 +214,13 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 		return nil, apiErr
 	}
 
+	// A singular write (vnd.pgrst.object+json) that touched zero or many rows
+	// fails closed before commit, so the deferred rollback discards it rather
+	// than the renderer rejecting an already-durable mutation.
+	if apiErr := backend.EnforceSingularWrite(q.Singular, res.affected, res.hasAff); apiErr != nil {
+		return nil, apiErr
+	}
+
 	if q.Write != nil && q.Write.Tx == ir.TxRollback {
 		return res, nil
 	}
