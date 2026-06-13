@@ -66,6 +66,31 @@ func TestUnsupportedMethodIs405PGRST117(t *testing.T) {
 	}
 }
 
+// TestStrictHandlingRejectsUnknownPreference checks a read under
+// Prefer: handling=strict carrying an unknown preference is a 400 PGRST122,
+// while the same request under the default lenient handling succeeds.
+func TestStrictHandlingRejectsUnknownPreference(t *testing.T) {
+	srv := newServer(t)
+	resp := do(t, srv, http.MethodGet, "/films", map[string]string{
+		"Prefer": "handling=strict, frobnicate=yes",
+	})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	var env map[string]any
+	json.NewDecoder(resp.Body).Decode(&env)
+	if env["code"] != "PGRST122" {
+		t.Errorf("code = %v, want PGRST122", env["code"])
+	}
+
+	ok := do(t, srv, http.MethodGet, "/films", map[string]string{
+		"Prefer": "frobnicate=yes",
+	})
+	if ok.StatusCode != http.StatusOK {
+		t.Errorf("lenient status = %d, want 200", ok.StatusCode)
+	}
+}
+
 // TestDeleteOnRPCIsPGRST101 checks PUT/PATCH/DELETE on a function keep
 // PostgREST's PGRST101 with the exact "Cannot use the <method> method on RPC"
 // text, distinct from the PGRST117 unsupported-method case.

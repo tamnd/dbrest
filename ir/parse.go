@@ -30,6 +30,9 @@ func ParseRead(relation, rawQuery string, preferHeaders []string) (*Query, *pger
 	}
 	q := &Query{Kind: Read, Relation: Ref{Name: relation}}
 	q.Prefer = ParsePrefer(preferHeaders)
+	if perr := q.Prefer.StrictError(); perr != nil {
+		return nil, perr
+	}
 	if q.Prefer.Count != nil {
 		q.Count = *q.Prefer.Count
 	}
@@ -149,6 +152,9 @@ func ParseWrite(kind QueryKind, relation, rawQuery string, preferHeaders []strin
 	// promotion below can also turn a POST into an upsert.
 	q := &Query{Kind: kind, Relation: Ref{Name: relation}, IsPut: kind == Upsert}
 	q.Prefer = ParsePrefer(preferHeaders)
+	if perr := q.Prefer.StrictError(); perr != nil {
+		return nil, perr
+	}
 	if q.Prefer.Count != nil {
 		q.Count = *q.Prefer.Count
 	}
@@ -243,6 +249,9 @@ func ParseCall(fn, rawQuery string, preferHeaders []string, isGet bool, contentT
 	}
 	c := &Call{Function: Ref{Name: fn}}
 	c.Prefer = ParsePrefer(preferHeaders)
+	if perr := c.Prefer.StrictError(); perr != nil {
+		return nil, perr
+	}
 	if c.Prefer.Count != nil {
 		c.Count = *c.Prefer.Count
 	}
