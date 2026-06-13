@@ -70,10 +70,18 @@ func Open(dsn string) (*Backend, error) {
 	if err != nil {
 		return nil, err
 	}
-	// SQLite does not enforce FK constraints by default. Pin to one connection so
-	// the PRAGMA stays in effect for the lifetime of the pool.
+	// SQLite does not enforce FK constraints by default, and its LIKE folds ASCII
+	// case by default, which makes the like operator silently case-insensitive
+	// unlike PostgreSQL. Pin to one connection so both PRAGMAs stay in effect for
+	// the lifetime of the pool.
 	db.SetMaxOpenConns(1)
 	if _, err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// case_sensitive_like = ON makes the like operator case-sensitive to match
+	// PostgreSQL; ilike folds case explicitly in the dialect (lower() LIKE lower()).
+	if _, err := db.Exec("PRAGMA case_sensitive_like = ON"); err != nil {
 		db.Close()
 		return nil, err
 	}

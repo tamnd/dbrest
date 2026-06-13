@@ -220,8 +220,13 @@ func (dialect) ArrayOp(col, op, val, colType string) (string, bool) {
 // RangeOp declines: SQLite has no range types, so sl/sr/nxr/nxl/adj are PGRST127.
 func (dialect) RangeOp(_, _, _ string) (string, bool) { return "", false }
 
-// ILike uses plain LIKE which is case-insensitive for ASCII in SQLite.
-func (dialect) ILike(col, val string) (string, bool) { return col + " LIKE " + val, true }
+// ILike folds case explicitly with lower() on both sides. Plain LIKE cannot be
+// relied on for case-insensitivity because the pool sets case_sensitive_like =
+// ON (so the like operator stays case-sensitive like PostgreSQL); lower() folds
+// ASCII, which is the documented best-effort, leaving non-ASCII folding as a gap.
+func (dialect) ILike(col, val string) (string, bool) {
+	return "lower(" + col + ") LIKE lower(" + val + ")", true
+}
 
 // IsBool falls back to the generic "IS 1"/"IS 0" form; SQLite's IS operator is
 // a NULL-safe equality that works with any value.
