@@ -295,6 +295,20 @@ func jsonScalarText(v any) string {
 // against a table return's declared columns. The resolved function and the
 // read-only decision travel on the plan for the backend to lower. See spec 12.
 func Call(reg rpc.Registry, c *ir.Call, isGet bool, searchPath []string) (*ir.Plan, *pgerr.APIError) {
+	// On GET the argument-versus-filter split needs the function's parameter
+	// names, which the registry knows by function name (the union across every
+	// overload). A query key naming a parameter is an argument; the rest are
+	// re-read as filters on a table-valued result. An unknown function is left
+	// unpartitioned so resolution raises PGRST202, rather than a stray key being
+	// mis-parsed as a filter on a result that does not exist.
+	if isGet {
+		if params, known := paramNameSet(reg, c.Function.Name); known {
+			if perr := c.PartitionGetArgs(func(k string) bool { return params[k] }); perr != nil {
+				return nil, perr
+			}
+		}
+	}
+
 	args := make(rpc.ArgSet, len(c.Args))
 	for name := range c.Args {
 		args[name] = true
@@ -317,6 +331,14 @@ func Call(reg rpc.Registry, c *ir.Call, isGet bool, searchPath []string) (*ir.Pl
 	if isGet && !fn.Volatility.ReadOnly() {
 		return nil, pgerr.ErrMethodNotAllowed(
 			"Cannot call a volatile function with GET; use POST")
+	}
+
+	// A GET argument arrives as text; validate it against the declared parameter
+	// type so an invalid value is the same 22P02 on every backend, the way a read
+	// filter is coerced. A POST argument is already typed by the JSON body, and an
+	// empty text value stays an empty string rather than becoming NULL.
+	if err := coerceCallArgs(fn, c); err != nil {
+		return nil, err
 	}
 
 	// Post-filters apply to a table return; validate their columns against the
@@ -369,6 +391,48 @@ func nearestSignature(reg rpc.Registry, schemaName, name string, args rpc.ArgSet
 		return ""
 	}
 	return "Perhaps you meant to call the function " + best.Signature(schemaName)
+}
+
+// paramNameSet is the union of parameter names across every overload of a
+// function name, and whether the name is registered at all. PostgREST partitions
+// a GET call's query keys against this set, independent of which overload
+// eventually resolves, so a key naming any overload's parameter is an argument
+// rather than a filter. The found flag separates a known parameterless function
+// (partition its keys as filters) from an unknown name (leave the keys so
+// resolution raises PGRST202).
+func paramNameSet(reg rpc.Registry, name string) (set map[string]bool, found bool) {
+	set = map[string]bool{}
+	for _, f := range reg.List() {
+		if f.Name != name {
+			continue
+		}
+		found = true
+		for _, p := range f.Params {
+			set[p.Name] = true
+		}
+	}
+	return set, found
+}
+
+// coerceCallArgs validates each GET text argument against its declared parameter
+// type, turning a bad value into the 22P02 the read path raises. A POST argument
+// is typed by the JSON body and skipped; an undeclared argument cannot reach here
+// because resolution already rejected it. A parameter with no declared type is
+// carried through unchanged.
+func coerceCallArgs(fn *rpc.Function, c *ir.Call) *pgerr.APIError {
+	for name, v := range c.Args {
+		if v.JSON != nil {
+			continue // a POST argument, already typed
+		}
+		p, ok := fn.Param(name)
+		if !ok || p.Type == "" {
+			continue
+		}
+		if err := coerce(p.Type, v.Text); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // validateCallFilters checks an RPC call's post-filter columns against a table

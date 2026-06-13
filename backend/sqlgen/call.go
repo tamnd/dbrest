@@ -190,16 +190,14 @@ func singleObjectArgs(fn *rpc.Function, args map[string]ir.Value) map[string]ir.
 
 // callArg converts an argument value to a driver argument. A POST argument has a
 // decoded JSON value (numbers preserved, objects/arrays re-encoded to text); a
-// GET argument is the raw query-string text. Type coercion to the declared
-// parameter type lands with the types subsystem (spec 16).
+// GET argument is the raw query-string text, bound verbatim. An empty query value
+// is an empty string, not NULL: PostgREST passes "" to the parameter, and a NULL
+// is expressed only by omitting the argument (which binds the parameter default).
 func callArg(d Dialect, v ir.Value) any {
 	if v.JSON != nil {
 		return writeArg(d, v)
 	}
-	if v.Text != "" {
-		return v.Text
-	}
-	return nil
+	return v.Text
 }
 
 // isJSONType reports whether a canonical type name is a JSON family type.

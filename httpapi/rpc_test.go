@@ -241,6 +241,36 @@ func TestRPCTablePostFilter(t *testing.T) {
 	}
 }
 
+// TestRPCGetArgAndColumnFilter pins the GET argument-versus-filter split: y names
+// the function parameter and binds as an argument, while title names no parameter
+// and post-filters the table return as a horizontal filter, the way PostgREST
+// treats a non-argument query key on a table-valued function.
+func TestRPCGetArgAndColumnFilter(t *testing.T) {
+	srv := newRPCServer(t)
+	resp := do(t, srv, http.MethodGet, "/rpc/films_after?y=1900&title=eq.Arrival", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	rows := decodeArray(t, resp)
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	if rows[0]["title"] != "Arrival" {
+		t.Errorf("title = %v, want Arrival", rows[0]["title"])
+	}
+}
+
+// TestRPCGetBadArgTypeIs400 checks a GET argument that does not coerce to its
+// declared parameter type is a 22P02 400, the same error a read filter raises,
+// rather than reaching the engine as raw text.
+func TestRPCGetBadArgTypeIs400(t *testing.T) {
+	srv := newRPCServer(t)
+	resp := do(t, srv, http.MethodGet, "/rpc/add_them?a=notanint&b=3", nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
 func TestRPCTableSingular(t *testing.T) {
 	srv := newRPCServer(t)
 	resp := do(t, srv, http.MethodGet, "/rpc/films_after?y=2000", map[string]string{

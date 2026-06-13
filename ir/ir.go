@@ -8,7 +8,11 @@
 // backend; its errors are the PGRST1xx family. See spec 05-query-ir-and-planning.
 package ir
 
-import "github.com/tamnd/dbrest/schema"
+import (
+	"net/url"
+
+	"github.com/tamnd/dbrest/schema"
+)
 
 // QueryKind is the operation a /<table> request performs.
 type QueryKind uint8
@@ -76,6 +80,11 @@ type Call struct {
 	Singular bool
 	Count    CountKind
 	Prefer   PreferSet
+	// RawGet holds a GET call's non-reserved query parameters before the
+	// argument-versus-filter split, which needs the resolved function's
+	// parameter names. PartitionGetArgs consumes it once the planner knows the
+	// signature. It is nil on a POST call.
+	RawGet url.Values
 }
 
 // RootSpec is a GET / request: render the OpenAPI document for a schema.

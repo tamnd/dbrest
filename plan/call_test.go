@@ -120,6 +120,76 @@ func TestCallNoParameterlessMessage(t *testing.T) {
 	}
 }
 
+// TestCallGetPartitionsArgsFromFilters checks the GET argument-versus-filter
+// split: a key naming a declared parameter binds as an argument, while a key that
+// does not name a parameter is re-read as a post-filter on the table return. The
+// function still resolves, and the filter lands in the call's WHERE.
+func TestCallGetPartitionsArgsFromFilters(t *testing.T) {
+	c := &ir.Call{
+		Function: ir.Ref{Name: "films_after"},
+		Args:     map[string]ir.Value{"y": {Text: "2000"}, "title": {Text: "eq.Arrival"}},
+		RawGet: map[string][]string{
+			"y":     {"2000"},
+			"title": {"eq.Arrival"},
+		},
+	}
+	p, err := Call(reg(filmsAfter()), c, true, nil)
+	if err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if p.Func == nil || p.Func.Name != "films_after" {
+		t.Fatalf("function not bound: %+v", p.Func)
+	}
+	// y stayed an argument; title moved out of the argument map.
+	if _, ok := c.Args["y"]; !ok {
+		t.Error("declared parameter y should remain an argument")
+	}
+	if _, ok := c.Args["title"]; ok {
+		t.Error("title names no parameter and should not be an argument")
+	}
+	// title became a post-filter in the WHERE tree.
+	if c.Where == nil {
+		t.Fatal("the non-parameter key should have become a filter")
+	}
+	cmp, ok := (*c.Where).(ir.Compare)
+	if !ok || len(cmp.Path) != 1 || cmp.Path[0] != "title" || cmp.Op != ir.OpEq {
+		t.Errorf("WHERE = %#v, want title eq filter", *c.Where)
+	}
+}
+
+// TestCallGetFilterUnknownColumnRejected checks a partitioned filter is still
+// validated against the table return's declared columns, so a non-parameter key
+// naming no column is PGRST204 rather than silently dropped.
+func TestCallGetFilterUnknownColumnRejected(t *testing.T) {
+	c := &ir.Call{
+		Function: ir.Ref{Name: "films_after"},
+		Args:     map[string]ir.Value{"y": {Text: "2000"}, "ghost": {Text: "eq.1"}},
+		RawGet: map[string][]string{
+			"y":     {"2000"},
+			"ghost": {"eq.1"},
+		},
+	}
+	_, err := Call(reg(filmsAfter()), c, true, nil)
+	if err == nil || err.Code != "PGRST204" {
+		t.Fatalf("want PGRST204, got %v", err)
+	}
+}
+
+// TestCallGetArgTypeCoercion checks a GET text argument is validated against its
+// declared parameter type, so a non-integer value for an integer parameter is the
+// same 22P02 a read filter raises, on every backend.
+func TestCallGetArgTypeCoercion(t *testing.T) {
+	c := &ir.Call{
+		Function: ir.Ref{Name: "add_them"},
+		Args:     map[string]ir.Value{"a": {Text: "notanint"}, "b": {Text: "3"}},
+		RawGet:   map[string][]string{"a": {"notanint"}, "b": {"3"}},
+	}
+	_, err := Call(reg(addThem()), c, true, nil)
+	if err == nil || err.HTTPStatus != 400 {
+		t.Fatalf("want a 400 coercion error, got %v", err)
+	}
+}
+
 func TestCallGetOnVolatileIs405(t *testing.T) {
 	vol := &rpc.Function{
 		Name:       "do_thing",

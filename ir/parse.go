@@ -248,14 +248,20 @@ func ParseCall(fn, rawQuery string, preferHeaders []string, isGet bool, contentT
 
 	if isGet {
 		post := url.Values{}
+		raw := url.Values{}
 		for k, vs := range vals {
 			if callReserved[k] {
 				post[k] = vs
 				continue
 			}
-			// A function argument; the last value wins, matching url.Values.Get.
+			// A candidate argument: the last value wins for the argument binding
+			// (matching url.Values.Get), but every value is retained on RawGet so the
+			// planner can re-read a key that turns out to be a filter, or collect a
+			// variadic parameter's repeats, once the signature is known.
+			raw[k] = vs
 			args[k] = Value{Text: vs[len(vs)-1]}
 		}
+		c.RawGet = raw
 		if perr := parseQueryString(pq, post); perr != nil {
 			return nil, perr
 		}
@@ -277,6 +283,44 @@ func ParseCall(fn, rawQuery string, preferHeaders []string, isGet bool, contentT
 	c.Select, c.Where, c.Order, c.Limit, c.Offset = pq.Select, pq.Where, pq.Order, pq.Limit, pq.Offset
 	c.Args = args
 	return c, nil
+}
+
+// PartitionGetArgs splits a GET /rpc call's query parameters into function
+// arguments and post-filters once the resolved function's parameter names are
+// known. A key naming a declared parameter stays an argument; every other key is
+// re-read through the filter grammar and merged into the call's WHERE, matching
+// how PostgREST treats a query key that does not name a parameter as a filter on
+// a table-valued result. It is a no-op on a POST call, where the body carries the
+// arguments and the query string already post-filtered.
+func (c *Call) PartitionGetArgs(isParam func(string) bool) *pgerr.APIError {
+	if c.RawGet == nil {
+		return nil
+	}
+	filters := url.Values{}
+	for k, vs := range c.RawGet {
+		if isParam(k) {
+			continue // a declared parameter stays an argument
+		}
+		delete(c.Args, k)
+		filters[k] = vs
+	}
+	if len(filters) == 0 {
+		return nil
+	}
+	cond, perr := parseFilters(filters)
+	if perr != nil {
+		return perr
+	}
+	if cond == nil {
+		return nil
+	}
+	if c.Where == nil {
+		c.Where = cond
+		return nil
+	}
+	merged := Cond(And{Kids: []Cond{*c.Where, *cond}})
+	c.Where = &merged
+	return nil
 }
 
 // writeFormat is the request body encoding selected by Content-Type (spec 17).
