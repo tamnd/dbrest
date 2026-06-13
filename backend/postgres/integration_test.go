@@ -12,6 +12,7 @@ import (
 	"github.com/tamnd/dbrest/pgerr"
 	planpkg "github.com/tamnd/dbrest/plan"
 	"github.com/tamnd/dbrest/reqctx"
+	"github.com/tamnd/dbrest/schema"
 )
 
 // dsn returns the DSN for the integration tests. The tests are skipped entirely
@@ -1307,6 +1308,91 @@ func TestIntegrationHoistedTxSettings(t *testing.T) {
 	be.SetHoistedTxSettings([]string{"statement_timeout", "plan_filter.statement_cost_limit", "default_transaction_isolation"})
 	if got := callIso(); got != "serializable" {
 		t.Errorf("isolation with hoisting = %q, want serializable", got)
+	}
+}
+
+// TestIntegrationRelationKinds proves the schema cache mirrors PostgREST's
+// relation set: a materialized view is exposed (as the view kind), a foreign table
+// is exposed (as the table kind), and a partitioned table exposes only the parent,
+// never its leaf partitions. Before the fix the relkind filter was IN ('r','v','p')
+// with no relispartition guard, so matviews and foreign tables were invisible and
+// every partition leaked in as its own endpoint. Finding 03-P08 / 03-P14.
+func TestIntegrationRelationKinds(t *testing.T) {
+	be := openBE(t)
+	ctx := context.Background()
+
+	// A matview over a base table, a partitioned parent with two leaf partitions,
+	// and a foreign table over a file_fdw server. file_fdw ships with the standard
+	// contrib package and needs no network, so it is the lightest foreign table to
+	// stand up; if the extension is unavailable the foreign-table leg is skipped.
+	if _, err := be.Pool().Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS _dbrest_test_mvbase (id int PRIMARY KEY, n int);
+		TRUNCATE _dbrest_test_mvbase;
+		INSERT INTO _dbrest_test_mvbase VALUES (1, 10), (2, 20);
+		DROP MATERIALIZED VIEW IF EXISTS _dbrest_test_mv;
+		CREATE MATERIALIZED VIEW _dbrest_test_mv AS SELECT id, n FROM _dbrest_test_mvbase;
+		CREATE TABLE IF NOT EXISTS _dbrest_test_part (id int, region text) PARTITION BY LIST (region);
+		CREATE TABLE IF NOT EXISTS _dbrest_test_part_us PARTITION OF _dbrest_test_part FOR VALUES IN ('us');
+		CREATE TABLE IF NOT EXISTS _dbrest_test_part_eu PARTITION OF _dbrest_test_part FOR VALUES IN ('eu')`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, `
+			DROP MATERIALIZED VIEW IF EXISTS _dbrest_test_mv;
+			DROP TABLE IF EXISTS _dbrest_test_mvbase;
+			DROP TABLE IF EXISTS _dbrest_test_part`)
+	})
+
+	// Best-effort foreign table over file_fdw; the test still asserts the matview
+	// and partition behaviour when the extension is not installed.
+	haveForeign := false
+	if _, err := be.Pool().Exec(ctx, `
+		CREATE EXTENSION IF NOT EXISTS file_fdw;
+		DROP SERVER IF EXISTS _dbrest_test_files CASCADE;
+		CREATE SERVER _dbrest_test_files FOREIGN DATA WRAPPER file_fdw;
+		CREATE FOREIGN TABLE _dbrest_test_ft (line text)
+			SERVER _dbrest_test_files OPTIONS (filename '/etc/hostname')`); err == nil {
+		haveForeign = true
+		t.Cleanup(func() {
+			_, _ = be.Pool().Exec(ctx, `DROP SERVER IF EXISTS _dbrest_test_files CASCADE`)
+		})
+	} else {
+		t.Logf("file_fdw unavailable, skipping foreign-table leg: %v", err)
+	}
+
+	model, err := be.Introspect(ctx)
+	if err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+
+	// The materialized view is exposed and carries the view kind.
+	mv, ok := model.Lookup("_dbrest_test_mv", []string{"public"})
+	if !ok {
+		t.Fatal("materialized view _dbrest_test_mv not exposed")
+	}
+	if mv.Kind != schema.KindView {
+		t.Errorf("matview kind = %v, want KindView", mv.Kind)
+	}
+
+	// The partitioned parent is exposed; the leaf partitions are not.
+	if _, ok := model.Lookup("_dbrest_test_part", []string{"public"}); !ok {
+		t.Error("partitioned parent _dbrest_test_part not exposed")
+	}
+	if _, ok := model.Lookup("_dbrest_test_part_us", []string{"public"}); ok {
+		t.Error("leaf partition _dbrest_test_part_us leaked as an endpoint")
+	}
+	if _, ok := model.Lookup("_dbrest_test_part_eu", []string{"public"}); ok {
+		t.Error("leaf partition _dbrest_test_part_eu leaked as an endpoint")
+	}
+
+	// The foreign table is exposed and carries the table kind (an FDW can write).
+	if haveForeign {
+		ft, ok := model.Lookup("_dbrest_test_ft", []string{"public"})
+		if !ok {
+			t.Error("foreign table _dbrest_test_ft not exposed")
+		} else if ft.Kind != schema.KindTable {
+			t.Errorf("foreign table kind = %v, want KindTable", ft.Kind)
+		}
 	}
 }
 

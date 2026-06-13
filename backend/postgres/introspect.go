@@ -83,13 +83,21 @@ type relInfo struct {
 }
 
 func (b *Backend) relationNames(ctx context.Context, schemas []string) ([]relInfo, error) {
-	// Build a literal array of quoted schema names for the ANY(...) test.
+	// The relation set mirrors PostgREST's schema cache: ordinary tables ('r'),
+	// views ('v'), materialized views ('m'), foreign tables ('f'), and partitioned
+	// parents ('p'). Materialized views map to the view kind (read-mostly; a write
+	// fails with PostgreSQL's own error, the same passthrough as PostgREST), while
+	// foreign tables map to the table kind since an FDW can accept writes.
+	// Partitions are excluded with NOT c.relispartition so only the partitioned
+	// parent is an endpoint, matching upstream; this drops both leaf partitions
+	// ('r') and intermediate sub-partitioned tables ('p').
 	q := `
 SELECT c.oid, n.nspname, c.relname,
-       CASE c.relkind WHEN 'v' THEN 'v' ELSE 't' END AS kind
+       CASE c.relkind WHEN 'v' THEN 'v' WHEN 'm' THEN 'v' ELSE 't' END AS kind
   FROM pg_class c
   JOIN pg_namespace n ON n.oid = c.relnamespace
- WHERE c.relkind IN ('r','v','p')
+ WHERE c.relkind IN ('r','v','m','f','p')
+   AND NOT c.relispartition
    AND n.nspname = ANY($1)
  ORDER BY n.nspname, c.relname`
 	rows, err := b.pool.Query(ctx, q, schemas)
