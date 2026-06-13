@@ -298,6 +298,70 @@ func TestIntegrationNativeCallSchemaDispatch(t *testing.T) {
 	}
 }
 
+// TestIntegrationNativeCallJSONArg proves a JSON object argument binds to a
+// json, a jsonb, and a text parameter alike. The argument is spliced as an
+// untyped literal so PostgreSQL's function resolution coerces it to whichever
+// type the parameter declares; a '...'::json literal would fail to match a
+// jsonb parameter (42883 -> 404). Finding 03-P05.
+func TestIntegrationNativeCallJSONArg(t *testing.T) {
+	be := openBE(t)
+	ctx := context.Background()
+
+	if _, err := be.Pool().Exec(ctx, `
+		CREATE OR REPLACE FUNCTION _dbrest_test_jb(payload jsonb) RETURNS text
+			LANGUAGE sql IMMUTABLE AS $$ SELECT payload->>'name' $$;
+		CREATE OR REPLACE FUNCTION _dbrest_test_js(payload json) RETURNS text
+			LANGUAGE sql IMMUTABLE AS $$ SELECT payload->>'name' $$;
+		CREATE OR REPLACE FUNCTION _dbrest_test_tx(payload text) RETURNS text
+			LANGUAGE sql IMMUTABLE AS $$ SELECT payload $$`); err != nil {
+		t.Fatalf("seed functions: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, `
+			DROP FUNCTION IF EXISTS _dbrest_test_jb(jsonb);
+			DROP FUNCTION IF EXISTS _dbrest_test_js(json);
+			DROP FUNCTION IF EXISTS _dbrest_test_tx(text)`)
+	})
+
+	call := func(fn string) string {
+		t.Helper()
+		plan := &ir.Plan{ReadOnly: true, Call: &ir.Call{
+			Function: ir.Ref{Name: fn},
+			Args:     map[string]ir.Value{"payload": {JSON: map[string]any{"name": "Ada"}}},
+			ReadOnly: true,
+		}}
+		res, err := be.Execute(ctx, plan, &reqctx.Context{Method: "GET", Path: "/rpc/" + fn})
+		if err != nil {
+			t.Fatalf("Execute(%s): %v", fn, err)
+		}
+		rs := res.Rows()
+		defer rs.Close()
+		if !rs.Next() {
+			t.Fatalf("Execute(%s): no rows", fn)
+		}
+		vals, err := rs.Values()
+		if err != nil {
+			t.Fatalf("Values(%s): %v", fn, err)
+		}
+		if vals[0] == nil {
+			return ""
+		}
+		return vals[0].(string)
+	}
+
+	// json/jsonb parameters extract the name; the text parameter receives the
+	// serialized object. The point is that none of the three 404s.
+	if got := call("_dbrest_test_jb"); got != "Ada" {
+		t.Errorf("jsonb arg returned %q, want Ada", got)
+	}
+	if got := call("_dbrest_test_js"); got != "Ada" {
+		t.Errorf("json arg returned %q, want Ada", got)
+	}
+	if got := call("_dbrest_test_tx"); got != `{"name":"Ada"}` {
+		t.Errorf("text arg returned %q, want the serialized object", got)
+	}
+}
+
 func condPtr(c ir.Cond) *ir.Cond { return &c }
 func intPtr(n int) *int          { return &n }
 

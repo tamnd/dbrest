@@ -442,11 +442,16 @@ func appendNativeArg(sb *strings.Builder, val ir.Value) {
 				sb.WriteString("FALSE")
 			}
 		default:
-			// JSON object / array: pass as json literal.
+			// JSON object / array: splice the encoded text as an UNTYPED literal.
+			// PostgreSQL's function resolution applies implicit casts only, and the
+			// json->jsonb cast is assignment-context, so a '...'::json literal fails
+			// to match an fn(jsonb) signature (42883 -> 404). An unknown-type literal
+			// instead coerces to json, jsonb, or text alike, which is also why the
+			// string/number/bool branches already work against any parameter type.
 			enc, _ := json.Marshal(v)
 			sb.WriteString("'")
 			sb.WriteString(strings.ReplaceAll(string(enc), "'", "''"))
-			sb.WriteString("'::json")
+			sb.WriteString("'")
 		}
 		return
 	}
