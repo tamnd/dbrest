@@ -269,6 +269,10 @@ func (Dialect) BoolValue(v bool) string {
 	return "0"
 }
 
+// InList reports ok=false: SQL Server has no array-bound ANY, so the compiler
+// emits the expanded col IN ($1, $2, ...) form.
+func (Dialect) InList(_ string) (string, bool) { return "", false }
+
 // ArrayLiteral converts a PostgreSQL {a,b} array literal to a JSON array
 // ["a","b"] so OPENJSON in ArrayOp can iterate over it.
 func (Dialect) ArrayLiteral(pgText string) string {

@@ -871,6 +871,19 @@ func (b *builder) writeIn(col string, list []string) (string, *pgerr.APIError) {
 		// `col IN ()` is a syntax error; an empty IN matches nothing.
 		return "1 = 0", nil
 	}
+	// On an engine that binds the list as a single array (PostgreSQL's = ANY), every
+	// list length is one prepared statement instead of one per length. The element
+	// quoting is PostgreSQL's array-literal format, the same the array operators use,
+	// so a value with a comma or brace stays a single element. The bind happens only
+	// on this branch so the expansion path's placeholder numbering is unaffected.
+	if frag, ok := b.d.InList(col); ok {
+		elems := make([]any, len(list))
+		for i, v := range list {
+			elems[i] = v
+		}
+		ph := b.bind(PGArrayLiteral(elems))
+		return strings.Replace(frag, PatternMark, ph, 1), nil
+	}
 	parts := make([]string, len(list))
 	for i, v := range list {
 		parts[i] = b.bind(v)

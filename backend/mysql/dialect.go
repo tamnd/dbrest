@@ -238,6 +238,10 @@ func (Dialect) BoolValue(v bool) string {
 	return "0"
 }
 
+// InList reports ok=false: MySQL has no array-bound ANY, so the compiler emits
+// the expanded col IN ($1, $2, ...) form.
+func (Dialect) InList(_ string) (string, bool) { return "", false }
+
 // ArrayLiteral converts a PostgreSQL {a,b} array literal to a JSON array
 // ["a","b"] so JSON_CONTAINS/JSON_OVERLAPS in ArrayOp can process it.
 func (Dialect) ArrayLiteral(pgText string) string {

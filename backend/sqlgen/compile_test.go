@@ -83,6 +83,7 @@ func (stub) RangeOp(col, op, val string) (string, bool) {
 	return col + " " + op + " " + val, true
 }
 func (stub) ArrayLiteral(s string) string         { return s }
+func (stub) InList(_ string) (string, bool)    { return "", false }
 func (stub) ArrayArg(e []any, _ string) any       { return JSONArrayArg(e) }
 func (stub) ILike(col, val string) (string, bool) { return col + " ILIKE " + val, true }
 func (stub) BoolValue(v bool) string {

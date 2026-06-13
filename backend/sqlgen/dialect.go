@@ -117,6 +117,17 @@ type Dialect interface {
 	// ArrayOp either).
 	ArrayLiteral(pgText string) string
 
+	// InList renders an in-list filter as a single-parameter form when the engine
+	// supports it, or reports ok=false to fall back to col IN ($1, $2, ...). col is
+	// the quoted column; the returned fragment carries PatternMark where the bound
+	// array placeholder goes, so the compiler binds the one argument only on this
+	// path (an unused bind would shift every later placeholder). PostgreSQL returns
+	// col = ANY(PatternMark), which PostgREST uses so a list of any length is one
+	// prepared statement instead of a distinct statement per length; the rows are
+	// identical to the expanded IN. Engines without an array-bound ANY return
+	// ok=false.
+	InList(col string) (string, bool)
+
 	// ArrayArg converts a decoded JSON array from a write payload into the
 	// bound driver argument the engine expects. colType is the target column's
 	// canonical type, so PostgreSQL renders the {elem1,elem2} array-literal text

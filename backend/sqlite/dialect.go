@@ -146,6 +146,10 @@ func (dialect) SessionRead(string) string { return "" }
 // SessionWrite reports ok=false: there is no engine setting to write.
 func (dialect) SessionWrite(string) (string, bool) { return "", false }
 
+// InList reports ok=false: SQLite has no array-bound ANY, so the compiler emits
+// the expanded col IN ($1, $2, ...) form.
+func (dialect) InList(_ string) (string, bool) { return "", false }
+
 // ArrayLiteral converts a PostgreSQL {a,b} array literal to a JSON array
 // ["a","b"] so json_each() in ArrayOp can iterate over it.
 func (dialect) ArrayLiteral(pgText string) string {

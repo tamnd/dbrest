@@ -780,6 +780,65 @@ func TestIntegrationUpsertNoConflictTarget(t *testing.T) {
 	}
 }
 
+// TestIntegrationInListAny proves the col = ANY($1) lowering selects exactly the
+// rows an expanded IN would, against a live server. The list binds as one array
+// literal parameter. Finding P13.
+func TestIntegrationInListAny(t *testing.T) {
+	be := openBE(t)
+	ctx := context.Background()
+
+	if _, err := be.Pool().Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS _dbrest_test_inlist (id int PRIMARY KEY);
+		TRUNCATE _dbrest_test_inlist;
+		INSERT INTO _dbrest_test_inlist SELECT generate_series(1, 5)`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, "DROP TABLE IF EXISTS _dbrest_test_inlist")
+	})
+
+	model, err := be.Introspect(ctx)
+	if err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+	rel, ok := model.Lookup("_dbrest_test_inlist", []string{"public"})
+	if !ok {
+		t.Fatal("_dbrest_test_inlist not found")
+	}
+
+	plan := &ir.Plan{
+		Rel: rel,
+		Query: &ir.Query{
+			Kind:     ir.Read,
+			Relation: ir.Ref{Schema: "public", Name: "_dbrest_test_inlist"},
+			Select:   []ir.SelectItem{ir.Column{Path: []string{"id"}}},
+			Where:    condPtr(ir.Compare{Path: []string{"id"}, Op: ir.OpIn, ColumnType: "integer", Value: ir.Value{List: []string{"2", "4", "9"}}}),
+			Order:    []ir.OrderTerm{{Path: []string{"id"}}},
+		},
+	}
+	res, err := be.Execute(ctx, plan, &reqctx.Context{Method: "GET", Path: "/_dbrest_test_inlist"})
+	if err != nil {
+		t.Fatalf("Execute(in-list): %v", err)
+	}
+	rs := res.Rows()
+	defer rs.Close()
+	var got []int32
+	for rs.Next() {
+		vals, err := rs.Values()
+		if err != nil {
+			t.Fatalf("Values: %v", err)
+		}
+		got = append(got, vals[0].(int32))
+	}
+	if err := rs.Err(); err != nil {
+		t.Fatalf("row error: %v", err)
+	}
+	// 2 and 4 exist; 9 does not. = ANY selects exactly the present members.
+	if len(got) != 2 || got[0] != 2 || got[1] != 4 {
+		t.Errorf("in-list rows = %v, want [2 4]", got)
+	}
+}
+
 func condPtr(c ir.Cond) *ir.Cond { return &c }
 func intPtr(n int) *int          { return &n }
 
