@@ -278,6 +278,24 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 		plan.Func = b.nativeFunc(plan.Call, b.callSchema(rc))
 	}
 
+	// On the native path the access mode follows volatility, not only the method:
+	// PostgREST runs a STABLE or IMMUTABLE function read-only even on POST, and
+	// only a VOLATILE function read-write. The registry path already set plan.ReadOnly
+	// from volatility, so only the native path needs the check. The mode is decided
+	// before lowering because it selects the volatile count mechanism below.
+	readOnly := plan.ReadOnly
+	if !portableCall(plan) {
+		readOnly = b.nativeCallReadOnly(plan, rc)
+	}
+
+	// A volatile function must run exactly once, so its count cannot use the read
+	// path's separate count statement; instead count(*) OVER () rides the row query
+	// when the caller asked for a count, and the total is read off any returned row
+	// and the column dropped. This applies only to the native, read-write path: the
+	// portable count compiler is the read path's, and the read path counts with its
+	// own separate statement.
+	counted := !readOnly && !portableCall(plan) && plan.Call.Count != ir.CountNone
+
 	var (
 		st     *sqlgen.Statement
 		apiErr *pgerr.APIError
@@ -289,22 +307,19 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 		if apiErr == nil {
 			// A table-valued function result supports the same select, filters,
 			// ordering, and window a table read does; the registry path wraps for
-			// these inside CompileCall, so the native path wraps here too.
-			st, apiErr = sqlgen.CompileNativeCallWrap(Dialect{}, plan.Call, st)
+			// these inside CompileCall, so the native path wraps here too. When a
+			// count is requested the counted wrap also carries count(*) OVER ().
+			if counted {
+				st, apiErr = sqlgen.CompileNativeCallCountedWrap(Dialect{}, plan.Call, st)
+			} else {
+				st, apiErr = sqlgen.CompileNativeCallWrap(Dialect{}, plan.Call, st)
+			}
 		}
 	}
 	if apiErr != nil {
 		return nil, apiErr
 	}
 
-	// On the native path the access mode follows volatility, not only the method:
-	// PostgREST runs a STABLE or IMMUTABLE function read-only even on POST, and
-	// only a VOLATILE function read-write. The registry path already set plan.ReadOnly
-	// from volatility, so only the native path needs the check.
-	readOnly := plan.ReadOnly
-	if !portableCall(plan) {
-		readOnly = b.nativeCallReadOnly(plan, rc)
-	}
 	if readOnly {
 		return b.executeCallRead(ctx, plan, rc, st)
 	}
@@ -337,6 +352,14 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 	}
 
 	res := &bufResult{cols: cols, rows: buf, controls: rc.Controls()}
+	if counted {
+		// The count(*) OVER () column repeats the full filtered total on every row;
+		// read it off the first row (an empty result is a total of zero) and drop the
+		// column so it never reaches the body. This is the single-execution count: the
+		// function ran once, in this same query.
+		res.cols, res.rows, res.count = extractCountWindow(cols, buf)
+		res.hasCount = true
+	}
 	if err := readResponseControls(ctx, tx, res.controls); err != nil {
 		return nil, b.MapError(err)
 	}
@@ -604,6 +627,42 @@ func fieldNames(rows pgx.Rows) []string {
 		names[i] = d.Name
 	}
 	return names
+}
+
+// extractCountWindow pulls the count(*) OVER () total out of a buffered result that
+// carries the _pgrst_count window column, returning the columns and rows with that
+// column removed and the total. The window repeats the full filtered total on every
+// row, so the first row carries it; an empty result is a total of zero. The rows are
+// rewritten in place: each is reduced to a fresh slice that excludes the count cell.
+func extractCountWindow(cols []string, buf [][]any) ([]string, [][]any, int64) {
+	idx := -1
+	for i, c := range cols {
+		if c == sqlgen.CountColName {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return cols, buf, 0
+	}
+	var total int64
+	if len(buf) > 0 && idx < len(buf[0]) {
+		switch n := buf[0][idx].(type) {
+		case int64:
+			total = n
+		case int32:
+			total = int64(n)
+		case int:
+			total = int64(n)
+		}
+	}
+	outCols := append(cols[:idx:idx], cols[idx+1:]...)
+	for i, row := range buf {
+		if idx < len(row) {
+			buf[i] = append(row[:idx:idx], row[idx+1:]...)
+		}
+	}
+	return outCols, buf, total
 }
 
 // explainPrefix builds the "EXPLAIN (...) " clause for a plan request from the

@@ -172,6 +172,53 @@ func CompileNativeCallCountWrap(d Dialect, c *ir.Call, inner *Statement) (*State
 	return &Statement{SQL: b.sb.String(), Args: b.args}, nil
 }
 
+// CompileNativeCallCountedWrap wraps a backend-built function-call statement so the
+// row query carries the total alongside the page in a single execution. It is the
+// volatile path's count: a STABLE or IMMUTABLE function may be counted with a
+// separate statement (it has no side effects), but a VOLATILE function must run
+// exactly once, so count(*) OVER () rides the projection. The caller reads the
+// total off any returned row and drops the _pgrst_count column. The select,
+// filter, order, and window match CompileNativeCallWrap so the page is identical;
+// count(*) OVER () counts the full filtered set because it is evaluated before the
+// LIMIT. Unlike CompileNativeCallWrap it always wraps, since even a bare call needs
+// the extra column.
+func CompileNativeCallCountedWrap(d Dialect, c *ir.Call, inner *Statement) (*Statement, *pgerr.APIError) {
+	b := newBuilder(d)
+	b.args = append(b.args, inner.Args...)
+	const alias = "_rpc"
+	b.sb.WriteString("SELECT ")
+	if len(c.Select) > 0 {
+		if err := b.writeSelect(c.Select); err != nil {
+			return nil, err
+		}
+	} else {
+		b.sb.WriteString("*")
+	}
+	b.sb.WriteString(`, count(*) OVER () AS "`)
+	b.sb.WriteString(CountColName)
+	b.sb.WriteString(`" FROM (`)
+	b.sb.WriteString(inner.SQL)
+	b.sb.WriteString(") ")
+	b.sb.WriteString(alias)
+	if c.Where != nil {
+		b.sb.WriteString(" WHERE ")
+		if err := b.writeCond(*c.Where); err != nil {
+			return nil, err
+		}
+	}
+	hasOrder := len(c.Order) > 0
+	if hasOrder {
+		if err := b.writeOrder(c.Order); err != nil {
+			return nil, err
+		}
+	}
+	if clause := b.d.LimitOffset(c.Limit, c.Offset, hasOrder); clause != "" {
+		b.sb.WriteString(" ")
+		b.sb.WriteString(clause)
+	}
+	return &Statement{SQL: b.sb.String(), Args: b.args}, nil
+}
+
 // CompileCallCount lowers the count of an RPC result: the bound function wrapped
 // in a count over its rows, with a table return's WHERE post-filter applied (the
 // select, order, and window do not change the count). It runs as a separate

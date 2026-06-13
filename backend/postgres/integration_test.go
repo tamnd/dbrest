@@ -325,6 +325,85 @@ func TestIntegrationNativeReturnShapes(t *testing.T) {
 	}
 }
 
+// TestIntegrationNativeVolatileCount covers finding 03-P02: a POST to a VOLATILE
+// set-returning function with Prefer: count=exact returns the exact total over the
+// filtered set, and the function runs exactly once. The read path counts with a
+// separate statement, but a volatile function has side effects, so the count must
+// ride count(*) OVER () on the single row query rather than re-invoking the
+// function. An audit table records each invocation, proving single execution.
+func TestIntegrationNativeVolatileCount(t *testing.T) {
+	be := openBE(t)
+	ctx := context.Background()
+
+	if _, err := be.Pool().Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS _dbrest_vc_audit (n int);
+		TRUNCATE _dbrest_vc_audit;
+		CREATE OR REPLACE FUNCTION _dbrest_vc_enroll() RETURNS TABLE(n int)
+			LANGUAGE plpgsql VOLATILE AS $$
+			BEGIN
+				INSERT INTO _dbrest_vc_audit VALUES (1);
+				RETURN QUERY SELECT * FROM (VALUES (1),(2),(3),(4)) v(n);
+			END $$`); err != nil {
+		t.Fatalf("seed function: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, `
+			DROP FUNCTION IF EXISTS _dbrest_vc_enroll();
+			DROP TABLE IF EXISTS _dbrest_vc_audit`)
+	})
+	if _, err := be.Introspect(ctx); err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+
+	// POST with a filter (n >= 2) and a limit of 1: of the four returned values
+	// three match, so the exact count is 3, but only one row reaches the body.
+	plan := &ir.Plan{Call: &ir.Call{
+		Function: ir.Ref{Name: "_dbrest_vc_enroll"},
+		Args:     map[string]ir.Value{},
+		Where:    condPtr(ir.Compare{Path: []string{"n"}, Op: ir.OpGte, Value: ir.Value{Text: "2"}}),
+		Limit:    intPtr(1),
+		Count:    ir.CountExact,
+	}}
+
+	res, err := be.Execute(ctx, plan, &reqctx.Context{Method: "POST", Path: "/rpc/_dbrest_vc_enroll"})
+	if err != nil {
+		t.Fatalf("Execute(volatile call): %v", err)
+	}
+
+	if c, ok := res.Count(); !ok || c != 3 {
+		t.Errorf("Count = (%d, %v), want (3, true) over the filtered rows", c, ok)
+	}
+
+	rs := res.Rows()
+	var rows, cols int
+	for rs.Next() {
+		vals, err := rs.Values()
+		if err != nil {
+			t.Fatalf("Values: %v", err)
+		}
+		cols = len(vals)
+		rows++
+	}
+	rs.Close()
+	if rows != 1 {
+		t.Errorf("limit 1 returned %d rows, want 1", rows)
+	}
+	// The _pgrst_count window column must not leak into the body.
+	if cols != 1 {
+		t.Errorf("body row has %d columns, want 1 (count column stripped)", cols)
+	}
+
+	// The function ran exactly once: a separate count statement would have inserted
+	// a second audit row.
+	var runs int
+	if err := be.Pool().QueryRow(ctx, "SELECT count(*) FROM _dbrest_vc_audit").Scan(&runs); err != nil {
+		t.Fatalf("audit count: %v", err)
+	}
+	if runs != 1 {
+		t.Errorf("function ran %d times, want exactly 1", runs)
+	}
+}
+
 // TestIntegrationNativeCallSchemaDispatch proves a native RPC resolves in the
 // request's negotiated schema (Accept-Profile / Content-Profile, carried as
 // reqctx.Context.Schema), not always the first configured schema. Two schemas
