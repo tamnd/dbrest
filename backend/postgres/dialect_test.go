@@ -256,3 +256,25 @@ func TestBoolValue(t *testing.T) {
 		t.Error("BoolValue should render the PostgreSQL keywords")
 	}
 }
+
+// A JSON array in a write payload is bound by target column type: a json/jsonb
+// column takes JSON text (a JSON array there is JSON, not a PG array), an array
+// column takes the {a,b} array literal, and an unknown type keeps the literal.
+func TestArrayArgByColumnType(t *testing.T) {
+	elems := []any{"a", "b"}
+	cases := []struct {
+		colType string
+		want    string
+	}{
+		{"jsonb", `["a","b"]`},
+		{"json", `["a","b"]`},
+		{"text[]", `{a,b}`},
+		{"integer[]", `{a,b}`},
+		{"", `{a,b}`},
+	}
+	for _, c := range cases {
+		if got := d.ArrayArg(elems, c.colType); got != c.want {
+			t.Errorf("ArrayArg(_, %q) = %q, want %q", c.colType, got, c.want)
+		}
+	}
+}

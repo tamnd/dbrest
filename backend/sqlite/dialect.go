@@ -173,7 +173,7 @@ func (dialect) ArrayLiteral(pgText string) string {
 // ArrayArg stores a payload array as its JSON text: SQLite has no array
 // columns, so a JSON-typed column holds the array and reads it back as JSON.
 // A PostgreSQL {a,b} literal here would corrupt the column.
-func (dialect) ArrayArg(elems []any) any { return sqlgen.JSONArrayArg(elems) }
+func (dialect) ArrayArg(elems []any, _ string) any { return sqlgen.JSONArrayArg(elems) }
 
 // JSONPath lowers a JSON sub-path to SQLite's -> / ->> operators over a single
 // JSON path argument. SQLite's ->> returns the SQL text scalar and -> returns

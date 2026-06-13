@@ -364,7 +364,7 @@ func singleObjectArgs(fn *rpc.Function, args map[string]ir.Value) map[string]ir.
 // is expressed only by omitting the argument (which binds the parameter default).
 func callArg(d Dialect, v ir.Value) any {
 	if v.JSON != nil {
-		return writeArg(d, v)
+		return writeArg(d, v, "")
 	}
 	return v.Text
 }
@@ -398,12 +398,12 @@ func variadicElems(d Dialect, v ir.Value) []any {
 	if arr, ok := v.JSON.([]any); ok {
 		out := make([]any, len(arr))
 		for i, e := range arr {
-			out[i] = writeArg(d, ir.Value{JSON: e})
+			out[i] = writeArg(d, ir.Value{JSON: e}, "")
 		}
 		return out
 	}
 	if v.JSON != nil {
-		return []any{writeArg(d, v)}
+		return []any{writeArg(d, v, "")}
 	}
 	if v.Text != "" {
 		return []any{v.Text}

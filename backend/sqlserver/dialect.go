@@ -299,7 +299,7 @@ func (Dialect) ArrayLiteral(pgText string) string {
 // ArrayArg stores a payload array as its JSON text: SQL Server has no array
 // columns, so an nvarchar column holds the array and reads it back as JSON.
 // A PostgreSQL {a,b} literal here would corrupt the column.
-func (Dialect) ArrayArg(elems []any) any { return sqlgen.JSONArrayArg(elems) }
+func (Dialect) ArrayArg(elems []any, _ string) any { return sqlgen.JSONArrayArg(elems) }
 
 // JSONPath reports ok=false so the compiler raises PGRST127. SQL Server expresses
 // JSON access through JSON_VALUE/JSON_QUERY rather than ->/->>, and lowering them

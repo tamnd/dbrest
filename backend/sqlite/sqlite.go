@@ -501,7 +501,7 @@ func detectUpsertInsert(ctx context.Context, tx *sql.Tx, q *ir.Query, rel *schem
 				args = nil
 				break
 			}
-			args[i] = sqlgen.WriteArg(d, v)
+			args[i] = sqlgen.WriteArg(d, v, q.Write.ColumnTypes[c])
 		}
 		if args == nil {
 			inserted++

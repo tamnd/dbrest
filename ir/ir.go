@@ -416,6 +416,12 @@ type WriteSpec struct {
 	Return   ReturnMode
 	MaxRows  *int64
 	Tx       TxMode
+	// ColumnTypes is the canonical type of each written column, resolved by the
+	// planner from the relation. The compiler uses it to decide how a JSON array
+	// payload value lands: a json/jsonb column takes JSON text, an array column
+	// takes a PostgreSQL array literal. It is empty for backends or paths that do
+	// not resolve a schema.
+	ColumnTypes map[string]string
 }
 
 // MissingMode is the Prefer: missing= behavior for absent payload columns.

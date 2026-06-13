@@ -521,6 +521,72 @@ func TestIntegrationFullTextTSVector(t *testing.T) {
 	}
 }
 
+// TestIntegrationArrayPayloadByColumnType proves a JSON array payload value
+// lands as JSON in a jsonb column and as a PostgreSQL array in a text[] column.
+// Before the fix every array became a {a,b} literal, so inserting an array into
+// a jsonb column failed with 22P02. The planner resolves the target column type
+// and the dialect routes the value accordingly. Finding 01-P06.
+func TestIntegrationArrayPayloadByColumnType(t *testing.T) {
+	be := openBE(t)
+	ctx := context.Background()
+
+	if _, err := be.Pool().Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS _dbrest_test_arr (
+			id   serial PRIMARY KEY,
+			tags jsonb NOT NULL,
+			labs text[] NOT NULL
+		);
+		TRUNCATE _dbrest_test_arr`); err != nil {
+		t.Fatalf("seed table: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, "DROP TABLE IF EXISTS _dbrest_test_arr")
+	})
+
+	model, err := be.Introspect(ctx)
+	if err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+	rel, ok := model.Lookup("_dbrest_test_arr", []string{"public"})
+	if !ok {
+		t.Fatal("_dbrest_test_arr not found")
+	}
+
+	// The planner fills WriteSpec.ColumnTypes from the relation; build the same
+	// shape here so the compiler routes each array by its target column type.
+	plan := &ir.Plan{Rel: rel, Query: &ir.Query{
+		Kind:     ir.Insert,
+		Relation: ir.Ref{Schema: "public", Name: "_dbrest_test_arr"},
+		Write: &ir.WriteSpec{
+			Rows: []map[string]ir.Value{{
+				"tags": {JSON: []any{"x", "y"}},
+				"labs": {JSON: []any{"a", "b"}},
+			}},
+			Columns:     []string{"tags", "labs"},
+			ColumnTypes: map[string]string{"tags": "jsonb", "labs": "text[]"},
+			Return:      ir.ReturnMinimal,
+		},
+	}}
+	if _, err := be.Execute(ctx, plan, &reqctx.Context{Method: "POST", Path: "/_dbrest_test_arr"}); err != nil {
+		t.Fatalf("Execute(insert arrays): %v", err)
+	}
+
+	// Read the stored values straight from the pool to confirm the jsonb holds a
+	// JSON array and the text[] holds two elements.
+	var tags string
+	var labs []string
+	if err := be.Pool().QueryRow(ctx,
+		"SELECT tags::text, labs FROM _dbrest_test_arr LIMIT 1").Scan(&tags, &labs); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if tags != `["x", "y"]` {
+		t.Errorf("jsonb tags = %q, want a JSON array", tags)
+	}
+	if len(labs) != 2 || labs[0] != "a" || labs[1] != "b" {
+		t.Errorf("text[] labs = %v, want [a b]", labs)
+	}
+}
+
 func condPtr(c ir.Cond) *ir.Cond { return &c }
 func intPtr(n int) *int          { return &n }
 

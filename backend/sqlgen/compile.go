@@ -272,7 +272,7 @@ func CompileInsert(d Dialect, q *ir.Query, returning []string) (*Statement, *pge
 					b.sb.WriteString(", ")
 				}
 				if val, ok := row[c]; ok {
-					b.sb.WriteString(b.bind(writeArg(b.d, val)))
+					b.sb.WriteString(b.bind(writeArg(b.d, val, w.ColumnTypes[c])))
 				} else if w.Missing == ir.MissingNull {
 					b.sb.WriteString(b.bind(nil))
 				} else {
@@ -313,7 +313,7 @@ func CompileUpdate(d Dialect, q *ir.Query, returning []string) (*Statement, *pge
 		}
 		b.sb.WriteString(d.QuoteIdent(c))
 		b.sb.WriteString(" = ")
-		b.sb.WriteString(b.bind(writeArg(b.d, w.Set[c])))
+		b.sb.WriteString(b.bind(writeArg(b.d, w.Set[c], w.ColumnTypes[c])))
 	}
 	if q.Where != nil {
 		b.sb.WriteString(" WHERE ")
@@ -396,10 +396,12 @@ func (b *builder) writeReturning(cols []string) *pgerr.APIError {
 // {a,b} array literal or JSON text. It is exported for backends (e.g. the
 // MERGE path) that need the same coercion without going through the SQL
 // builder.
-func WriteArg(d Dialect, v ir.Value) any { return writeArg(d, v) }
+func WriteArg(d Dialect, v ir.Value, colType string) any { return writeArg(d, v, colType) }
 
-// writeArg is the unexported implementation used by the builder methods.
-func writeArg(d Dialect, v ir.Value) any {
+// writeArg is the unexported implementation used by the builder methods. colType
+// is the target column's canonical type, which steers how a JSON array value is
+// bound (see Dialect.ArrayArg); an empty colType keeps the engine default.
+func writeArg(d Dialect, v ir.Value, colType string) any {
 	switch x := v.JSON.(type) {
 	case nil:
 		return nil
@@ -412,7 +414,7 @@ func writeArg(d Dialect, v ir.Value) any {
 		}
 		return x.String()
 	case []any:
-		return d.ArrayArg(x)
+		return d.ArrayArg(x, colType)
 	case map[string]any:
 		bs, err := json.Marshal(x)
 		if err != nil {

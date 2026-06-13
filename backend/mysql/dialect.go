@@ -265,7 +265,7 @@ func (Dialect) ArrayLiteral(pgText string) string {
 // ArrayArg stores a payload array as its JSON text: MySQL has no array
 // columns, so a JSON column holds the array and reads it back as JSON. A
 // PostgreSQL {a,b} literal here would corrupt the column.
-func (Dialect) ArrayArg(elems []any) any { return sqlgen.JSONArrayArg(elems) }
+func (Dialect) ArrayArg(elems []any, _ string) any { return sqlgen.JSONArrayArg(elems) }
 
 // JSONPath reports ok=false so the compiler raises PGRST127. MySQL has ->/->>
 // operators, but lowering them faithfully needs a live server to verify against

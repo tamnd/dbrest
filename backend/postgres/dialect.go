@@ -256,10 +256,17 @@ func (Dialect) IsUnknown(col string) (string, bool) { return col + " IS UNKNOWN"
 // accepts it natively.
 func (Dialect) ArrayLiteral(pgText string) string { return pgText }
 
-// ArrayArg renders a payload array as the {a,b} array-literal text so the
-// server-side cast from text to text[]/int4[]/etc. succeeds with or without
-// type OIDs.
-func (Dialect) ArrayArg(elems []any) any { return sqlgen.PGArrayLiteral(elems) }
+// ArrayArg renders a payload array for the target column. A JSON array bound for
+// a json/jsonb column is JSON, not a PostgreSQL array, so it is kept as JSON
+// text; for an array column it becomes the {a,b} array-literal text so the
+// server-side cast from text to text[]/int4[]/etc. succeeds with or without type
+// OIDs. An unknown column type keeps the array-literal default.
+func (Dialect) ArrayArg(elems []any, colType string) any {
+	if colType == "json" || colType == "jsonb" {
+		return sqlgen.JSONArrayArg(elems)
+	}
+	return sqlgen.PGArrayLiteral(elems)
+}
 
 // JSONPath emits PostgreSQL's native -> / ->> operator chain: every hop is ->
 // (json) except the final one, which is ->> when the access was text. A digit

@@ -118,12 +118,13 @@ type Dialect interface {
 	ArrayLiteral(pgText string) string
 
 	// ArrayArg converts a decoded JSON array from a write payload into the
-	// bound driver argument the engine expects. PostgreSQL renders the
-	// {elem1,elem2} array-literal text so the server-side cast to
-	// text[]/int4[]/etc. succeeds; engines without array columns (SQLite,
-	// MySQL, SQL Server) keep the JSON text so a json/text column stores the
-	// array unchanged and reads it back as a JSON array.
-	ArrayArg(elems []any) any
+	// bound driver argument the engine expects. colType is the target column's
+	// canonical type, so PostgreSQL renders the {elem1,elem2} array-literal text
+	// for an array column but keeps JSON text for a json/jsonb column (a JSON
+	// array there is JSON, not an array literal); engines without array columns
+	// (SQLite, MySQL, SQL Server) keep the JSON text regardless so a json/text
+	// column stores the array unchanged and reads it back as a JSON array.
+	ArrayArg(elems []any, colType string) any
 
 	// JSONPath lowers a JSON sub-path access into the engine's spelling. base is
 	// the already-qualified, quoted base column; hops are the path segments after

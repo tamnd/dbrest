@@ -646,17 +646,26 @@ func validateWrite(rel *schema.Relation, w *ir.WriteSpec) *pgerr.APIError {
 		return nil
 	}
 	// The insert column set (first-row keys or explicit columns=) is what the
-	// compiler writes; validating it covers the payload that reaches SQL.
+	// compiler writes; validating it covers the payload that reaches SQL. Each
+	// resolved column carries its canonical type so the compiler can lower a JSON
+	// array payload value to the shape the target column accepts (json/jsonb text
+	// vs a PostgreSQL array literal).
+	types := map[string]string{}
 	for _, c := range w.Columns {
-		if !rel.HasColumn(c) {
+		col, ok := rel.Column(c)
+		if !ok {
 			return pgerr.ErrUnknownColumn(c, rel.Name)
 		}
+		types[c] = col.Type
 	}
 	for k := range w.Set {
-		if !rel.HasColumn(k) {
+		col, ok := rel.Column(k)
+		if !ok {
 			return pgerr.ErrUnknownColumn(k, rel.Name)
 		}
+		types[k] = col.Type
 	}
+	w.ColumnTypes = types
 	if w.Conflict != nil && len(w.Conflict.Target) == 0 {
 		w.Conflict.Target = rel.PrimaryKey
 	}
