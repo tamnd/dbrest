@@ -429,7 +429,7 @@ func bindRawBody(contentType string, body []byte, declaredType string) (Value, *
 		dec.UseNumber()
 		var v any
 		if err := dec.Decode(&v); err != nil {
-			return Value{}, pgerr.ErrParse("request body must be valid JSON")
+			return Value{}, pgerr.ErrInvalidBody("")
 		}
 		return Value{JSON: v}, nil
 	case "text/plain", "text/xml", "application/xml":
@@ -453,7 +453,7 @@ func decodeBodyObject(contentType string, body []byte) (map[string]any, *pgerr.A
 		dec.UseNumber()
 		var raw any
 		if err := dec.Decode(&raw); err != nil {
-			return nil, pgerr.ErrParse("update body must be a JSON object")
+			return nil, pgerr.ErrInvalidBody("")
 		}
 		switch v := raw.(type) {
 		case map[string]any:
@@ -465,12 +465,12 @@ func decodeBodyObject(contentType string, body []byte) (map[string]any, *pgerr.A
 			for _, e := range v {
 				obj, ok := e.(map[string]any)
 				if !ok || len(obj) > 0 {
-					return nil, pgerr.ErrParse("update body must be a JSON object")
+					return nil, pgerr.ErrInvalidBody("All object keys must match")
 				}
 			}
 			return map[string]any{}, nil
 		default:
-			return nil, pgerr.ErrParse("update body must be a JSON object")
+			return nil, pgerr.ErrInvalidBody("")
 		}
 	case fmtCSV:
 		objs, _, perr := decodeCSVObjects(body)
@@ -495,7 +495,7 @@ func decodeJSONObjects(body []byte) ([]map[string]any, *pgerr.APIError) {
 	dec.UseNumber()
 	var raw any
 	if err := dec.Decode(&raw); err != nil {
-		return nil, pgerr.ErrParse("request body is not valid JSON")
+		return nil, pgerr.ErrInvalidBody("")
 	}
 	switch v := raw.(type) {
 	case map[string]any:
@@ -505,13 +505,13 @@ func decodeJSONObjects(body []byte) ([]map[string]any, *pgerr.APIError) {
 		for _, e := range v {
 			obj, ok := e.(map[string]any)
 			if !ok {
-				return nil, pgerr.ErrParse("insert array must contain objects")
+				return nil, pgerr.ErrInvalidBody("All object keys must match")
 			}
 			objs = append(objs, obj)
 		}
 		return objs, nil
 	default:
-		return nil, pgerr.ErrParse("insert body must be an object or an array of objects")
+		return nil, pgerr.ErrInvalidBody("")
 	}
 }
 
@@ -529,10 +529,10 @@ func decodeCSVObjects(body []byte) ([]map[string]any, []string, *pgerr.APIError)
 		if errors.As(err, &pe) && pe.Err == csv.ErrFieldCount {
 			return nil, nil, pgerr.ErrInvalidBody("All lines must have same number of fields")
 		}
-		return nil, nil, pgerr.ErrParse("malformed CSV body")
+		return nil, nil, pgerr.ErrInvalidBody("malformed CSV body")
 	}
 	if len(recs) == 0 {
-		return nil, nil, pgerr.ErrParse("CSV body has no header row")
+		return nil, nil, pgerr.ErrInvalidBody("CSV body has no header row")
 	}
 	header := recs[0]
 	objs := make([]map[string]any, 0, len(recs)-1)
@@ -558,7 +558,7 @@ func decodeCSVObjects(body []byte) ([]map[string]any, []string, *pgerr.APIError)
 func decodeFormObject(body []byte) (map[string]any, *pgerr.APIError) {
 	vals, err := url.ParseQuery(string(body))
 	if err != nil {
-		return nil, pgerr.ErrParse("malformed form body")
+		return nil, pgerr.ErrInvalidBody("malformed form body")
 	}
 	obj := make(map[string]any, len(vals))
 	for k, v := range vals {

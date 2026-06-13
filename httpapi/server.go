@@ -140,7 +140,7 @@ func (s *Server) readBody(w http.ResponseWriter, r *http.Request) ([]byte, *pger
 		if errors.As(err, &tooLarge) {
 			return nil, pgerr.ErrBodyTooLarge(s.maxBody)
 		}
-		return nil, pgerr.ErrParse("could not read request body")
+		return nil, pgerr.ErrInvalidBody("could not read request body")
 	}
 	return b, nil
 }
@@ -545,7 +545,13 @@ func rpcName(path string) (string, bool) {
 // only reach a read-only function; the plan raises 405 otherwise. Any other
 // method is not allowed on a function. See spec 12-rpc.
 func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id identity, activeSchema string) {
-	if fn == "" || strings.Contains(fn, "/") {
+	if strings.Contains(fn, "/") {
+		// /rpc/<fn>/extra is a multi-segment path, not a missing function: PostgREST
+		// answers PGRST125 "Invalid path specified in request URL" (item 04.8).
+		writeError(w, pgerr.ErrInvalidPath())
+		return
+	}
+	if fn == "" {
 		writeError(w, pgerr.ErrNoFunction(activeSchema, fn, nil, ""))
 		return
 	}
@@ -714,7 +720,10 @@ func (s *Server) writeCall(w http.ResponseWriter, r *http.Request, call *ir.Call
 func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity, activeSchema string) {
 	relation := strings.Trim(r.URL.Path, "/")
 	if relation == "" || strings.Contains(relation, "/") {
-		writeError(w, pgerr.ErrUnknownTable(activeSchema, relation))
+		// A path with more than one segment names no routable resource; PostgREST
+		// answers PGRST125 "Invalid path specified in request URL", distinct from
+		// the PGRST205 a single unknown relation gets (item 04.8).
+		writeError(w, pgerr.ErrInvalidPath())
 		return
 	}
 
@@ -885,7 +894,8 @@ func planContentType(opts backend.PlanOptions) string {
 func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.QueryKind, id identity, activeSchema string) {
 	relation := strings.Trim(r.URL.Path, "/")
 	if relation == "" || strings.Contains(relation, "/") {
-		writeError(w, pgerr.ErrUnknownTable(activeSchema, relation))
+		// As in handleRead: a multi-segment path is PGRST125, not a missing table.
+		writeError(w, pgerr.ErrInvalidPath())
 		return
 	}
 
@@ -1263,15 +1273,16 @@ func asAPIError(b backend.Backend, err error) *pgerr.APIError {
 }
 
 // mapExecError wraps asAPIError with the PostgREST 401/403 rule: a 42501
-// (insufficient_privilege) error to an anonymous request is 401 (authentication
-// required), not 403 (forbidden). An authenticated request that is denied
-// remains 403 so the caller knows to authenticate, not just retry.
-// The original PostgreSQL message is preserved to match PostgREST wire behavior.
+// (insufficient_privilege) error is 403 for an authenticated request, so the
+// caller knows the role is wrong rather than missing, and 401 for an anonymous
+// one, so it knows to authenticate. GradePrivilegeStatus is the one place the
+// rule lives, so the status is correct whatever status a backend's SQLSTATE
+// table assigned; mapExecError adds the bare Bearer challenge PostgREST sends on
+// the 401. The original PostgreSQL message is preserved for wire compatibility.
 func mapExecError(b backend.Backend, err error, anonymous bool) *pgerr.APIError {
-	e := asAPIError(b, err)
+	e := pgerr.GradePrivilegeStatus(asAPIError(b, err), !anonymous)
 	if anonymous && e.Code == pgerr.CodeInsufficientPrivilege {
 		lifted := *e
-		lifted.HTTPStatus = http.StatusUnauthorized
 		// PostgREST sends the bare Bearer challenge on every 401, including a
 		// privilege denial lifted from 403 for an unauthenticated request.
 		lifted.WWWAuthenticate = "Bearer"

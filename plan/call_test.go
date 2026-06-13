@@ -191,6 +191,10 @@ func TestCallGetArgTypeCoercion(t *testing.T) {
 	}
 }
 
+// A GET reaching a volatile function fails the way PostgREST's does: the read-only
+// transaction rejects the write with SQLSTATE 25006 at 405, not a PGRST101. The
+// registry path raises it from the declared volatility since it cannot run the
+// call, but the code and status a client sees match the native path (item 04.6).
 func TestCallGetOnVolatileIs405(t *testing.T) {
 	vol := &rpc.Function{
 		Name:       "do_thing",
@@ -200,8 +204,8 @@ func TestCallGetOnVolatileIs405(t *testing.T) {
 	}
 	c := &ir.Call{Function: ir.Ref{Name: "do_thing"}}
 	_, err := Call(reg(vol), nil, c, true, nil)
-	if err == nil || err.Code != "PGRST101" {
-		t.Fatalf("want PGRST101, got %v", err)
+	if err == nil || err.Code != "25006" {
+		t.Fatalf("want 25006, got %v", err)
 	}
 	if err.HTTPStatus != 405 {
 		t.Errorf("status = %d, want 405", err.HTTPStatus)

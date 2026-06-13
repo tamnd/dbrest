@@ -362,10 +362,14 @@ func Call(reg rpc.Registry, model *schema.Model, c *ir.Call, isGet bool, searchP
 	}
 
 	// A read method may only call a read-only function; a write-capable function
-	// requires POST so it runs in a read-write transaction.
+	// requires POST so it runs in a read-write transaction. PostgREST does not
+	// pre-reject this: it runs the call in a read-only transaction and lets the
+	// server fail with SQLSTATE 25006 (405, "cannot execute ... in a read-only
+	// transaction"). A registry backend cannot run the function to find out, so it
+	// raises the same SQLSTATE up front from the declared volatility, keeping the
+	// code and status a client sees identical to the native path's.
 	if isGet && !fn.Volatility.ReadOnly() {
-		return nil, pgerr.ErrMethodNotAllowed(
-			"Cannot call a volatile function with GET; use POST")
+		return nil, pgerr.ErrReadOnlyTransaction("function " + c.Function.Name)
 	}
 
 	// A GET argument arrives as text; validate it against the declared parameter

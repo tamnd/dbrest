@@ -148,6 +148,24 @@ func TestRPCUnknownFunctionIs404(t *testing.T) {
 	}
 }
 
+// /rpc/<fn>/extra is a multi-segment path, not a missing function: PostgREST
+// answers PGRST125 at 404, not the PGRST202 a missing function gets (item 04.8).
+func TestRPCNestedPathIsInvalidPath(t *testing.T) {
+	srv := newRPCServer(t)
+	resp := do(t, srv, http.MethodGet, "/rpc/add/extra", nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+	var env map[string]any
+	json.NewDecoder(resp.Body).Decode(&env)
+	if env["code"] != "PGRST125" {
+		t.Errorf("code = %v, want PGRST125", env["code"])
+	}
+}
+
+// A GET to a volatile function fails with the read-only-transaction SQLSTATE
+// 25006 at 405, the same code and status PostgREST surfaces when the read-only
+// transaction rejects the function's write (item 04.6).
 func TestRPCGetOnVolatileIs405(t *testing.T) {
 	srv := newRPCServer(t)
 	resp := do(t, srv, http.MethodGet, "/rpc/bump_year?film_id=1", nil)
@@ -156,8 +174,8 @@ func TestRPCGetOnVolatileIs405(t *testing.T) {
 	}
 	var env map[string]any
 	json.NewDecoder(resp.Body).Decode(&env)
-	if env["code"] != "PGRST101" {
-		t.Errorf("code = %v, want PGRST101", env["code"])
+	if env["code"] != "25006" {
+		t.Errorf("code = %v, want 25006", env["code"])
 	}
 }
 

@@ -68,6 +68,37 @@ func TestParseWriteCSVMalformedRejected(t *testing.T) {
 	}
 }
 
+// A malformed JSON insert body is v14's PGRST102 at 400 with the canonical
+// "Empty or invalid json" message, not a PGRST100 query-parse error (item 04.1).
+func TestParseWriteMalformedJSONIsPGRST102(t *testing.T) {
+	_, err := ParseWrite(Insert, "films", "", nil, "application/json", []byte("{not json"))
+	if err == nil || err.Code != "PGRST102" {
+		t.Fatalf("malformed JSON err = %v, want PGRST102", err)
+	}
+	if err.HTTPStatus != 400 {
+		t.Errorf("status = %d, want 400", err.HTTPStatus)
+	}
+	if err.Message != "Empty or invalid json" {
+		t.Errorf("message = %q, want 'Empty or invalid json'", err.Message)
+	}
+}
+
+// A request body whose Content-Type no parser handles is PGRST102 at 400 with
+// "Content-Type not acceptable: <mime>", not the stale 415 PGRST107 (item 04.1).
+// PGRST107 stays reserved for Accept negotiation, which is always a 406.
+func TestParseWriteUnsupportedContentTypeIsPGRST102(t *testing.T) {
+	_, err := ParseWrite(Insert, "films", "", nil, "application/x-yaml", []byte("title: Dune"))
+	if err == nil || err.Code != "PGRST102" {
+		t.Fatalf("unsupported content-type err = %v, want PGRST102", err)
+	}
+	if err.HTTPStatus != 400 {
+		t.Errorf("status = %d, want 400", err.HTTPStatus)
+	}
+	if err.Message != "Content-Type not acceptable: application/x-yaml" {
+		t.Errorf("message = %q", err.Message)
+	}
+}
+
 // A form-urlencoded insert body decodes to a single row of string columns.
 func TestParseWriteFormBody(t *testing.T) {
 	q, err := ParseWrite(Insert, "films", "", nil,

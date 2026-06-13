@@ -195,6 +195,26 @@ func TestUnknownTableIs404Code(t *testing.T) {
 	}
 }
 
+// A path with more than one segment names no routable resource and is PGRST125
+// at 404, not the PGRST205 a single unknown relation gets (item 04.8).
+func TestNestedTablePathIsInvalidPath(t *testing.T) {
+	srv := newServer(t)
+	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPatch, http.MethodDelete} {
+		resp := do(t, srv, method, "/films/extra", nil)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("%s status = %d, want 404", method, resp.StatusCode)
+		}
+		var env map[string]any
+		json.NewDecoder(resp.Body).Decode(&env)
+		if env["code"] != "PGRST125" {
+			t.Errorf("%s code = %v, want PGRST125", method, env["code"])
+		}
+		if msg, _ := env["message"].(string); msg != "Invalid path specified in request URL" {
+			t.Errorf("%s message = %q", method, msg)
+		}
+	}
+}
+
 func TestUnknownColumnIsError(t *testing.T) {
 	srv := newServer(t)
 	resp := do(t, srv, http.MethodGet, "/films?select=bogus", nil)
