@@ -76,6 +76,26 @@ type Query struct {
 	// a function call on the row instead of a bare column. Nil when the relation has
 	// no computed fields. Each embed carries its own map for its own relation.
 	Computed map[string]string
+	// Reps maps a column name to the cast functions that drive its data
+	// representation (PostgREST domain representations, spec 11). The planner fills
+	// it from the resolved relation so the compiler reformats the column through the
+	// domain's casts: ToJSON on read output, FromJSON on a write value, FromText on a
+	// filter literal. Nil when no column of the relation carries one; each embed
+	// carries its own map for its own relation.
+	Reps map[string]Rep
+}
+
+// Rep carries the cast functions that drive a column's data representation
+// (PostgREST domain representations, spec 11): a domain type with casts to and
+// from json/text whose functions reformat the wire value. Each field is the
+// schema-qualified function backing that direction, or empty when the domain
+// declares no cast there. ToJSON formats the stored value for a response,
+// FromText parses a query-string filter literal, FromJSON parses a write-body
+// value.
+type Rep struct {
+	ToJSONSchema, ToJSONFunc     string
+	FromTextSchema, FromTextFunc string
+	FromJSONSchema, FromJSONFunc string
 }
 
 // Call is a /rpc/<fn> request.

@@ -844,6 +844,152 @@ func TestIntegrationComputedRelationships(t *testing.T) {
 	}
 }
 
+// TestIntegrationDataRepresentations covers finding 03-P11 (data
+// representations, spec 11): a domain over a base type plus pg_cast casts to and
+// from json/text reshapes a column on the wire. The to-json cast formats the
+// stored value for a response, the from-json cast parses a write body, and the
+// from-text cast parses a query-string filter literal. PostgreSQL ignores these
+// casts in the `::` operator, so the introspector records the cast function per
+// direction and the compiler calls it by name. The headline is a full round trip:
+// POST a representation value, read it back formatted, and filter by the formatted
+// form. The fixture is a "color" domain over integer presented as "#rrggbb".
+func TestIntegrationDataRepresentations(t *testing.T) {
+	be := openBE(t)
+	be.SetSchemas([]string{"_p11dr"})
+	ctx := context.Background()
+
+	if _, err := be.Pool().Exec(ctx, `
+		DROP SCHEMA IF EXISTS _p11dr CASCADE;
+		CREATE SCHEMA _p11dr;
+		-- a color is an integer presented on the wire as the string "#rrggbb".
+		CREATE DOMAIN _p11dr.color AS integer;
+		-- to-json: format the stored integer as "#rrggbb".
+		CREATE FUNCTION _p11dr.json(c _p11dr.color) RETURNS json
+			LANGUAGE sql IMMUTABLE AS $$
+				SELECT to_json('#' || lpad(to_hex(c::int), 6, '0')) $$;
+		-- from-text: parse "#rrggbb" out of a filter literal.
+		CREATE FUNCTION _p11dr.color(t text) RETURNS _p11dr.color
+			LANGUAGE sql IMMUTABLE AS $$
+				SELECT (('x' || lpad(substring(t from 2), 8, '0'))::bit(32)::int)::_p11dr.color $$;
+		-- from-json: parse a json string ("#rrggbb") out of a write body.
+		CREATE FUNCTION _p11dr.color(j json) RETURNS _p11dr.color
+			LANGUAGE sql IMMUTABLE AS $$ SELECT _p11dr.color(j #>> '{}') $$;
+		CREATE CAST (_p11dr.color AS json) WITH FUNCTION _p11dr.json(_p11dr.color) AS ASSIGNMENT;
+		CREATE CAST (text AS _p11dr.color) WITH FUNCTION _p11dr.color(text) AS ASSIGNMENT;
+		CREATE CAST (json AS _p11dr.color) WITH FUNCTION _p11dr.color(json) AS ASSIGNMENT;
+		CREATE TABLE _p11dr.shirts (id int PRIMARY KEY, c _p11dr.color)`); err != nil {
+		t.Fatalf("seed schema: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, "DROP SCHEMA IF EXISTS _p11dr CASCADE")
+	})
+
+	model, err := be.Introspect(ctx)
+	if err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+	rel, ok := model.Lookup("shirts", []string{"_p11dr"})
+	if !ok {
+		t.Fatal("shirts relation not found")
+	}
+
+	// The c column carries a representation with all three cast directions, each
+	// backed by a function in _p11dr.
+	var crep *schema.Representation
+	for i := range rel.Columns {
+		if rel.Columns[i].Name == "c" {
+			crep = rel.Columns[i].Rep
+		}
+	}
+	if crep == nil {
+		t.Fatal("column c carries no data representation")
+	}
+	if crep.ToJSON.IsZero() || crep.FromText.IsZero() || crep.FromJSON.IsZero() {
+		t.Fatalf("representation missing a direction: %+v", crep)
+	}
+	if crep.ToJSON.Schema != "_p11dr" || crep.ToJSON.Name != "json" ||
+		crep.FromText.Name != "color" || crep.FromJSON.Name != "color" {
+		t.Errorf("representation functions = %+v, want json/color/color in _p11dr", crep)
+	}
+
+	// POST a representation value: the from-json cast parses "#0000ff" out of the
+	// body, and return=representation reads it back formatted through to-json.
+	wq := &ir.Query{
+		Kind:     ir.Insert,
+		Relation: ir.Ref{Schema: "_p11dr", Name: "shirts"},
+		Select: []ir.SelectItem{
+			ir.Column{Path: []string{"id"}},
+			ir.Column{Path: []string{"c"}},
+		},
+		Write: &ir.WriteSpec{
+			Columns: []string{"id", "c"},
+			Rows:    []map[string]ir.Value{{"id": {JSON: json.Number("1")}, "c": {JSON: "#0000ff"}}},
+			Return:  ir.ReturnRepresentation,
+		},
+	}
+	wp, perr := planpkg.Write(model, wq, []string{"_p11dr"})
+	if perr != nil {
+		t.Fatalf("plan.Write: %v", perr)
+	}
+	wp.Rel = rel
+	wres, err := be.Execute(ctx, wp, &reqctx.Context{Method: "POST", Path: "/shirts"})
+	if err != nil {
+		t.Fatalf("Execute(insert): %v", err)
+	}
+	wrs := wres.Rows()
+	var posted string
+	for wrs.Next() {
+		vals, err := wrs.Values()
+		if err != nil {
+			t.Fatalf("Values: %v", err)
+		}
+		// columns: id, c (formatted through to-json)
+		posted = fmt.Sprintf("%v", vals[1])
+	}
+	wrs.Close()
+	if err := wrs.Err(); err != nil {
+		t.Fatalf("row error: %v", err)
+	}
+	if !strings.Contains(posted, "#0000ff") {
+		t.Errorf("return=representation c = %q, want it formatted as #0000ff", posted)
+	}
+
+	// GET /shirts?select=id,c&c=eq.#0000ff filters by the formatted value: the
+	// from-text cast parses the literal and the to-json cast formats the output.
+	rq, perr := ir.ParseRead("shirts", "select=id,c&c=eq.%230000ff", nil)
+	if perr != nil {
+		t.Fatalf("parse: %v", perr)
+	}
+	rp, perr := planpkg.Read(model, rq, []string{"_p11dr"}, planpkg.Options{})
+	if perr != nil {
+		t.Fatalf("plan.Read: %v", perr)
+	}
+	rp.Rel = rel
+	rres, err := be.Execute(ctx, rp, &reqctx.Context{Method: "GET", Path: "/shirts"})
+	if err != nil {
+		t.Fatalf("Execute(read): %v", err)
+	}
+	rs := rres.Rows()
+	defer rs.Close()
+	var got []string
+	for rs.Next() {
+		vals, err := rs.Values()
+		if err != nil {
+			t.Fatalf("Values: %v", err)
+		}
+		got = append(got, fmt.Sprintf("%v", vals[1]))
+	}
+	if err := rs.Err(); err != nil {
+		t.Fatalf("row error: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("filter by representation returned %d rows, want 1: %v", len(got), got)
+	}
+	if !strings.Contains(got[0], "#0000ff") {
+		t.Errorf("read c = %q, want it formatted as #0000ff", got[0])
+	}
+}
+
 // TestIntegrationMergedRegistry covers finding 03-P13: a declared portable
 // registry on postgres is reachable and shares one document with the native
 // catalog. The merged registry (portable plus native, the exact composition the

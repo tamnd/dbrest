@@ -70,6 +70,7 @@ func Read(model *schema.Model, q *ir.Query, searchPath []string, opts Options) (
 		return nil, err
 	}
 	bindComputed(rel, q)
+	bindReps(rel, q)
 
 	return &ir.Plan{Query: q, Rel: rel, ReadOnly: true}, nil
 }
@@ -88,6 +89,29 @@ func bindComputed(rel *schema.Relation, q *ir.Query) {
 		m[rel.Computed[i].Name] = rel.Computed[i].FuncSchema
 	}
 	q.Computed = m
+}
+
+// bindReps copies the data-representation cast set of every column that carries
+// one onto the query, so the compiler reformats that column through its domain's
+// casts (spec 11): ToJSON on read output, FromJSON on a write value, FromText on a
+// filter literal. It costs nothing for the common relation with no representation
+// column (the map stays nil).
+func bindReps(rel *schema.Relation, q *ir.Query) {
+	var m map[string]ir.Rep
+	for _, c := range rel.Columns {
+		if c.Rep == nil {
+			continue
+		}
+		if m == nil {
+			m = make(map[string]ir.Rep)
+		}
+		m[c.Name] = ir.Rep{
+			ToJSONSchema: c.Rep.ToJSON.Schema, ToJSONFunc: c.Rep.ToJSON.Name,
+			FromTextSchema: c.Rep.FromText.Schema, FromTextFunc: c.Rep.FromText.Name,
+			FromJSONSchema: c.Rep.FromJSON.Schema, FromJSONFunc: c.Rep.FromJSON.Name,
+		}
+	}
+	q.Reps = m
 }
 
 // resolveEmbeds binds every embed of a query against the model: it finds the
@@ -125,6 +149,7 @@ func resolveEmbeds(model *schema.Model, parent *schema.Relation, q *ir.Query, se
 			return err
 		}
 		bindComputed(rel.Target, &emb.Query)
+		bindReps(rel.Target, &emb.Query)
 	}
 	return nil
 }
@@ -230,6 +255,11 @@ func Write(model *schema.Model, q *ir.Query, searchPath []string) (*ir.Plan, *pg
 			return nil, err
 		}
 	}
+	// A return=representation body renders through the read path, and a write value
+	// of a domain column parses through its from-json cast, so the same maps a read
+	// uses are bound here too (spec 11).
+	bindComputed(rel, q)
+	bindReps(rel, q)
 
 	return &ir.Plan{Query: q, Rel: rel, ReadOnly: false}, nil
 }

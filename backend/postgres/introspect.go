@@ -56,6 +56,14 @@ func (b *Backend) Introspect(ctx context.Context) (*schema.Model, error) {
 		return nil, err
 	}
 
+	// Data representations are domain types whose casts to and from json/text
+	// reformat a column's wire value (spec 11). Read once, keyed by domain type OID,
+	// and attached to each column of that domain as the columns are loaded below.
+	reps, err := b.loadRepresentations(ctx, schemas)
+	if err != nil {
+		return nil, err
+	}
+
 	// Function volatility drives the native RPC transaction access mode (a STABLE
 	// or IMMUTABLE function runs read-only even on POST), so it is loaded here with
 	// the rest of the catalog and refreshed whenever the model is rebuilt.
@@ -105,7 +113,7 @@ func (b *Backend) Introspect(ctx context.Context) (*schema.Model, error) {
 
 	var out []*schema.Relation
 	for _, r := range rels {
-		cols, pk, err := b.columns(ctx, r.oid)
+		cols, pk, err := b.columns(ctx, r.oid, reps)
 		if err != nil {
 			return nil, err
 		}
@@ -192,18 +200,20 @@ SELECT c.oid, n.nspname, c.relname,
 	return out, rows.Err()
 }
 
-func (b *Backend) columns(ctx context.Context, relOID uint32) ([]*schema.Column, []string, error) {
+func (b *Backend) columns(ctx context.Context, relOID uint32, reps map[uint32]*schema.Representation) ([]*schema.Column, []string, error) {
 	// pg_attribute carries every attribute including system columns (attnum < 0)
 	// and dropped columns (attisdropped). We want only live user columns.
 	// pg_constraint with contype='p' gives the primary-key columns in confkey order
 	// via unnest; the conkey[] entries are attribute numbers matching attnum.
+	// atttypid is the column's exact type OID, which carries the representation cast
+	// set when the type is a domain.
 	colQ := `
 SELECT a.attname, format_type(a.atttypid, a.atttypmod),
        NOT a.attnotnull AS nullable,
        pg_get_expr(d.adbin, d.adrelid) IS NOT NULL AS has_default,
        a.attidentity <> '' AS is_identity,
        COALESCE(col_description(a.attrelid, a.attnum), '') AS comment,
-       a.attnum
+       a.attnum, a.atttypid
   FROM pg_attribute a
   LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
  WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped
@@ -220,7 +230,8 @@ SELECT a.attname, format_type(a.atttypid, a.atttypmod),
 		var name, pgType, comment string
 		var nullable, hasDef, isIdentity bool
 		var attnum int
-		if err := rows.Scan(&name, &pgType, &nullable, &hasDef, &isIdentity, &comment, &attnum); err != nil {
+		var typOID uint32
+		if err := rows.Scan(&name, &pgType, &nullable, &hasDef, &isIdentity, &comment, &attnum, &typOID); err != nil {
 			return nil, nil, err
 		}
 		cols = append(cols, &schema.Column{
@@ -235,6 +246,9 @@ SELECT a.attname, format_type(a.atttypid, a.atttypmod),
 			Identity:   isIdentity,
 			Comment:    comment,
 			Position:   attnum,
+			// A column whose type is a domain with representation casts carries the
+			// cast set so the compiler reformats it on the wire (spec 11).
+			Rep: reps[typOID],
 		})
 		attByNum[attnum] = name
 	}

@@ -61,6 +61,11 @@ type builder struct {
 	// the row of the single FROM relation. See spec 11 (computed fields).
 	computed map[string]string
 	rootRow  string
+	// reps maps the current relation's column names to their data-representation
+	// cast functions (spec 11), swapped alongside computed when descending into an
+	// embed. A column with one reformats on the wire: ToJSON on read, FromJSON on a
+	// write value, FromText on a filter literal.
+	reps map[string]ir.Rep
 }
 
 // newBuilder starts a builder with an empty output buffer.
@@ -106,15 +111,57 @@ func (b *builder) colRef(name string) string {
 	return b.qual + "." + b.d.QuoteIdent(name)
 }
 
-// useRelation points the builder's computed-field rendering at one relation: the
-// name-to-schema map for its computed fields and the unqualified name to pass as
-// the row argument when no alias is in force. It returns the previous pair so a
+// useRelation points the builder's computed-field and data-representation
+// rendering at one relation: the name-to-schema map for its computed fields, the
+// column-to-cast map for its representations, and the unqualified name to pass as
+// the row argument when no alias is in force. It returns the previous trio so a
 // caller descending into an embed can restore the parent's on the way out.
-func (b *builder) useRelation(computed map[string]string, relName string) (map[string]string, string) {
-	savedC, savedR := b.computed, b.rootRow
-	b.computed = computed
+func (b *builder) useRelation(q *ir.Query, relName string) (map[string]string, map[string]ir.Rep, string) {
+	savedC, savedReps, savedR := b.computed, b.reps, b.rootRow
+	b.computed = q.Computed
+	b.reps = q.Reps
 	b.rootRow = b.d.QuoteIdent(relName)
-	return savedC, savedR
+	return savedC, savedReps, savedR
+}
+
+// repCall renders a representation cast-function call: schema.func(arg). It is how
+// a domain's to-json/from-text/from-json cast is applied, since PostgreSQL ignores
+// the cast in the `::` operator and only the function does the reformatting.
+func (b *builder) repCall(funcSchema, funcName, arg string) string {
+	return b.d.QuoteIdent(funcSchema) + "." + b.d.QuoteIdent(funcName) + "(" + arg + ")"
+}
+
+// filterValue binds a comparison literal, parsing it through the column's
+// from-text data representation when one is present (spec 11): a value the client
+// read back through a representation filters against the stored value via the
+// domain's text cast. It applies only to a plain (non-JSON-path) column, and the
+// placeholder is typed text so the schema-qualified cast function resolves as a
+// call rather than as the domain's own input syntax. A column with no from-text
+// cast binds the literal unchanged.
+func (b *builder) filterValue(c ir.Compare) string {
+	ph := b.bind(c.Value.Text)
+	if len(c.Path) == 1 {
+		if rep, ok := b.reps[c.Path[0]]; ok && rep.FromTextFunc != "" {
+			return b.repCall(rep.FromTextSchema, rep.FromTextFunc, ph+"::text")
+		}
+	}
+	return ph
+}
+
+// writeValue binds an insert/update value, parsing it through the column's
+// from-json data representation when one is present (spec 11): the body value is
+// bound as json text and passed to the domain's json cast, the same parse
+// PostgREST applies to a write. A column with no from-json cast binds the coerced
+// value through writeArg as usual.
+func (b *builder) writeValue(col string, v ir.Value, colType string) string {
+	if rep, ok := b.reps[col]; ok && rep.FromJSONFunc != "" {
+		js, err := json.Marshal(v.JSON)
+		if err != nil {
+			js = []byte("null")
+		}
+		return b.repCall(rep.FromJSONSchema, rep.FromJSONFunc, b.bind(string(js))+"::json")
+	}
+	return b.bind(writeArg(b.d, v, colType))
 }
 
 // CompileRead lowers a resolved read query to a row-returning SELECT. The result
@@ -149,7 +196,7 @@ func CompileReadCounted(d Dialect, q *ir.Query) (*Statement, *pgerr.APIError) {
 // can extract the total alongside the result rows.
 func compileReadPlain(d Dialect, q *ir.Query, withCount bool) (*Statement, *pgerr.APIError) {
 	b := newBuilder(d)
-	b.useRelation(q.Computed, q.Relation.Name)
+	b.useRelation(q, q.Relation.Name)
 	b.sb.WriteString("SELECT ")
 
 	if err := b.writeSelect(q.Select); err != nil {
@@ -228,7 +275,7 @@ func CompileRowEstimateSource(d Dialect, q *ir.Query) (*Statement, *pgerr.APIErr
 // same set the windowed read applies so an exact count matches its body. The
 // caller has already written the SELECT list up to FROM.
 func (b *builder) writeCountFromAndPredicates(q *ir.Query) *pgerr.APIError {
-	b.useRelation(q.Computed, q.Relation.Name)
+	b.useRelation(q, q.Relation.Name)
 	parent := b.qualify(q.Relation)
 	b.sb.WriteString(parent)
 
@@ -278,6 +325,7 @@ func CompileInsert(d Dialect, q *ir.Query, returning []string) (*Statement, *pge
 		return nil, pgerr.ErrParse("insert payload is empty")
 	}
 	b := newBuilder(d)
+	b.useRelation(q, q.Relation.Name)
 	b.sb.WriteString("INSERT INTO ")
 	b.sb.WriteString(b.qualify(q.Relation))
 
@@ -303,7 +351,7 @@ func CompileInsert(d Dialect, q *ir.Query, returning []string) (*Statement, *pge
 					b.sb.WriteString(", ")
 				}
 				if val, ok := row[c]; ok {
-					b.sb.WriteString(b.bind(writeArg(b.d, val, w.ColumnTypes[c])))
+					b.sb.WriteString(b.writeValue(c, val, w.ColumnTypes[c]))
 				} else if w.Missing == ir.MissingNull {
 					b.sb.WriteString(b.bind(nil))
 				} else {
@@ -339,6 +387,7 @@ func CompileUpdate(d Dialect, q *ir.Query, returning []string) (*Statement, *pge
 		return nil, pgerr.ErrParse("update payload is empty")
 	}
 	b := newBuilder(d)
+	b.useRelation(q, q.Relation.Name)
 	b.sb.WriteString("UPDATE ")
 	b.sb.WriteString(b.qualify(q.Relation))
 	b.sb.WriteString(" SET ")
@@ -349,7 +398,7 @@ func CompileUpdate(d Dialect, q *ir.Query, returning []string) (*Statement, *pge
 		}
 		b.sb.WriteString(d.QuoteIdent(c))
 		b.sb.WriteString(" = ")
-		b.sb.WriteString(b.bind(writeArg(b.d, w.Set[c], w.ColumnTypes[c])))
+		b.sb.WriteString(b.writeValue(c, w.Set[c], w.ColumnTypes[c]))
 	}
 	if q.Where != nil {
 		b.sb.WriteString(" WHERE ")
@@ -367,6 +416,7 @@ func CompileUpdate(d Dialect, q *ir.Query, returning []string) (*Statement, *pge
 // update, a delete without a filter removes every row.
 func CompileDelete(d Dialect, q *ir.Query, returning []string) (*Statement, *pgerr.APIError) {
 	b := newBuilder(d)
+	b.useRelation(q, q.Relation.Name)
 	b.sb.WriteString("DELETE FROM ")
 	b.sb.WriteString(b.qualify(q.Relation))
 	if q.Where != nil {
@@ -414,6 +464,15 @@ func (b *builder) writeReturning(cols []string) *pgerr.APIError {
 	}
 	quoted := make([]string, len(cols))
 	for i, c := range cols {
+		// A data-representation column reads back through its to-json cast, the same
+		// formatting a read applies, so return=representation carries what a later GET
+		// would return (spec 11). The cast function would otherwise name the output
+		// column after itself, so alias it back to the column name.
+		if rep, ok := b.reps[c]; ok && rep.ToJSONFunc != "" {
+			id := b.d.QuoteIdent(c)
+			quoted[i] = b.repCall(rep.ToJSONSchema, rep.ToJSONFunc, id) + " AS " + id
+			continue
+		}
 		quoted[i] = b.d.QuoteIdent(c)
 	}
 	clause, ok := b.d.Returning(quoted)
@@ -600,9 +659,11 @@ func (b *builder) writeSelect(items []ir.SelectItem) *pgerr.APIError {
 			b.sb.WriteString(expr)
 			// Alias the output so the renderer sees the PostgREST key, not the raw
 			// column expression. Always alias when a cast is present, an explicit
-			// alias was set, or the column is a JSON path (data->>x names its column
-			// after the last hop, the way upstream does).
-			if name := v.Name(); name != "" && (name != lastPath(v.Path) || v.Cast != "" || len(v.Path) > 1) {
+			// alias was set, the column is a JSON path (data->>x names its column
+			// after the last hop, the way upstream does), or a data representation
+			// wrapped the column in a cast function (which would otherwise name the
+			// output column after the function, not the column).
+			if name := v.Name(); name != "" && (name != lastPath(v.Path) || v.Cast != "" || len(v.Path) > 1 || b.repAppliedToJSON(v)) {
 				b.sb.WriteString(" AS ")
 				b.sb.WriteString(b.d.QuoteIdent(name))
 			}
@@ -674,11 +735,33 @@ func (b *builder) columnExpr(c ir.Column) (string, *pgerr.APIError) {
 		expr = frag
 	} else {
 		expr = b.colRef(c.Path[0])
+		// A data-representation column reformats on output through its to-json cast
+		// (spec 11): the stored value is passed to the cast function, which yields the
+		// json the response carries. An explicit client cast (col::type) opts out, the
+		// client having asked for a specific rendering instead.
+		if c.Cast == "" {
+			if rep, ok := b.reps[c.Path[0]]; ok && rep.ToJSONFunc != "" {
+				expr = b.repCall(rep.ToJSONSchema, rep.ToJSONFunc, expr)
+			}
+		}
 	}
 	if c.Cast != "" {
 		expr = b.d.Cast(expr, c.Cast)
 	}
 	return expr, nil
+}
+
+// repAppliedToJSON reports whether a plain base column carries a to-json data
+// representation that columnExpr will apply, so writeSelect knows to alias the
+// projection to the column name (the cast function would otherwise name the output
+// column after itself). A JSON sub-path or an explicit client cast opts out, the
+// same conditions columnExpr checks.
+func (b *builder) repAppliedToJSON(c ir.Column) bool {
+	if len(c.Path) != 1 || c.Cast != "" {
+		return false
+	}
+	rep, ok := b.reps[c.Path[0]]
+	return ok && rep.ToJSONFunc != ""
 }
 
 func lastPath(path []string) string {
@@ -791,9 +874,11 @@ func (b *builder) writeCompare(c ir.Compare) *pgerr.APIError {
 		case c.Value.Text == "false" && boolColumn:
 			frag = col + " " + binaryOp(c.Op) + " " + b.d.BoolValue(false)
 		default:
-			frag = col + " " + binaryOp(c.Op) + " " + b.bind(c.Value.Text)
+			frag = col + " " + binaryOp(c.Op) + " " + b.filterValue(c)
 		}
-	case ir.OpGt, ir.OpGte, ir.OpLt, ir.OpLte, ir.OpLike:
+	case ir.OpGt, ir.OpGte, ir.OpLt, ir.OpLte:
+		frag = col + " " + binaryOp(c.Op) + " " + b.filterValue(c)
+	case ir.OpLike:
 		frag = col + " " + binaryOp(c.Op) + " " + b.bind(c.Value.Text)
 	case ir.OpILike:
 		var ok bool
@@ -1065,19 +1150,19 @@ func (b *builder) relatedOrderExpr(t ir.OrderTerm, parentAlias string) (string, 
 
 	saved := b.qual
 	b.qual = alias
-	savedC, savedR := b.useRelation(emb.Query.Computed, rel.Target.Name)
+	savedC, savedReps, savedR := b.useRelation(&emb.Query, rel.Target.Name)
 	col := b.colRef(t.Path[0])
 	if len(t.Path) > 1 {
 		frag, err := b.jsonPathExpr(col, t.Path[1:], t.Last)
 		if err != nil {
 			b.qual = saved
-			b.computed, b.rootRow = savedC, savedR
+			b.computed, b.reps, b.rootRow = savedC, savedReps, savedR
 			return "", err
 		}
 		col = frag
 	}
 	b.qual = saved
-	b.computed, b.rootRow = savedC, savedR
+	b.computed, b.reps, b.rootRow = savedC, savedReps, savedR
 
 	from, cond := b.embedSource(rel, alias, parentAlias)
 	return "(SELECT " + col + " FROM " + from + " WHERE " + cond + ")", nil

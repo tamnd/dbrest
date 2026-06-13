@@ -162,7 +162,32 @@ type Column struct {
 	Identity bool
 	// Position is the 1-based ordinal, used for stable ordering.
 	Position int
+	// Rep, when non-nil, is the column's data-representation cast set: the column's
+	// type is a domain whose casts to and from json/text reformat the wire value
+	// (PostgREST domain representations, spec 11). Nil for an ordinary column.
+	Rep *Representation
 }
+
+// Representation is a column's data-representation cast set (PostgREST domain
+// representations, spec 11): a domain type whose casts to and from json/text
+// reformat the wire value. ToJSON formats the stored value for a response,
+// FromText parses a query-string filter literal, FromJSON parses a write-body
+// value. A direction the domain declares no cast for is the zero FuncRef.
+type Representation struct {
+	ToJSON   FuncRef
+	FromText FuncRef
+	FromJSON FuncRef
+}
+
+// FuncRef names a schema-qualified function. The zero value (empty Name) marks
+// an absent cast in a Representation.
+type FuncRef struct {
+	Schema string
+	Name   string
+}
+
+// IsZero reports whether the reference names no function (an absent cast).
+func (f FuncRef) IsZero() bool { return f.Name == "" }
 
 // FullTextIndex is an engine-side full-text facility covering one or more of a
 // relation's columns. The planner attaches the covering index to an fts predicate

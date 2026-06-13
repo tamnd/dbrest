@@ -42,7 +42,7 @@ func compileReadEmbedded(d Dialect, q *ir.Query) (*Statement, *pgerr.APIError) {
 // ahead of the source's, keeping positional arguments in textual order.
 func (b *builder) writeEmbeddedQuery(q *ir.Query, writeSource func() *pgerr.APIError) (*Statement, *pgerr.APIError) {
 	const parentAlias = "t0"
-	b.useRelation(q.Computed, q.Relation.Name)
+	b.useRelation(q, q.Relation.Name)
 
 	b.sb.WriteString("SELECT ")
 	if err := b.writeEmbeddedSelect(q, parentAlias); err != nil {
@@ -261,11 +261,11 @@ func (b *builder) writeEmbed(emb *ir.Embed, parentAlias string) *pgerr.APIError 
 		// A related-order term inside this embed resolves against the embed's own
 		// nested embeds, so scope them in for the duration of its ORDER BY.
 		b.embeds = emb.Query.Embeds
-		savedC, savedR := b.useRelation(emb.Query.Computed, rel.Target.Name)
+		savedC, savedReps, savedR := b.useRelation(&emb.Query, rel.Target.Name)
 		restore := func() {
 			b.qual = saved
 			b.embeds = savedEmbeds
-			b.computed, b.rootRow = savedC, savedR
+			b.computed, b.reps, b.rootRow = savedC, savedReps, savedR
 		}
 		if err := b.writeOrder(emb.Query.Order); err != nil {
 			restore()
@@ -345,8 +345,8 @@ func (b *builder) embedObject(emb *ir.Embed, alias string) (string, *pgerr.APIEr
 
 	saved := b.qual
 	b.qual = alias
-	savedC, savedR := b.useRelation(emb.Query.Computed, emb.Rel.Target.Name)
-	defer func() { b.qual = saved; b.computed, b.rootRow = savedC, savedR }()
+	savedC, savedReps, savedR := b.useRelation(&emb.Query, emb.Rel.Target.Name)
+	defer func() { b.qual = saved; b.computed, b.reps, b.rootRow = savedC, savedReps, savedR }()
 
 	for _, it := range emb.Query.Select {
 		switch v := it.(type) {
@@ -424,8 +424,8 @@ func (b *builder) spreadPairs(emb *ir.Embed, parentAlias string) ([]Pair, *pgerr
 	var cols []lifted
 	saved := b.qual
 	b.qual = alias
-	savedC, savedR := b.useRelation(emb.Query.Computed, rel.Target.Name)
-	defer func() { b.computed, b.rootRow = savedC, savedR }()
+	savedC, savedReps, savedR := b.useRelation(&emb.Query, rel.Target.Name)
+	defer func() { b.computed, b.reps, b.rootRow = savedC, savedReps, savedR }()
 	addAll := func() {
 		for _, n := range rel.Target.ColumnNames() {
 			cols = append(cols, lifted{n, alias + "." + b.d.QuoteIdent(n)})
@@ -484,12 +484,12 @@ func (b *builder) writeEmbedFilter(emb *ir.Embed, alias string) *pgerr.APIError 
 	}
 	saved := b.qual
 	b.qual = alias
-	savedC, savedR := b.useRelation(emb.Query.Computed, emb.Rel.Target.Name)
+	savedC, savedReps, savedR := b.useRelation(&emb.Query, emb.Rel.Target.Name)
 	b.sb.WriteString(" AND (")
 	err := b.writeCond(*emb.Query.Where)
 	b.sb.WriteString(")")
 	b.qual = saved
-	b.computed, b.rootRow = savedC, savedR
+	b.computed, b.reps, b.rootRow = savedC, savedReps, savedR
 	return err
 }
 
