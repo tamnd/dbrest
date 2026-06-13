@@ -281,8 +281,13 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 	// instead of the GUCs (the engine-agnostic mechanism); lift them out here too
 	// so a portable function behaves the same on postgres as on an emulated
 	// backend. A native function sets the GUCs and carries no such columns, so
-	// this is a no-op for it.
-	res.cols, res.rows = backend.LiftResponseControls(res.cols, res.rows, res.controls)
+	// this is a no-op for it. An invalid status or header set is PGRST112/111
+	// before commit, so the deferred rollback discards the mutation.
+	var ctrlErr *pgerr.APIError
+	res.cols, res.rows, ctrlErr = backend.LiftResponseControls(res.cols, res.rows, res.controls)
+	if ctrlErr != nil {
+		return nil, ctrlErr
+	}
 	// Void-returning functions produce no meaningful body; signal 204 to the
 	// HTTP layer unless the function already set a status override via GUC.
 	if isVoid && res.controls.Status == 0 {

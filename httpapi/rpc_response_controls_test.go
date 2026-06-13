@@ -38,6 +38,25 @@ func responseControlFunctions() []*rpc.Function {
 			Volatility: rpc.Volatile,
 			Query:      &rpc.PortableQuery{SQL: `UPDATE films SET year = 0 WHERE id = :id RETURNING title, 202 AS "response.status"`},
 		},
+		{
+			Name:       "bad_status",
+			Returns:    rpc.ReturnShape{Kind: rpc.ReturnTable, Columns: []rpc.Column{{Name: "message"}}},
+			Volatility: rpc.Stable,
+			Query:      &rpc.PortableQuery{SQL: `SELECT 'x' AS message, 9999 AS "response.status"`},
+		},
+		{
+			Name:       "bad_header",
+			Returns:    rpc.ReturnShape{Kind: rpc.ReturnTable, Columns: []rpc.Column{{Name: "message"}}},
+			Volatility: rpc.Stable,
+			Query:      &rpc.PortableQuery{SQL: `SELECT 'x' AS message, 'not-a-header' AS "response.headers"`},
+		},
+		{
+			Name:       "bad_status_volatile",
+			Params:     []rpc.Param{{Name: "id", Type: "integer"}},
+			Returns:    rpc.ReturnShape{Kind: rpc.ReturnTable, Columns: []rpc.Column{{Name: "title"}}},
+			Volatility: rpc.Volatile,
+			Query:      &rpc.PortableQuery{SQL: `UPDATE films SET year = 0 WHERE id = :id RETURNING title, 9999 AS "response.status"`},
+		},
 	}
 }
 
@@ -131,5 +150,50 @@ func TestRPCResponseStatusVolatile(t *testing.T) {
 	got := decodeArray(t, after)
 	if len(got) != 1 || got[0]["year"].(float64) != 0 {
 		t.Errorf("archive did not persist: %v", got)
+	}
+}
+
+// TestRPCInvalidResponseStatus: a function projecting an out-of-range status is
+// PGRST112, the way PostgREST rejects a junk response.status rather than
+// forwarding it.
+func TestRPCInvalidResponseStatus(t *testing.T) {
+	srv := newResponseControlServer(t)
+	resp := do(t, srv, http.MethodGet, "/rpc/bad_status", nil)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", resp.StatusCode)
+	}
+	if env := decodeEnvelope(t, resp); env["code"] != "PGRST112" {
+		t.Errorf("code = %v, want PGRST112", env["code"])
+	}
+}
+
+// TestRPCInvalidResponseHeaders: a malformed response.headers is PGRST111.
+func TestRPCInvalidResponseHeaders(t *testing.T) {
+	srv := newResponseControlServer(t)
+	resp := do(t, srv, http.MethodGet, "/rpc/bad_header", nil)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", resp.StatusCode)
+	}
+	if env := decodeEnvelope(t, resp); env["code"] != "PGRST111" {
+		t.Errorf("code = %v, want PGRST111", env["code"])
+	}
+}
+
+// TestRPCInvalidResponseStatusVolatileRollsBack: an invalid status from a
+// volatile function fails before commit, so the mutation is discarded.
+func TestRPCInvalidResponseStatusVolatileRollsBack(t *testing.T) {
+	srv := newResponseControlServer(t)
+	resp := send(t, srv, http.MethodPost, "/rpc/bad_status_volatile", `{"id":2}`, nil)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", resp.StatusCode)
+	}
+	if env := decodeEnvelope(t, resp); env["code"] != "PGRST112" {
+		t.Errorf("code = %v, want PGRST112", env["code"])
+	}
+	// The UPDATE rolled back: film 2 still has its seeded year.
+	after := do(t, srv, http.MethodGet, "/films?id=eq.2&select=year", nil)
+	got := decodeArray(t, after)
+	if len(got) != 1 || got[0]["year"].(float64) != 1982 {
+		t.Errorf("rollback failed, film 2 year = %v, want 1982", got)
 	}
 }

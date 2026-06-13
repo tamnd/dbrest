@@ -10,7 +10,10 @@ func TestLiftResponseControlsNoReservedColumns(t *testing.T) {
 	cols := []string{"id", "title"}
 	rows := [][]any{{int64(1), "a"}}
 	var c reqctx.ResponseControls
-	gotCols, gotRows := LiftResponseControls(cols, rows, &c)
+	gotCols, gotRows, err := LiftResponseControls(cols, rows, &c)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if len(gotCols) != 2 || len(gotRows) != 1 {
 		t.Fatalf("result reshaped without reserved columns: %v %v", gotCols, gotRows)
 	}
@@ -23,7 +26,10 @@ func TestLiftResponseControlsStatusAndStrip(t *testing.T) {
 	cols := []string{"message", ColResponseStatus}
 	rows := [][]any{{"gone", int64(410)}}
 	var c reqctx.ResponseControls
-	gotCols, gotRows := LiftResponseControls(cols, rows, &c)
+	gotCols, gotRows, err := LiftResponseControls(cols, rows, &c)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if len(gotCols) != 1 || gotCols[0] != "message" {
 		t.Errorf("columns = %v, want [message]", gotCols)
 	}
@@ -39,7 +45,9 @@ func TestLiftResponseControlsStatusFromString(t *testing.T) {
 	cols := []string{ColResponseStatus}
 	rows := [][]any{{"201"}}
 	var c reqctx.ResponseControls
-	LiftResponseControls(cols, rows, &c)
+	if _, _, err := LiftResponseControls(cols, rows, &c); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if c.Status != 201 {
 		t.Errorf("status = %d, want 201", c.Status)
 	}
@@ -49,7 +57,9 @@ func TestLiftResponseControlsHeadersArray(t *testing.T) {
 	cols := []string{ColResponseHeaders}
 	rows := [][]any{{`[{"X-A":"1"},{"X-B":"2"}]`}}
 	var c reqctx.ResponseControls
-	LiftResponseControls(cols, rows, &c)
+	if _, _, err := LiftResponseControls(cols, rows, &c); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if c.Headers["X-A"] != "1" || c.Headers["X-B"] != "2" {
 		t.Errorf("headers = %v, want X-A=1 X-B=2", c.Headers)
 	}
@@ -59,7 +69,9 @@ func TestLiftResponseControlsHeadersObject(t *testing.T) {
 	cols := []string{ColResponseHeaders}
 	rows := [][]any{{`{"X-A":"1"}`}}
 	var c reqctx.ResponseControls
-	LiftResponseControls(cols, rows, &c)
+	if _, _, err := LiftResponseControls(cols, rows, &c); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if c.Headers["X-A"] != "1" {
 		t.Errorf("headers = %v, want X-A=1", c.Headers)
 	}
@@ -68,7 +80,10 @@ func TestLiftResponseControlsHeadersObject(t *testing.T) {
 func TestLiftResponseControlsNoRowsStillStrips(t *testing.T) {
 	cols := []string{"message", ColResponseStatus}
 	var c reqctx.ResponseControls
-	gotCols, gotRows := LiftResponseControls(cols, nil, &c)
+	gotCols, gotRows, err := LiftResponseControls(cols, nil, &c)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if len(gotCols) != 1 || gotCols[0] != "message" {
 		t.Errorf("columns = %v, want [message]", gotCols)
 	}
@@ -77,6 +92,40 @@ func TestLiftResponseControlsNoRowsStillStrips(t *testing.T) {
 	}
 	if c.Status != 0 {
 		t.Errorf("status set from an empty result: %d", c.Status)
+	}
+}
+
+// An out-of-range status is PGRST112, matching PostgREST's rejection of a junk
+// response.status rather than forwarding it (and avoiding a net/http panic).
+func TestLiftResponseControlsInvalidStatusRange(t *testing.T) {
+	cols := []string{ColResponseStatus}
+	rows := [][]any{{int64(9999)}}
+	var c reqctx.ResponseControls
+	_, _, err := LiftResponseControls(cols, rows, &c)
+	if err == nil || err.Code != "PGRST112" {
+		t.Fatalf("err = %v, want PGRST112", err)
+	}
+}
+
+// A non-numeric status is PGRST112 too.
+func TestLiftResponseControlsInvalidStatusText(t *testing.T) {
+	cols := []string{ColResponseStatus}
+	rows := [][]any{{"not-a-number"}}
+	var c reqctx.ResponseControls
+	_, _, err := LiftResponseControls(cols, rows, &c)
+	if err == nil || err.Code != "PGRST112" {
+		t.Fatalf("err = %v, want PGRST112", err)
+	}
+}
+
+// A response.headers value that is not the array/object shape is PGRST111.
+func TestLiftResponseControlsInvalidHeaders(t *testing.T) {
+	cols := []string{ColResponseHeaders}
+	rows := [][]any{{`"just a string"`}}
+	var c reqctx.ResponseControls
+	_, _, err := LiftResponseControls(cols, rows, &c)
+	if err == nil || err.Code != "PGRST111" {
+		t.Fatalf("err = %v, want PGRST111", err)
 	}
 }
 

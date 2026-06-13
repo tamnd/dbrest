@@ -5,6 +5,7 @@ import (
 	"maps"
 	"strconv"
 
+	"github.com/tamnd/dbrest/pgerr"
 	"github.com/tamnd/dbrest/reqctx"
 )
 
@@ -39,7 +40,13 @@ func HasResponseControlCols(cols []string) bool {
 // leaves the controls untouched. The returned columns and rows have the reserved
 // columns stripped so they never reach the rendered body. A result with neither
 // reserved column is returned unchanged.
-func LiftResponseControls(cols []string, rows [][]any, controls *reqctx.ResponseControls) ([]string, [][]any) {
+//
+// A response.status that is not a valid HTTP status code is PGRST112, and a
+// response.headers that is not the array-of-single-key-objects shape is PGRST111,
+// matching the way PostgREST rejects a junk GUC rather than forwarding it. The
+// error returns before the controls are applied, so a volatile function's
+// transaction rolls back through the caller's deferred rollback.
+func LiftResponseControls(cols []string, rows [][]any, controls *reqctx.ResponseControls) ([]string, [][]any, *pgerr.APIError) {
 	statusIdx, headersIdx := -1, -1
 	for i, c := range cols {
 		switch c {
@@ -50,19 +57,27 @@ func LiftResponseControls(cols []string, rows [][]any, controls *reqctx.Response
 		}
 	}
 	if statusIdx < 0 && headersIdx < 0 {
-		return cols, rows
+		return cols, rows, nil
 	}
 
 	if len(rows) > 0 && controls != nil {
 		first := rows[0]
 		if statusIdx >= 0 && statusIdx < len(first) {
-			if code, ok := toStatus(first[statusIdx]); ok {
+			if v := first[statusIdx]; v != nil {
+				code, ok := toStatus(v)
+				if !ok || !validStatus(code) {
+					return cols, rows, pgerr.ErrInvalidResponseStatus()
+				}
 				controls.SetStatus(code)
 			}
 		}
 		if headersIdx >= 0 && headersIdx < len(first) {
-			for name, val := range toHeaders(first[headersIdx]) {
-				controls.SetHeader(name, val)
+			if v := first[headersIdx]; v != nil {
+				hdrs, ok := toHeaders(v)
+				if !ok {
+					return cols, rows, pgerr.ErrInvalidResponseHeaders()
+				}
+				maps.Copy(controlHeaders(controls), hdrs)
 			}
 		}
 	}
@@ -74,7 +89,22 @@ func LiftResponseControls(cols []string, rows [][]any, controls *reqctx.Response
 	if headersIdx >= 0 {
 		drop[headersIdx] = true
 	}
-	return stripColumns(cols, rows, drop)
+	cols, rows = stripColumns(cols, rows, drop)
+	return cols, rows, nil
+}
+
+// validStatus reports whether a status override is in the range an HTTP response
+// can carry. net/http panics outside 100..999; PostgREST rejects anything that is
+// not a real status code, so the tighter 100..599 range is used.
+func validStatus(code int) bool { return code >= 100 && code <= 599 }
+
+// controlHeaders returns the controls' header map, allocating it on first use so
+// maps.Copy has a destination.
+func controlHeaders(controls *reqctx.ResponseControls) map[string]string {
+	if controls.Headers == nil {
+		controls.Headers = map[string]string{}
+	}
+	return controls.Headers
 }
 
 // toStatus reads a status override from a reserved column value, accepting the
@@ -106,8 +136,9 @@ func toStatus(v any) (int, bool) {
 
 // toHeaders reads response headers from a reserved column value. The value is the
 // JSON the GUC convention uses: an array of single-key {name: value} objects. A
-// lone object is also accepted for convenience.
-func toHeaders(v any) map[string]string {
+// lone object is also accepted for convenience. ok is false when the value is
+// present but not a JSON shape that can carry headers, the PGRST111 case.
+func toHeaders(v any) (map[string]string, bool) {
 	var raw []byte
 	switch s := v.(type) {
 	case string:
@@ -117,7 +148,7 @@ func toHeaders(v any) map[string]string {
 	case []byte:
 		raw = s
 	default:
-		return nil
+		return nil, false
 	}
 	out := map[string]string{}
 	var list []map[string]string
@@ -125,14 +156,14 @@ func toHeaders(v any) map[string]string {
 		for _, obj := range list {
 			maps.Copy(out, obj)
 		}
-		return out
+		return out, true
 	}
 	var obj map[string]string
 	if err := json.Unmarshal(raw, &obj); err == nil {
 		maps.Copy(out, obj)
-		return out
+		return out, true
 	}
-	return nil
+	return nil, false
 }
 
 // stripColumns returns the columns and rows with the dropped indices removed,

@@ -218,7 +218,10 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 			if err != nil {
 				return nil, b.MapError(err)
 			}
-			cols, buf = backend.LiftResponseControls(cols, buf, res.controls)
+			cols, buf, apiErr := backend.LiftResponseControls(cols, buf, res.controls)
+			if apiErr != nil {
+				return nil, apiErr
+			}
 			return &writeResult{cols: cols, rows: buf, count: res.count, hasCount: res.hasCount, controls: res.controls}, nil
 		}
 		res.rows, res.cols = rows, cols
@@ -247,9 +250,14 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 	}
 
 	// A volatile function steers the response the same way a read-only one does:
-	// reserved columns lift into the controls and drop out of the body.
+	// reserved columns lift into the controls and drop out of the body. An invalid
+	// status or header set fails the call before commit, so the deferred rollback
+	// discards the mutation.
 	controls := rc.Controls()
-	cols, buf = backend.LiftResponseControls(cols, buf, controls)
+	cols, buf, apiErr = backend.LiftResponseControls(cols, buf, controls)
+	if apiErr != nil {
+		return nil, apiErr
+	}
 
 	res := &writeResult{cols: cols, rows: buf, controls: controls}
 	if plan.Call.Prefer.Tx != nil && *plan.Call.Prefer.Tx == ir.TxRollback {
