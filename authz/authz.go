@@ -26,7 +26,6 @@ import (
 	"github.com/tamnd/dbrest/ir"
 	"github.com/tamnd/dbrest/pgerr"
 	"github.com/tamnd/dbrest/reqctx"
-	"github.com/tamnd/dbrest/schema"
 )
 
 // Action is a privilege verb a role may be granted on a relation.
@@ -146,8 +145,8 @@ func NewRegistry(grants []Grant, policies []Policy) *Registry {
 
 // Authorize gates a planned query for the request's role and injects any RLS
 // policy. It runs after planning and before execution, mutating the plan's query
-// in place: it rejects a request the role may not make, narrows or rejects a
-// projection by column privilege, and AND-s the policy predicate onto the filter
+// in place: it rejects a request the role may not make, rejects a projection
+// outside the column privilege, and AND-s the policy predicate onto the filter
 // tree. An RPC plan carries no relation query and is passed through unchanged.
 func (r *Registry) Authorize(rc *reqctx.Context, p *ir.Plan) *pgerr.APIError {
 	if p == nil || p.Query == nil {
@@ -166,9 +165,9 @@ func (r *Registry) Authorize(rc *reqctx.Context, p *ir.Plan) *pgerr.APIError {
 
 	// The column gate. A read always projects; a write projects only when it
 	// returns the representation. Either way the projection is gated against the
-	// SELECT column grant, and a star/empty projection is narrowed to it.
+	// SELECT column grant.
 	if q.Kind == ir.Read || (q.Write != nil && q.Write.Return == ir.ReturnRepresentation) {
-		if err := r.gateSelect(role, rel, q, p.Rel, rc.Anonymous); err != nil {
+		if err := r.gateSelect(role, rel, q, rc.Anonymous); err != nil {
 			return err
 		}
 	}
@@ -210,11 +209,14 @@ func (r *Registry) Authorize(rc *reqctx.Context, p *ir.Plan) *pgerr.APIError {
 	return nil
 }
 
-// gateSelect enforces the SELECT column grant on a projection. An explicitly
-// named forbidden column rejects the request; a star or empty projection is
-// narrowed to the granted columns, matching how PostgreSQL drops what a role may
-// not read while refusing an explicit ungranted column.
-func (r *Registry) gateSelect(role, rel string, q *ir.Query, relSchema *schema.Relation, anon bool) *pgerr.APIError {
+// gateSelect enforces the SELECT column grant on a projection. Under a
+// column-limited grant, a forbidden named column rejects the request, and so
+// does a star or empty projection: both mean SELECT every column, which the
+// grant does not cover. That matches PostgreSQL, where SELECT * raises 42501
+// under partial column grants, and PostgREST, whose maintainers explicitly
+// rejected narrowing * to the granted set (issue #1732); the client must name
+// the columns it may read.
+func (r *Registry) gateSelect(role, rel string, q *ir.Query, anon bool) *pgerr.APIError {
 	g, ok := r.grants[grantKey{role, rel, Select}]
 	if !ok {
 		return pgerr.ErrPermissionDenied(rel, anon)
@@ -222,22 +224,17 @@ func (r *Registry) gateSelect(role, rel string, q *ir.Query, relSchema *schema.R
 	if g.all {
 		return nil
 	}
-	hasStar := len(q.Select) == 0
+	if len(q.Select) == 0 {
+		return pgerr.ErrPermissionDenied(rel, anon)
+	}
 	for _, it := range q.Select {
 		c, isCol := it.(ir.Column)
 		if !isCol {
 			continue
 		}
-		if isStar(c) {
-			hasStar = true
-			continue
-		}
-		if !g.cols[baseColumn(c)] {
+		if isStar(c) || !g.cols[baseColumn(c)] {
 			return pgerr.ErrPermissionDenied(rel, anon)
 		}
-	}
-	if hasStar && relSchema != nil {
-		q.Select = narrowProjection(q.Select, g.cols, relSchema)
 	}
 	return nil
 }
@@ -263,35 +260,6 @@ func (r *Registry) gateWriteColumns(role, rel string, w *ir.WriteSpec, action Ac
 		}
 	}
 	return nil
-}
-
-// narrowProjection rewrites a star or empty projection to the granted columns in
-// relation order, keeping any embed references and any already-allowed explicit
-// columns, with duplicates removed.
-func narrowProjection(items []ir.SelectItem, allowed map[string]bool, rel *schema.Relation) []ir.SelectItem {
-	out := make([]ir.SelectItem, 0, len(rel.Columns))
-	seen := map[string]bool{}
-	add := func(name string) {
-		if seen[name] || !allowed[name] {
-			return
-		}
-		seen[name] = true
-		out = append(out, ir.Column{Path: []string{name}})
-	}
-	for _, c := range rel.Columns {
-		add(c.Name)
-	}
-	for _, it := range items {
-		switch v := it.(type) {
-		case ir.Column:
-			if !isStar(v) {
-				add(baseColumn(v))
-			}
-		default:
-			out = append(out, it)
-		}
-	}
-	return out
 }
 
 // usingConds turns a USING predicate into IR conditions with each claim resolved

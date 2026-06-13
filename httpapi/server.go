@@ -5,12 +5,15 @@
 package httpapi
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/tamnd/dbrest/auth"
 	"github.com/tamnd/dbrest/authz"
@@ -19,34 +22,66 @@ import (
 	"github.com/tamnd/dbrest/pgerr"
 	"github.com/tamnd/dbrest/plan"
 	"github.com/tamnd/dbrest/reqctx"
+	"github.com/tamnd/dbrest/rpc"
 	"github.com/tamnd/dbrest/schema"
 )
 
 // singularMediaType is the Accept value that asks for a single object.
 const singularMediaType = "application/vnd.pgrst.object+json"
 
-// maxBodyBytes caps a request body, so a runaway payload cannot exhaust memory.
-const maxBodyBytes = 16 << 20 // 16 MiB
-
 // Server holds the resolved schema model and the backend, and serves the API. A
 // verifier, when set, resolves the request role from the JWT; with none, every
 // request runs as the static default role.
 type Server struct {
-	backend      backend.Backend
-	model        *schema.Model
-	searchPath   []string
-	role         string
-	verifier     *auth.Verifier
-	authz        *authz.Registry
-	openapiMode  string
-	openapiProxy string
+	backend         backend.Backend
+	cache           *schema.Cache
+	searchPath      []string
+	role            string
+	verifier        *auth.Verifier
+	authz           *authz.Registry
+	openapiMode     string
+	openapiProxy    string
+	openapiSecurity bool
+	rootSpec        string
+	corsOrigins     []string // server-cors-allowed-origins; empty means any
+	maxRows         int      // db-max-rows; 0 means no cap
+	maxBody         int64    // max-request-body bytes; 0 means unlimited
+	planEnabled     bool     // db-plan-enabled; plans are off by default
+	aggregatesOn    bool     // db-aggregates-enabled; aggregates are off by default
+	preRequest      string   // db-pre-request, carried to the backend per request
+	appSettings     map[string]string
+	logQuery        bool     // log-query, carried to the backend per request
+	timingEnabled   bool     // server-timing-enabled; the Server-Timing header is off by default
+	txEnd           ir.TxEnd // db-tx-end; governs whether Prefer: tx= is honored
 }
 
 // NewServer builds a Server over a backend, its introspected model, and the
-// schema search path (the exposed schemas, in resolution order). It runs every
-// request as the anon role until a verifier is attached with SetVerifier.
+// schema search path (the exposed schemas, in resolution order). It has no
+// default role: until SetDefaultRole or SetVerifier provides an identity
+// source, every request is refused with 401 PGRST302, matching PostgREST's
+// fail-closed posture when db-anon-role is unset.
 func NewServer(b backend.Backend, model *schema.Model, searchPath []string) *Server {
-	return &Server{backend: b, model: model, searchPath: searchPath, role: "anon"}
+	return &Server{backend: b, cache: schema.NewCache(model), searchPath: searchPath}
+}
+
+// Model returns the current schema model snapshot. A handler loads it once at
+// entry so one request never straddles a reload.
+func (s *Server) Model() *schema.Model { return s.cache.Load() }
+
+// Reload re-runs introspection and publishes the fresh model, the schema
+// cache reload PostgREST performs on SIGUSR1 and on NOTIFY over the
+// db-channel. In-flight requests keep the snapshot they started with; a
+// failed introspection leaves the old model published, so a transient
+// database error never takes the running cache down. The OpenAPI document is
+// generated per request from the published model and needs no separate
+// regeneration.
+func (s *Server) Reload(ctx context.Context) error {
+	model, err := s.backend.Introspect(ctx)
+	if err != nil {
+		return err
+	}
+	s.cache.Store(model)
+	return nil
 }
 
 // SetOpenAPI configures the root document. mode is the openapi-mode option:
@@ -54,26 +89,122 @@ func NewServer(b backend.Backend, model *schema.Model, searchPath []string) *Ser
 // modes leave it on. proxyURI, when set, is the externally visible base URL the
 // document advertises (the openapi-server-proxy-uri option), overriding the
 // host and scheme the request arrived on so a document served behind a reverse
-// proxy points at the public address. See spec 20.
-func (s *Server) SetOpenAPI(mode, proxyURI string) {
+// proxy points at the public address. securityActive is the
+// openapi-security-active option: it attaches the JWT security requirement to
+// every operation rather than just describing the scheme. See spec 20.
+func (s *Server) SetOpenAPI(mode, proxyURI string, securityActive bool) {
 	s.openapiMode = mode
 	s.openapiProxy = proxyURI
+	s.openapiSecurity = securityActive
 }
 
-// SetDefaultRole overrides the static role used for unauthenticated requests
-// when no verifier is configured. It should be called with the db-anon-role
-// option value so the server uses the configured anon role instead of the
-// hardcoded "anon" placeholder.
+// SetRootSpec names the function whose JSON result replaces the generated
+// OpenAPI document, the db-root-spec option. Empty keeps the generated
+// document. The function is called like GET /rpc/<fn> with no arguments.
+func (s *Server) SetRootSpec(fn string) { s.rootSpec = fn }
+
+// SetDefaultRole sets the static role used for unauthenticated requests when no
+// verifier is configured. It should be called with the db-anon-role option
+// value; left unset, tokenless requests are refused with 401 PGRST302.
 func (s *Server) SetDefaultRole(role string) {
 	if role != "" {
 		s.role = role
 	}
 }
 
+// SetMaxRows applies the db-max-rows option: a hard cap on the rows any read
+// or RPC response may return, enforced as an implicit LIMIT at plan time. Zero
+// means no cap. Mutation representations are exempt, matching PostgREST v10+.
+func (s *Server) SetMaxRows(n int) { s.maxRows = n }
+
+// MaxRows reports the configured db-max-rows cap (0 when uncapped). The
+// count=estimated logic uses it as the exactness threshold.
+func (s *Server) MaxRows() int { return s.maxRows }
+
+// SetMaxRequestBody applies the max-request-body option: a byte cap on a
+// request body. Zero, the default, leaves bodies unlimited as PostgREST does;
+// a positive value is a runaway-payload guard that an operator opts into.
+func (s *Server) SetMaxRequestBody(n int) { s.maxBody = int64(n) }
+
+// readBody reads a request body, honoring the optional max-request-body cap. A
+// body over the cap is a 413 with the byte bound, not a parse error; a read
+// error under the cap stays the generic could-not-read parse error.
+func (s *Server) readBody(w http.ResponseWriter, r *http.Request) ([]byte, *pgerr.APIError) {
+	reader := r.Body
+	if s.maxBody > 0 {
+		reader = http.MaxBytesReader(w, r.Body, s.maxBody)
+	}
+	b, err := io.ReadAll(reader)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return nil, pgerr.ErrBodyTooLarge(s.maxBody)
+		}
+		return nil, pgerr.ErrInvalidBody("could not read request body")
+	}
+	return b, nil
+}
+
+// capLimit lowers *limit to the db-max-rows cap, installing the cap as the
+// limit when the client did not ask for one. It returns the (possibly
+// replaced) pointer so callers can assign it back into the query.
+func (s *Server) capLimit(limit *int) *int {
+	if s.maxRows <= 0 {
+		return limit
+	}
+	if limit == nil || *limit > s.maxRows {
+		capped := s.maxRows
+		return &capped
+	}
+	return limit
+}
+
+// SetCORSAllowedOrigins restricts cross-origin requests to the given origin
+// list (the server-cors-allowed-origins option). With an empty list the server
+// keeps the PostgREST default: any origin is accepted.
+func (s *Server) SetCORSAllowedOrigins(origins []string) { s.corsOrigins = origins }
+
+// SetPlanEnabled applies the db-plan-enabled option. Execution plans leak
+// schema and statistics detail, so PostgREST only honors the
+// application/vnd.pgrst.plan+json media type when the option is on; the
+// default is off, and a plan request then fails the same way as any other
+// unproducible media type.
+func (s *Server) SetPlanEnabled(on bool) { s.planEnabled = on }
+
+// SetAggregatesEnabled applies db-aggregates-enabled: when on, requests may use
+// aggregate functions (count(), col.sum(), ...). It is off by default, matching
+// PostgREST, so an aggregate request answers PGRST123 until an operator opts in.
+func (s *Server) SetAggregatesEnabled(on bool) { s.aggregatesOn = on }
+
+// SetAppSettings carries the app.settings.* options to the backend on every
+// request context, to be applied as transaction settings.
+func (s *Server) SetAppSettings(settings map[string]string) { s.appSettings = settings }
+
+// SetLogQuery asks backends to echo the statements they execute, the
+// log-query option.
+func (s *Server) SetLogQuery(on bool) { s.logQuery = on }
+
+// SetServerTimingEnabled applies the server-timing-enabled option. When on,
+// every response carries a Server-Timing header with the jwt/parse/plan/
+// transaction/response phase durations; the default is off, matching
+// PostgREST, so the wire is unchanged until an operator opts in.
+func (s *Server) SetServerTimingEnabled(on bool) { s.timingEnabled = on }
+
+// SetTxEnd applies the db-tx-end option, the policy that decides whether a
+// request's Prefer: tx= may override the transaction outcome. The default
+// commit ignores the preference, matching PostgREST.
+func (s *Server) SetTxEnd(v string) { s.txEnd = ir.ParseTxEnd(v) }
+
 // SetVerifier attaches a JWT verifier. Once set, the role and claims of each
 // request come from its bearer token (spec 13), and a bad token is rejected
 // before any query runs. With no verifier the server keeps the static role.
 func (s *Server) SetVerifier(v *auth.Verifier) { s.verifier = v }
+
+// SetPreRequest names the db-pre-request function carried to the backend on
+// every request context. The backend invokes it after the request context is
+// in place and before the main statement (spec 13); the caller is responsible
+// for refusing the option at startup on a backend that cannot honor it.
+func (s *Server) SetPreRequest(fn string) { s.preRequest = fn }
 
 // SetAuthz attaches an authorization registry. Once set, every read and write is
 // gated by the registry's table and column privileges and has any Row Level
@@ -104,36 +235,76 @@ type identity struct {
 
 // buildContext assembles the per-request context the backend receives: the
 // resolved identity plus the request metadata that crosses the HTTP/query
-// boundary (method, path, headers, cookies, and the selected schema). The
-// frontend builds it once after authentication; on the emulated backend the
-// values a policy references are later bound as parameters (spec 15).
-func buildContext(r *http.Request, id identity) *reqctx.Context {
+// boundary (method, path, headers, cookies, and the active schema), and the
+// configured transaction-scoped settings (db-pre-request, app.settings.*,
+// log-query). The frontend builds it once after authentication; on the
+// emulated backend the values a policy references are later bound as
+// parameters (spec 15).
+func (s *Server) buildContext(r *http.Request, id identity, activeSchema string) *reqctx.Context {
 	cookies := r.Cookies()
 	jar := make(map[string]string, len(cookies))
 	for _, c := range cookies {
 		jar[c.Name] = c.Value
 	}
 	return &reqctx.Context{
-		Role:      id.role,
-		Anonymous: id.anonymous,
-		Claims:    id.claims,
-		Method:    r.Method,
-		Path:      r.URL.Path,
-		Headers:   r.Header,
-		Cookies:   jar,
-		Schema:    requestSchema(r),
+		Role:        id.role,
+		Anonymous:   id.anonymous,
+		Claims:      id.claims,
+		Method:      r.Method,
+		Path:        r.URL.Path,
+		Headers:     r.Header,
+		Cookies:     jar,
+		Schema:      activeSchema,
+		PreRequest:  s.preRequest,
+		AppSettings: s.appSettings,
+		LogQuery:    s.logQuery,
 	}
 }
 
-// requestSchema reads the schema the client selected with the Accept-Profile
-// header (reads) or the Content-Profile header (writes). It carries the choice
-// onto the context; cross-schema identifier routing is the introspection
-// subsystem's job (spec 08), so an unset header is the default schema.
-func requestSchema(r *http.Request) string {
-	if r.Method == http.MethodGet || r.Method == http.MethodHead {
-		return r.Header.Get("Accept-Profile")
+// resolveSchema negotiates the active schema for the request, the PostgREST
+// profile rules: POST/PATCH/PUT/DELETE read Content-Profile, every other
+// method reads Accept-Profile; no header selects the first exposed schema. A
+// profile outside db-schemas is 406 PGRST106. The bool reports whether the
+// schema was negotiated, which is when the client named one, or implicitly on
+// a multi-schema deployment; a negotiated response echoes the active schema in
+// a Content-Profile response header.
+func (s *Server) resolveSchema(r *http.Request) (string, bool, *pgerr.APIError) {
+	var profile string
+	switch r.Method {
+	case http.MethodPost, http.MethodPatch, http.MethodPut, http.MethodDelete:
+		profile = r.Header.Get("Content-Profile")
+	default:
+		profile = r.Header.Get("Accept-Profile")
 	}
-	return r.Header.Get("Content-Profile")
+	if profile == "" {
+		var def string
+		if len(s.searchPath) > 0 {
+			def = s.searchPath[0]
+		}
+		return def, len(s.searchPath) > 1, nil
+	}
+	for _, sch := range s.searchPath {
+		if sch == profile {
+			return profile, true, nil
+		}
+	}
+	return "", false, errUnacceptableSchema(profile, s.searchPath)
+}
+
+// errUnacceptableSchema is PostgREST's PGRST106: a profile header naming a
+// schema that is not exposed by db-schemas, a 406 whose hint lists the schemas
+// that are.
+func errUnacceptableSchema(profile string, schemas []string) *pgerr.APIError {
+	e := pgerr.New(http.StatusNotAcceptable, "PGRST106", "Invalid schema: "+profile)
+	return e.WithHint("Only the following schemas are exposed: " + strings.Join(schemas, ", "))
+}
+
+// applyTxPolicy resolves a request's Prefer: tx= against the db-tx-end server
+// policy and returns the PGRST122 a handling=strict request earns when tx= is
+// disallowed. It runs after parsing and before execution on every method.
+func (s *Server) applyTxPolicy(p *ir.PreferSet) *pgerr.APIError {
+	p.ResolveTx(s.txEnd)
+	return p.StrictError()
 }
 
 // applyControls applies a backend's response controls and returns the status to
@@ -153,9 +324,14 @@ func applyControls(w http.ResponseWriter, rc *reqctx.ResponseControls, def int) 
 
 // authenticate resolves the request identity from the Authorization header. With
 // no verifier it is the static default role; otherwise the verifier maps the
-// bearer token to a role (or anon), or returns the 401/403 the token earns.
+// bearer token to a role (or anon), or returns the 401/403 the token earns. The
+// no-verifier path fails closed: with no default role configured, tokenless
+// requests are refused with 401 PGRST302 rather than run as anyone.
 func (s *Server) authenticate(r *http.Request) (identity, *pgerr.APIError) {
 	if s.verifier == nil {
+		if s.role == "" {
+			return identity{}, pgerr.ErrJWTRequired()
+		}
 		return identity{role: s.role, anonymous: true}, nil
 	}
 	res, apiErr := s.verifier.Authenticate(r.Header.Get("Authorization"))
@@ -170,33 +346,187 @@ func (s *Server) authenticate(r *http.Request) (identity, *pgerr.APIError) {
 // PATCH updates; PUT upserts; DELETE deletes. RPC and OpenAPI arrive with their
 // subsystems; an unhandled method gets an honest error.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.serveCORS(w, r) {
+		return
+	}
+	if r.Method == http.MethodOptions {
+		// OPTIONS describes the resource with an Allow header and runs no
+		// transaction, so it answers before authentication and schema negotiation,
+		// the way PostgREST does. A CORS preflight was already handled by serveCORS.
+		s.handleOptions(w, r)
+		return
+	}
+	// server-timing-enabled wraps the response so every exit path emits the
+	// Server-Timing header, and carries a phaseTimer to the handlers through the
+	// request context. The jwt phase is the only one measured here; the rest are
+	// recorded inside the handlers.
+	var timer *phaseTimer
+	if s.timingEnabled {
+		timer = &phaseTimer{}
+		w = &timingWriter{ResponseWriter: w, timer: timer}
+		r = r.WithContext(withTimer(r.Context(), timer))
+	}
+	jwtStart := time.Now()
 	id, apiErr := s.authenticate(r)
+	timer.mark("jwt", jwtStart)
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
 	}
+	activeSchema, negotiated, apiErr := s.resolveSchema(r)
+	if apiErr != nil {
+		writeError(w, apiErr)
+		return
+	}
+	if negotiated {
+		// PostgREST echoes the negotiated schema on successful responses so the
+		// client knows which schema served it; writeError strips it on failure.
+		w.Header().Set("Content-Profile", activeSchema)
+	}
 	if fn, ok := rpcName(r.URL.Path); ok {
-		s.handleRPC(w, r, fn, id)
+		s.handleRPC(w, r, fn, id, activeSchema)
 		return
 	}
 	if r.URL.Path == "/" {
-		s.handleRoot(w, r)
+		s.handleRoot(w, r, id, activeSchema)
 		return
 	}
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
-		s.handleRead(w, r, id)
+		s.handleRead(w, r, id, activeSchema)
 	case http.MethodPost:
-		s.handleWrite(w, r, ir.Insert, id)
+		s.handleWrite(w, r, ir.Insert, id, activeSchema)
 	case http.MethodPatch:
-		s.handleWrite(w, r, ir.Update, id)
+		s.handleWrite(w, r, ir.Update, id, activeSchema)
 	case http.MethodPut:
-		s.handleWrite(w, r, ir.Upsert, id)
+		s.handleWrite(w, r, ir.Upsert, id, activeSchema)
 	case http.MethodDelete:
-		s.handleWrite(w, r, ir.Delete, id)
+		s.handleWrite(w, r, ir.Delete, id, activeSchema)
 	default:
-		writeError(w, pgerr.ErrUnsupported(r.Method+" requests", "dbrest"))
+		// A verb the server implements nowhere (TRACE, CONNECT, a custom method)
+		// is PostgREST's 405 PGRST117, not the capability gate's PGRST127.
+		writeError(w, pgerr.ErrUnsupportedMethod(r.Method))
 	}
+}
+
+// tableAllow is the Allow value an OPTIONS on a table or view answers with: the
+// full verb set a relation endpoint accepts, in PostgREST's order.
+const tableAllow = "OPTIONS,GET,HEAD,POST,PUT,PATCH,DELETE"
+
+// handleOptions answers an OPTIONS request with an Allow header naming the
+// methods the resource accepts and a 200 with no body, the way PostgREST does.
+// The root answers its own verb set, a function answers by volatility (a
+// volatile function is POST-only, otherwise GET/HEAD/POST are allowed too), and
+// every table or view answers the full relation verb set. No transaction runs.
+func (s *Server) handleOptions(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/" {
+		w.Header().Set("Allow", rootAllow)
+	} else if fn, ok := rpcName(r.URL.Path); ok {
+		w.Header().Set("Allow", s.rpcAllow(fn))
+	} else {
+		w.Header().Set("Allow", tableAllow)
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// rpcAllow is the Allow value for an OPTIONS on /rpc/<fn>: a volatile function
+// accepts only OPTIONS and POST, every other (read-only) function also accepts
+// GET and HEAD. A non-registry (native) backend does not resolve volatility
+// here, so it answers the read-capable set, matching PostgREST's default for a
+// function whose volatility is not yet known.
+func (s *Server) rpcAllow(fn string) string {
+	const readable = "OPTIONS,GET,HEAD,POST"
+	const writeOnly = "OPTIONS,POST"
+	if s.backend.Capabilities().NativeRPC {
+		return readable
+	}
+	for _, f := range s.backend.Functions().List() {
+		if f.Name == fn && !f.Volatility.ReadOnly() {
+			return writeOnly
+		}
+	}
+	return readable
+}
+
+// corsExposedHeaders is the Access-Control-Expose-Headers value PostgREST
+// returns on every cross-origin request.
+const corsExposedHeaders = "Content-Encoding, Content-Location, Content-Range, Content-Type, " +
+	"Date, Location, Server, Transfer-Encoding, Range-Unit"
+
+// corsAllowedMethods is the Access-Control-Allow-Methods value PostgREST
+// returns on a preflight.
+const corsAllowedMethods = "GET, POST, PATCH, PUT, DELETE, OPTIONS, HEAD"
+
+// serveCORS answers CORS the way PostgREST v14 does and reports whether the
+// request was fully handled (a preflight). A request without an Origin header
+// is untouched. With server-cors-allowed-origins unset any origin is accepted
+// with Access-Control-Allow-Origin: *; with the option set, a listed origin is
+// reflected with Access-Control-Allow-Credentials: true and an unlisted one
+// falls through to normal handling with no CORS headers (the browser enforces
+// the denial). A preflight (OPTIONS with Access-Control-Request-Method) is
+// answered directly with the allowed methods, the requested headers, and a
+// one-day max age, before authentication and routing.
+func (s *Server) serveCORS(w http.ResponseWriter, r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return false
+	}
+	allowOrigin := "*"
+	credentials := false
+	if len(s.corsOrigins) > 0 {
+		found := false
+		for _, o := range s.corsOrigins {
+			if o == origin {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+		allowOrigin = origin
+		credentials = true
+	}
+
+	h := w.Header()
+	h.Set("Access-Control-Allow-Origin", allowOrigin)
+	if credentials {
+		h.Set("Access-Control-Allow-Credentials", "true")
+	}
+
+	if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+		h.Set("Access-Control-Allow-Methods", corsAllowedMethods)
+		h.Set("Access-Control-Allow-Headers", corsAllowedHeaders(r.Header.Get("Access-Control-Request-Headers")))
+		h.Set("Access-Control-Max-Age", "86400")
+		w.WriteHeader(http.StatusOK)
+		return true
+	}
+
+	h.Set("Access-Control-Expose-Headers", corsExposedHeaders)
+	return false
+}
+
+// corsAllowedHeaders builds the preflight Access-Control-Allow-Headers value:
+// Authorization, then the headers the client asked for, then the simple
+// headers, deduplicated case-insensitively. The order matches PostgREST.
+func corsAllowedHeaders(requested string) string {
+	out := []string{"Authorization"}
+	seen := map[string]bool{"authorization": true}
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[strings.ToLower(name)] {
+			return
+		}
+		seen[strings.ToLower(name)] = true
+		out = append(out, name)
+	}
+	for _, name := range strings.Split(requested, ",") {
+		add(name)
+	}
+	for _, name := range []string{"Accept", "Accept-Language", "Content-Language"} {
+		add(name)
+	}
+	return strings.Join(out, ", ")
 }
 
 // rpcName extracts the function name from an /rpc/<fn> path, reporting false for
@@ -214,16 +544,24 @@ func rpcName(path string) (string, bool) {
 // string); POST reads or writes (arguments from the JSON body). A read method may
 // only reach a read-only function; the plan raises 405 otherwise. Any other
 // method is not allowed on a function. See spec 12-rpc.
-func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id identity) {
-	if fn == "" || strings.Contains(fn, "/") {
-		writeError(w, pgerr.ErrNoFunction(fn))
+func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id identity, activeSchema string) {
+	if strings.Contains(fn, "/") {
+		// /rpc/<fn>/extra is a multi-segment path, not a missing function: PostgREST
+		// answers PGRST125 "Invalid path specified in request URL" (item 04.8).
+		writeError(w, pgerr.ErrInvalidPath())
+		return
+	}
+	if fn == "" {
+		writeError(w, pgerr.ErrNoFunction(activeSchema, fn, nil, ""))
 		return
 	}
 
 	isGet := r.Method == http.MethodGet || r.Method == http.MethodHead
 	if !isGet && r.Method != http.MethodPost {
-		writeError(w, pgerr.ErrMethodNotAllowed(
-			"Method "+r.Method+" not allowed on a function; use GET or POST"))
+		// PUT, PATCH, or DELETE on a function is PostgREST's PGRST101 with the
+		// exact "Cannot use the <method> method on RPC" text. OPTIONS never
+		// reaches here; it is answered with an Allow header before routing.
+		writeError(w, pgerr.ErrInvalidRPCMethod(r.Method))
 		return
 	}
 
@@ -235,88 +573,209 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 
 	var body []byte
 	if r.Method == http.MethodPost {
-		b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
-		if err != nil {
-			writeError(w, pgerr.ErrParse("could not read request body"))
+		b, apiErr := s.readBody(w, r)
+		if apiErr != nil {
+			writeError(w, apiErr)
 			return
 		}
 		body = b
 	}
 
-	call, apiErr := ir.ParseCall(fn, r.URL.RawQuery, r.Header.Values("Prefer"), isGet, r.Header.Get("Content-Type"), body)
+	// A function with a single unnamed parameter takes the whole POST body as that
+	// argument, decoded by Content-Type. Both the portable registry and the native
+	// registry (once introspected) report this form, so the body is bound to the
+	// parameter rather than read as a JSON object of named arguments.
+	rawBodyParam, rawBodyType := "", ""
+	if !isGet {
+		rawBodyParam, rawBodyType = singleRawBodyParam(s.rpcRegistry(activeSchema), fn)
+	}
+
+	t := timerFrom(r.Context())
+
+	parseStart := time.Now()
+	call, apiErr := ir.ParseCall(fn, r.URL.RawQuery, r.Header.Values("Prefer"), isGet, r.Header.Get("Content-Type"), body, rawBodyParam, rawBodyType)
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
 	}
-	call.Singular = media == mediaObject
+	t.mark("parse", parseStart)
+	call.Singular = singularMedia(media)
+	if apiErr := s.applyTxPolicy(&call.Prefer); apiErr != nil {
+		writeError(w, apiErr)
+		return
+	}
 
+	// A GET /rpc read honors the Range header the same way a table read does:
+	// it overrides ?limit=&offset= and an inverted range is 416.
+	if isGet {
+		if rangeHdr := r.Header.Get("Range"); rangeHdr != "" && !strings.Contains(rangeHdr, "=") {
+			off, lim, ok, inverted := parseRangeHeader(rangeHdr)
+			if inverted {
+				writeError(w, pgerr.ErrRangeNotSatisfiable().
+					WithDetails("The lower boundary must be lower than or equal to the upper boundary in the Range header."))
+				return
+			}
+			if ok {
+				call.Offset = &off
+				if lim >= 0 {
+					l := lim
+					call.Limit = &l
+				}
+			}
+		}
+	}
+
+	// db-max-rows caps an RPC response like a read (an implicit LIMIT).
+	call.Limit = s.capLimit(call.Limit)
+
+	planStart := time.Now()
 	var planned *ir.Plan
 	if s.backend.Capabilities().NativeRPC {
-		// PostgreSQL (and any other NativeRPC backend) discovers and executes
-		// the function from its own catalog. We skip the portable-registry lookup
-		// and build a minimal plan: ReadOnly follows the HTTP method (GET/HEAD
-		// means read-only; POST means the function may write). The engine enforces
-		// the volatility constraint — if a GET reaches a volatile function the
-		// read-only transaction fails with SQLSTATE 25006, which maps to 405.
-		planned = &ir.Plan{Call: call, ReadOnly: isGet}
+		// A NativeRPC backend that introspects its functions resolves a known name
+		// through the shared planner: overload resolution (PGRST202/PGRST203), GET
+		// argument-versus-filter partitioning, declared-type argument coercion, and
+		// the volatility-driven access mode (a POST to a STABLE or IMMUTABLE function
+		// runs read-only) all match the portable path. An unknown name (one the
+		// introspection did not model) falls back to a minimal engine-planned call so
+		// it still reaches the catalog rather than 404ing on a registry miss; the
+		// engine then enforces volatility (a GET to a volatile function fails with
+		// SQLSTATE 25006, mapped to 405).
+		reg := s.rpcRegistry(activeSchema)
+		if registryKnows(reg, call.Function.Name) {
+			planned, apiErr = plan.Call(reg, s.Model(), call, isGet, []string{activeSchema})
+			if apiErr != nil {
+				writeError(w, apiErr)
+				return
+			}
+		} else {
+			planned = &ir.Plan{Call: call, ReadOnly: isGet}
+		}
 	} else {
-		planned, apiErr = plan.Call(s.backend.Functions(), call, isGet, s.searchPath)
+		planned, apiErr = plan.Call(s.backend.Functions(), s.Model(), call, isGet, []string{activeSchema})
 		if apiErr != nil {
 			writeError(w, apiErr)
 			return
 		}
 	}
+	t.mark("plan", planStart)
 
-	rc := buildContext(r, id)
+	rc := s.buildContext(r, id, activeSchema)
+	if call.Prefer.TimeZone != nil {
+		rc.TimeZone = *call.Prefer.TimeZone
+	}
+
+	// A plan request on an RPC call returns the EXPLAIN for the function instead
+	// of running it; route it before Execute so mediaPlan never reaches the
+	// call renderer.
+	if media == mediaPlan {
+		s.servePlan(w, r, id, func(exp backend.Explainer, opts backend.PlanOptions) ([]byte, error) {
+			return exp.ExplainCall(r.Context(), planned, rc, opts)
+		})
+		return
+	}
+
+	txStart := time.Now()
 	res, err := s.backend.Execute(r.Context(), planned, rc)
 	if err != nil {
 		writeError(w, mapExecError(s.backend, err, id.anonymous))
 		return
 	}
+	t.mark("transaction", txStart)
 
-	out, apiErr := renderCall(media, res, planned.Func, fn)
+	respStart := time.Now()
+	var out *rendered
+	if len(call.Embeds) > 0 {
+		// An embedded call returns parent rows with nested resources, the same
+		// row-object shape a table read produces, so the read renderer drives it
+		// with the call's embed columns marked raw.
+		out, apiErr = renderFor(media, res, embedKeysFor(call.Embeds, call.Select))
+	} else {
+		out, apiErr = renderCall(media, res, planned.Func, fn)
+	}
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
 	}
+	t.mark("response", respStart)
 
 	s.writeCall(w, r, call, out, res.ResponseControls())
 }
 
-// writeCall writes a successful RPC response. The status is 200, or 206 when a
-// bounded window over a table return did not cover the full count. A requested
-// count sets Content-Range, matching a read.
-func (s *Server) writeCall(w http.ResponseWriter, r *http.Request, call *ir.Call, out *rendered, ctrl *reqctx.ResponseControls) {
-	if applied := call.Prefer.AppliedHeader(); applied != "" {
-		w.Header().Set("Preference-Applied", applied)
+// rpcRegistry is the registry an RPC resolves against in the active schema. A
+// NativeRPC backend that introspects its functions (SchemaFunctioner) resolves
+// against that schema's native registry merged with any declared portable
+// registry, so overload resolution, GET argument partitioning, and the
+// volatility-driven access mode all run through the shared planner over one
+// function set; any other backend uses the single portable registry for every
+// schema.
+func (s *Server) rpcRegistry(activeSchema string) rpc.Registry {
+	if s.backend.Capabilities().NativeRPC {
+		if sf, ok := s.backend.(backend.SchemaFunctioner); ok {
+			// A NativeRPC backend can also carry a declared portable registry
+			// (the documented escape hatch for functions with no native
+			// equivalent). Merge keeps both reachable through one Registry, with
+			// a declared function shadowing a same-signature native one, so the
+			// call path and the OpenAPI document agree on exactly one function set.
+			return rpc.Merge(s.backend.Functions(), sf.SchemaFunctions(activeSchema))
+		}
 	}
-	w.Header().Set("Content-Type", out.contentType)
+	return s.backend.Functions()
+}
 
+// registryKnows reports whether a registry has any overload of a function name. The
+// native path resolves a known name through the planner (so a wrong argument set is
+// PGRST202 and an ambiguous one PGRST203) and falls back to a minimal engine-planned
+// call for an unknown name, so a function the introspection did not model still
+// reaches the engine rather than 404ing on a registry miss.
+func registryKnows(reg rpc.Registry, name string) bool {
+	for _, fn := range reg.List() {
+		if fn.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// singleRawBodyParam reports the parameter name and type of a function whose
+// signature is a single unnamed argument, the form that takes the whole POST
+// body as one value decoded by Content-Type. It scans every overload of the
+// name and returns the first single-raw-body match; an absent or multi-parameter
+// function yields empty strings, leaving the normal named-arguments path. See
+// spec 12-rpc and the PostgREST single-unnamed-parameter rule.
+func singleRawBodyParam(reg rpc.Registry, name string) (string, string) {
+	for _, fn := range reg.List() {
+		if fn.Name != name {
+			continue
+		}
+		if p, ok := fn.SingleRawBody(); ok {
+			return p.Name, p.Type
+		}
+	}
+	return "", ""
+}
+
+// writeCall writes a successful RPC response. An RPC read uses the same
+// pagination contract as a table read: Content-Range is always present, an
+// out-of-bounds offset is 416, and the 200/206 rule follows the count.
+func (s *Server) writeCall(w http.ResponseWriter, r *http.Request, call *ir.Call, out *rendered, ctrl *reqctx.ResponseControls) {
 	offset := 0
 	if call.Offset != nil {
 		offset = *call.Offset
 	}
-	if out.hasTotl {
-		w.Header().Set("Content-Range", contentRange(offset, out.nRows, out.total, true))
-	}
-
-	status := http.StatusOK
-	hasWindow := call.Limit != nil || call.Offset != nil
-	if hasWindow && out.hasTotl && int64(out.nRows) < out.total {
-		status = http.StatusPartialContent
-	}
-	w.WriteHeader(applyControls(w, ctrl, status))
-	if r.Method != http.MethodHead {
-		w.Write(out.body)
-	}
+	s.writePaged(w, r, call.Prefer.AppliedHeader(), offset, out, ctrl)
 }
 
-func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity) {
+func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity, activeSchema string) {
 	relation := strings.Trim(r.URL.Path, "/")
 	if relation == "" || strings.Contains(relation, "/") {
-		writeError(w, pgerr.ErrUnknownTable(relation))
+		// A path with more than one segment names no routable resource; PostgREST
+		// answers PGRST125 "Invalid path specified in request URL", distinct from
+		// the PGRST205 a single unknown relation gets (item 04.8).
+		writeError(w, pgerr.ErrInvalidPath())
 		return
 	}
+
+	t := timerFrom(r.Context())
 
 	acceptHdrs := r.Header.Values("Accept")
 	media, ok := negotiate(acceptHdrs)
@@ -325,12 +784,19 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity)
 		return
 	}
 
+	parseStart := time.Now()
 	q, apiErr := ir.ParseRead(relation, r.URL.RawQuery, r.Header.Values("Prefer"))
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
 	}
-	q.Singular = media == mediaObject
+	t.mark("parse", parseStart)
+	q.Singular = singularMedia(media)
+
+	if apiErr := s.applyTxPolicy(&q.Prefer); apiErr != nil {
+		writeError(w, apiErr)
+		return
+	}
 
 	// Range: header overrides ?limit=&offset= and marks the request as a
 	// Range request so the server can return 206 Partial Content. PostgREST
@@ -338,7 +804,13 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity)
 	// Only treat Range as item pagination when it has no unit prefix (i.e.
 	// not "bytes=0-9" form), matching PostgREST's parsing behaviour.
 	if rangeHdr := r.Header.Get("Range"); rangeHdr != "" && !strings.Contains(rangeHdr, "=") {
-		if off, lim, ok := parseRangeHeader(rangeHdr); ok {
+		off, lim, ok, inverted := parseRangeHeader(rangeHdr)
+		if inverted {
+			writeError(w, pgerr.ErrRangeNotSatisfiable().
+				WithDetails("The lower boundary must be lower than or equal to the upper boundary in the Range header."))
+			return
+		}
+		if ok {
 			q.Offset = &off
 			if lim >= 0 {
 				l := lim
@@ -348,56 +820,130 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity)
 		}
 	}
 
-	planned, apiErr := plan.Read(s.model, q, s.searchPath)
+	// db-max-rows is a hard cap on every read: the effective window is
+	// min(requested limit, max-rows), applied before planning so Content-Range
+	// and the 200/206 decision see the limit that actually ran. Mutation
+	// representations are exempt (PostgREST v10+), so this stays off the
+	// write path.
+	q.Limit = s.capLimit(q.Limit)
+
+	// An estimated count crosses from exact to the planner estimate at db-max-rows;
+	// hand the backend that threshold so it can decide which side a result lands on.
+	if q.Count == ir.CountEstimated && s.maxRows > 0 {
+		q.CountMax = int64(s.maxRows)
+	}
+
+	planStart := time.Now()
+	planned, apiErr := plan.Read(s.Model(), q, []string{activeSchema}, plan.Options{AggregatesEnabled: s.aggregatesOn})
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
 	}
+	t.mark("plan", planStart)
 
-	rc := buildContext(r, id)
+	rc := s.buildContext(r, id, activeSchema)
+	if q.Prefer.TimeZone != nil {
+		rc.TimeZone = *q.Prefer.TimeZone
+	}
 
 	if apiErr := s.authorize(rc, planned); apiErr != nil {
 		writeError(w, apiErr)
 		return
 	}
 
-	// vnd.pgrst.plan+json: return EXPLAIN JSON when the backend supports it.
+	// application/vnd.pgrst.plan: return the EXPLAIN output when the backend
+	// supports it. servePlan applies the db-plan-enabled gate and the Explainer
+	// check so the plan media type never reaches the renderer.
 	if media == mediaPlan {
-		exp, supported := s.backend.(backend.Explainer)
-		if !supported {
-			writeError(w, pgerr.ErrNotAcceptable(mediaPlan))
-			return
-		}
-		planJSON, err := exp.ExplainRead(r.Context(), planned, rc, planAnalyze(acceptHdrs))
-		if err != nil {
-			writeError(w, mapExecError(s.backend, err, id.anonymous))
-			return
-		}
-		w.Header().Set("Content-Type", mediaPlan)
-		w.WriteHeader(http.StatusOK)
-		w.Write(planJSON)
+		s.servePlan(w, r, id, func(exp backend.Explainer, opts backend.PlanOptions) ([]byte, error) {
+			return exp.ExplainRead(r.Context(), planned, rc, opts)
+		})
 		return
 	}
 
+	txStart := time.Now()
 	res, err := s.backend.Execute(r.Context(), planned, rc)
 	if err != nil {
 		writeError(w, mapExecError(s.backend, err, id.anonymous))
 		return
 	}
+	t.mark("transaction", txStart)
 
+	respStart := time.Now()
 	out, apiErr := renderFor(media, res, embedKeys(q))
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
 	}
+	t.mark("response", respStart)
 
 	s.writeRead(w, r, q, out, res.ResponseControls())
 }
 
-func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.QueryKind, id identity) {
+// servePlan answers a negotiated application/vnd.pgrst.plan request for any of
+// the three execution paths. It enforces the db-plan-enabled gate and the
+// backend Explainer capability first (406 when either is absent, so the plan
+// media type never falls through to the renderer and 500s), parses the plan
+// options from the Accept header, runs the explain via the supplied selector,
+// and echoes the full parameterized Content-Type. explain picks
+// ExplainRead/ExplainWrite/ExplainCall on the resolved Explainer.
+func (s *Server) servePlan(w http.ResponseWriter, r *http.Request, id identity, explain func(backend.Explainer, backend.PlanOptions) ([]byte, error)) {
+	if !s.planEnabled {
+		writeError(w, pgerr.ErrNotAcceptable(mediaPlan))
+		return
+	}
+	exp, supported := s.backend.(backend.Explainer)
+	if !supported {
+		writeError(w, pgerr.ErrNotAcceptable(mediaPlan))
+		return
+	}
+	opts, _ := parsePlan(r.Header.Values("Accept"))
+	planBytes, err := explain(exp, opts)
+	if err != nil {
+		writeError(w, mapExecError(s.backend, err, id.anonymous))
+		return
+	}
+	w.Header().Set("Content-Type", planContentType(opts))
+	w.WriteHeader(http.StatusOK)
+	w.Write(planBytes)
+}
+
+// planContentType builds the response Content-Type echoed for a plan request:
+// the format suffix, the for="<media>" target, the options= flags that were
+// set, and the charset, matching PostgREST's parameterized plan media type.
+func planContentType(opts backend.PlanOptions) string {
+	sub := "application/vnd.pgrst.plan+text"
+	if opts.Format == backend.PlanJSON {
+		sub = "application/vnd.pgrst.plan+json"
+	}
+	parts := []string{sub}
+	if opts.For != "" {
+		parts = append(parts, `for="`+opts.For+`"`)
+	}
+	var flags []string
+	for _, f := range []struct {
+		on   bool
+		name string
+	}{
+		{opts.Analyze, "analyze"}, {opts.Verbose, "verbose"},
+		{opts.Settings, "settings"}, {opts.Buffers, "buffers"}, {opts.Wal, "wal"},
+	} {
+		if f.on {
+			flags = append(flags, f.name)
+		}
+	}
+	if len(flags) > 0 {
+		parts = append(parts, "options="+strings.Join(flags, "|"))
+	}
+	parts = append(parts, "charset=utf-8")
+	return strings.Join(parts, "; ")
+}
+
+func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.QueryKind, id identity, activeSchema string) {
 	relation := strings.Trim(r.URL.Path, "/")
 	if relation == "" || strings.Contains(relation, "/") {
-		writeError(w, pgerr.ErrUnknownTable(relation))
+		// As in handleRead: a multi-segment path is PGRST125, not a missing table.
+		writeError(w, pgerr.ErrInvalidPath())
 		return
 	}
 
@@ -409,37 +955,71 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.Que
 
 	var body []byte
 	if kind != ir.Delete {
-		b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
-		if err != nil {
-			writeError(w, pgerr.ErrParse("could not read request body"))
+		b, apiErr := s.readBody(w, r)
+		if apiErr != nil {
+			writeError(w, apiErr)
 			return
 		}
 		body = b
 	}
 
+	t := timerFrom(r.Context())
+
+	parseStart := time.Now()
 	q, apiErr := ir.ParseWrite(kind, relation, r.URL.RawQuery, r.Header.Values("Prefer"), r.Header.Get("Content-Type"), body)
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
 	}
-	q.Singular = media == mediaObject
+	t.mark("parse", parseStart)
+	q.Singular = singularMedia(media)
 
-	planned, apiErr := plan.Write(s.model, q, s.searchPath)
+	if apiErr := s.applyTxPolicy(&q.Prefer); apiErr != nil {
+		writeError(w, apiErr)
+		return
+	}
+	if q.Write != nil {
+		if q.Prefer.Tx != nil {
+			q.Write.Tx = *q.Prefer.Tx
+		} else {
+			q.Write.Tx = ir.TxAuto
+		}
+	}
+
+	planStart := time.Now()
+	planned, apiErr := plan.Write(s.Model(), q, []string{activeSchema})
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
 	}
+	t.mark("plan", planStart)
 
-	rc := buildContext(r, id)
+	rc := s.buildContext(r, id, activeSchema)
+	if q.Prefer.TimeZone != nil {
+		rc.TimeZone = *q.Prefer.TimeZone
+	}
 	if apiErr := s.authorize(rc, planned); apiErr != nil {
 		writeError(w, apiErr)
 		return
 	}
+
+	// A plan request on a write returns the EXPLAIN for the mutation instead of
+	// running it. servePlan gates and routes it so mediaPlan never reaches the
+	// renderer (which would 500 on a write).
+	if media == mediaPlan {
+		s.servePlan(w, r, id, func(exp backend.Explainer, opts backend.PlanOptions) ([]byte, error) {
+			return exp.ExplainWrite(r.Context(), planned, rc, opts)
+		})
+		return
+	}
+
+	txStart := time.Now()
 	res, err := s.backend.Execute(r.Context(), planned, rc)
 	if err != nil {
 		writeError(w, mapExecError(s.backend, err, id.anonymous))
 		return
 	}
+	t.mark("transaction", txStart)
 
 	s.writeWrite(w, r, q, media, planned.Rel, res)
 }
@@ -453,72 +1033,88 @@ func (s *Server) writeWrite(w http.ResponseWriter, r *http.Request, q *ir.Query,
 	if applied := q.Prefer.AppliedHeader(); applied != "" {
 		w.Header().Set("Preference-Applied", applied)
 	}
-	// PostgREST v14 returns a Location header only for return=headers-only inserts/upserts.
-	// For return=representation or minimal, Location is omitted.
-	if (q.Kind == ir.Insert || q.Kind == ir.Upsert) && q.Write != nil && q.Write.Return == ir.ReturnHeadersOnly {
+	// A Location points at a newly created resource. PostgREST sets it only for a
+	// return=headers-only POST insert or upsert of a single row; a PUT never
+	// carries one (02.9).
+	if r.Method == http.MethodPost && (q.Kind == ir.Insert || q.Kind == ir.Upsert) &&
+		q.Write != nil && q.Write.Return == ir.ReturnHeadersOnly {
 		if loc := locationHeader(rel, q.Relation.Name, res); loc != "" {
 			w.Header().Set("Location", loc)
 		}
 	}
 
+	// Content-Range is present on every write except PUT, shaped by method (02.8):
+	// POST and DELETE report the total-only "*/*" form ("*/N" with count=exact),
+	// PATCH the affected-row range "0-(n-1)/...". It does not depend on the return
+	// mode, so a minimal write carries it too.
+	affected, hasAff := res.Affected()
+	if cr := writeContentRange(r.Method, affected, hasAff, q.Count); cr != "" {
+		w.Header().Set("Content-Range", cr)
+	}
+
 	representation := q.Write.Return == ir.ReturnRepresentation
 	if !representation {
-		// When count=exact was requested, include Content-Range: */<n> so the
-		// client knows how many rows were affected, matching PostgREST's wire.
-		if q.Count == ir.CountExact {
-			if n, ok := res.Affected(); ok {
-				w.Header().Set("Content-Range", fmt.Sprintf("*/%d", n))
-			}
-		}
 		w.WriteHeader(applyControls(w, ctrl, writeStatus(r.Method, q.Kind, false, ctrl)))
 		return
 	}
 
+	respStart := time.Now()
 	out, apiErr := renderFor(media, res, embedKeys(q))
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
 	}
+	timerFrom(r.Context()).mark("response", respStart)
 	w.Header().Set("Content-Type", out.contentType)
-	if !q.Singular {
-		// For writes with count=exact, include the total in Content-Range.
-		if q.Count == ir.CountExact {
-			if n, ok := res.Affected(); ok {
-				w.Header().Set("Content-Range", contentRange(0, out.nRows, n, true))
-			} else {
-				w.Header().Set("Content-Range", contentRange(0, out.nRows, 0, false))
-			}
-		} else {
-			w.Header().Set("Content-Range", contentRange(0, out.nRows, 0, false))
-		}
-	}
 	w.WriteHeader(applyControls(w, ctrl, writeStatus(r.Method, q.Kind, true, ctrl)))
 	if r.Method != http.MethodHead {
 		w.Write(out.body)
 	}
 }
 
+// writeContentRange builds the Content-Range header for a write, shaped by the
+// HTTP method (02.8). A PUT carries none. POST and DELETE report the total-only
+// "*/*" form ("*/N" with count=exact); PATCH reports the affected-row range
+// "0-(n-1)/..." and falls back to "*/..." when no row matched.
+func writeContentRange(method string, affected int64, hasAff bool, count ir.CountKind) string {
+	if method == http.MethodPut {
+		return ""
+	}
+	total := "*"
+	if count == ir.CountExact && hasAff {
+		total = strconv.FormatInt(affected, 10)
+	}
+	if method == http.MethodPatch && hasAff && affected > 0 {
+		return fmt.Sprintf("0-%d/%s", affected-1, total)
+	}
+	return "*/" + total
+}
+
 // writeStatus is the status for a successful write.
 //   - POST insert: 201 Created.
-//   - POST upsert where ALL rows were new inserts: 201 Created.
-//   - POST upsert where at least one row was an ON CONFLICT update: 200 OK.
-//   - PUT upsert where the row is known to be a new insert: 201 Created.
-//   - PUT upsert where the row is known to be an update, or unknown: 200 OK.
-//   - PATCH/DELETE with representation: 200 OK.
-//   - PATCH/DELETE without representation: 204 No Content.
+//   - POST merge-duplicates upsert with zero rows inserted: 200 OK.
+//   - POST upsert otherwise (ignore-duplicates, mixed, all-insert, unknown): 201.
+//   - PUT without representation (minimal, headers-only, none): 204 No Content.
+//   - PUT representation with a row inserted: 201 Created; else 200 OK.
+//   - PATCH/DELETE with representation: 200 OK; without: 204 No Content.
 func writeStatus(method string, kind ir.QueryKind, representation bool, ctrl *reqctx.ResponseControls) int {
-	if method == http.MethodPost {
-		// 200 when the upsert hit at least one existing row (ON CONFLICT UPDATE fired).
-		// 201 otherwise (new row was inserted or unknown).
-		if kind == ir.Upsert && ctrl != nil && ctrl.UpsertStatusKnown && !ctrl.UpsertInsert {
+	switch method {
+	case http.MethodPost:
+		// A POST upsert is 200 only when the resolution is merge-duplicates and no
+		// row was newly inserted; ignore-duplicates and mixed batches stay 201. The
+		// backend reports a known insert count only for a merge upsert, so a known
+		// zero here already implies merge-duplicates.
+		if kind == ir.Upsert && ctrl != nil && ctrl.UpsertStatusKnown && ctrl.InsertedRows == 0 {
 			return http.StatusOK
 		}
 		return http.StatusCreated
-	}
-	if method == http.MethodPut && kind == ir.Upsert {
-		// PUT is semantically "create or replace"; default to 200.
-		// Only return 201 when the backend positively confirms a new insert.
-		if ctrl != nil && ctrl.UpsertStatusKnown && ctrl.UpsertInsert {
+	case http.MethodPut:
+		// A PUT answers 204 for every return mode except representation, which is
+		// 201 when a row was inserted and 200 when it replaced an existing one.
+		if !representation {
+			return http.StatusNoContent
+		}
+		if ctrl != nil && ctrl.UpsertStatusKnown && ctrl.InsertedRows > 0 {
 			return http.StatusCreated
 		}
 		return http.StatusOK
@@ -570,14 +1166,68 @@ func locationHeader(rel *schema.Relation, relation string, res backend.Result) s
 // quoting their text. Nested embeds are already inside their parent's JSON blob,
 // so only the top level matters here.
 func embedKeys(q *ir.Query) map[string]bool {
-	if len(q.Embeds) == 0 {
-		return nil
+	return embedKeysFor(q.Embeds, q.Select)
+}
+
+// embedKeysFor computes the raw-JSON column set from an embed list and select,
+// shared by the table-read path (ir.Query) and the embedded-RPC path (ir.Call),
+// which carry the same two pieces.
+func embedKeysFor(embeds []ir.Embed, sel []ir.SelectItem) map[string]bool {
+	var keys map[string]bool
+	add := func(k string) {
+		if keys == nil {
+			keys = make(map[string]bool)
+		}
+		keys[k] = true
 	}
-	keys := make(map[string]bool, len(q.Embeds))
-	for i := range q.Embeds {
-		keys[q.Embeds[i].OutKey] = true
+	for i := range embeds {
+		emb := &embeds[i]
+		// A spread embed lifts its columns flat rather than nesting under a key.
+		// A to-many spread lifts each column as a JSON array, so those lifted
+		// names must render raw; a to-one spread lifts plain scalars that render
+		// normally. A non-spread embed nests under its OutKey.
+		if emb.Spread {
+			if emb.Rel != nil && emb.Rel.Card != schema.CardToOne {
+				for _, name := range spreadLiftedNames(emb) {
+					add(name)
+				}
+			}
+			continue
+		}
+		add(emb.OutKey)
+	}
+	// A projection ending in -> (data->meta) yields JSON the renderer must splice
+	// verbatim, the same as an embed; a final ->> is text and renders normally.
+	for _, it := range sel {
+		if c, ok := it.(ir.Column); ok && c.Last == ir.JSONArrow {
+			add(c.Name())
+		}
 	}
 	return keys
+}
+
+// spreadLiftedNames returns the parent-row column names a spread embed lifts,
+// mirroring the projection rules the sqlgen spread compiler uses: an empty or
+// star select lifts every target column; otherwise each named column lifts under
+// its output name.
+func spreadLiftedNames(emb *ir.Embed) []string {
+	target := emb.Rel.Target
+	if len(emb.Query.Select) == 0 {
+		return target.ColumnNames()
+	}
+	var names []string
+	for _, it := range emb.Query.Select {
+		c, ok := it.(ir.Column)
+		if !ok {
+			continue
+		}
+		if len(c.Path) == 1 && c.Path[0] == "*" {
+			names = append(names, target.ColumnNames()...)
+			continue
+		}
+		names = append(names, c.Name())
+	}
+	return names
 }
 
 // writeRead sets the headers and status for a successful read and writes the
@@ -585,22 +1235,31 @@ func embedKeys(q *ir.Query) map[string]bool {
 // the controls: a control header is added and a non-zero control status wins
 // over the computed 200/206 default.
 func (s *Server) writeRead(w http.ResponseWriter, r *http.Request, q *ir.Query, out *rendered, ctrl *reqctx.ResponseControls) {
-	if applied := q.Prefer.AppliedHeader(); applied != "" {
-		w.Header().Set("Preference-Applied", applied)
-	}
-	w.Header().Set("Content-Type", out.contentType)
-
 	offset := 0
 	if q.Offset != nil {
 		offset = *q.Offset
 	}
+	s.writePaged(w, r, q.Prefer.AppliedHeader(), offset, out, ctrl)
+}
+
+// writePaged sets the pagination headers and status shared by table reads and
+// RPC reads. Content-Range is always present (the "*" total form without a
+// count). An offset strictly past a known total is 416 with the upstream
+// detail; an offset equal to the total is in range and yields 206 with
+// Content-Range "*/total". The 200/206 rule is 206 whenever a total is known
+// and the returned span is smaller, for every count kind (PostgREST v14 returns
+// 206 for count=planned/estimated too). A function or policy can override the
+// status and add headers through the controls.
+func (s *Server) writePaged(w http.ResponseWriter, r *http.Request, applied string, offset int, out *rendered, ctrl *reqctx.ResponseControls) {
+	if applied != "" {
+		w.Header().Set("Preference-Applied", applied)
+	}
+	w.Header().Set("Content-Type", out.contentType)
 	w.Header().Set("Content-Range", contentRange(offset, out.nRows, out.total, out.hasTotl))
 
-	// An out-of-range offset is 416: the window starts past the end of the
-	// result. This is only knowable with a count, so it applies when one was
-	// requested (otherwise the empty window is a plain 200 with an empty array).
-	if offset > 0 && out.hasTotl && int64(offset) >= out.total {
-		rng := pgerr.ErrRangeNotSatisfiable()
+	if offset > 0 && out.hasTotl && int64(offset) > out.total {
+		rng := pgerr.ErrRangeNotSatisfiable().
+			WithDetails(fmt.Sprintf("An offset of %d was requested, but there are only %d rows.", offset, out.total))
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.WriteHeader(rng.HTTPStatus)
 		if r.Method != http.MethodHead {
@@ -609,47 +1268,43 @@ func (s *Server) writeRead(w http.ResponseWriter, r *http.Request, q *ir.Query, 
 		return
 	}
 
-	w.WriteHeader(applyControls(w, ctrl, readStatus(q, out, offset)))
+	status := http.StatusOK
+	if out.hasTotl && int64(out.nRows) < out.total {
+		status = http.StatusPartialContent
+	}
+	w.WriteHeader(applyControls(w, ctrl, status))
 	if r.Method != http.MethodHead {
 		w.Write(out.body)
 	}
 }
 
-// readStatus applies PostgREST's 200/206 rule: 206 only when a count is known
-// and the page returned is genuinely partial (nRows < total). PostgREST v14
-// returns 200 for count=planned/estimated even though the total is approximate;
-// the estimate is informational, not a range boundary.
-func readStatus(q *ir.Query, out *rendered, _ int) int {
-	if !out.hasTotl {
-		return http.StatusOK
-	}
-	if q.Count == ir.CountExact && int64(out.nRows) < out.total {
-		return http.StatusPartialContent
-	}
-	return http.StatusOK
-}
-
 // parseRangeHeader parses an HTTP Range header value of the form "start-end"
 // (as used with Range-Unit: items). Returns (offset, limit, true) where limit
-// is -1 for an open-ended range ("0-"). Returns (0, 0, false) on parse error.
-func parseRangeHeader(s string) (offset, limit int, ok bool) {
+// is -1 for an open-ended range ("0-"). A malformed header returns ok=false with
+// inverted=false so the caller serves the full result. A well-formed header whose
+// upper bound is below its lower bound returns ok=false with inverted=true, which
+// PostgREST answers with 416 rather than ignoring.
+func parseRangeHeader(s string) (offset, limit int, ok, inverted bool) {
 	dash := strings.LastIndex(s, "-")
 	if dash < 0 {
-		return 0, 0, false
+		return 0, 0, false, false
 	}
 	startStr, endStr := s[:dash], s[dash+1:]
 	start, err := strconv.Atoi(startStr)
 	if err != nil || start < 0 {
-		return 0, 0, false
+		return 0, 0, false, false
 	}
 	if endStr == "" {
-		return start, -1, true // open-ended: "0-"
+		return start, -1, true, false // open-ended: "0-"
 	}
 	end, err := strconv.Atoi(endStr)
-	if err != nil || end < start {
-		return 0, 0, false
+	if err != nil {
+		return 0, 0, false, false
 	}
-	return start, end - start + 1, true
+	if end < start {
+		return 0, 0, false, true
+	}
+	return start, end - start + 1, true, false
 }
 
 // asAPIError normalizes a backend execution error to the API envelope, asking
@@ -666,20 +1321,27 @@ func asAPIError(b backend.Backend, err error) *pgerr.APIError {
 }
 
 // mapExecError wraps asAPIError with the PostgREST 401/403 rule: a 42501
-// (insufficient_privilege) error to an anonymous request is 401 (authentication
-// required), not 403 (forbidden). An authenticated request that is denied
-// remains 403 so the caller knows to authenticate, not just retry.
-// The original PostgreSQL message is preserved to match PostgREST wire behavior.
+// (insufficient_privilege) error is 403 for an authenticated request, so the
+// caller knows the role is wrong rather than missing, and 401 for an anonymous
+// one, so it knows to authenticate. GradePrivilegeStatus is the one place the
+// rule lives, so the status is correct whatever status a backend's SQLSTATE
+// table assigned; mapExecError adds the bare Bearer challenge PostgREST sends on
+// the 401. The original PostgreSQL message is preserved for wire compatibility.
 func mapExecError(b backend.Backend, err error, anonymous bool) *pgerr.APIError {
-	e := asAPIError(b, err)
+	e := pgerr.GradePrivilegeStatus(asAPIError(b, err), !anonymous)
 	if anonymous && e.Code == pgerr.CodeInsufficientPrivilege {
 		lifted := *e
-		lifted.HTTPStatus = http.StatusUnauthorized
+		// PostgREST sends the bare Bearer challenge on every 401, including a
+		// privilege denial lifted from 403 for an unauthenticated request.
+		lifted.WWWAuthenticate = "Bearer"
 		return &lifted
 	}
 	return e
 }
 
 func writeError(w http.ResponseWriter, e *pgerr.APIError) {
+	// PostgREST does not echo Content-Profile on an error response; drop the
+	// header ServeHTTP may have staged before the handler failed.
+	w.Header().Del("Content-Profile")
 	e.Write(w)
 }

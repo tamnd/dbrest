@@ -8,7 +8,11 @@
 // backend; its errors are the PGRST1xx family. See spec 05-query-ir-and-planning.
 package ir
 
-import "github.com/tamnd/dbrest/schema"
+import (
+	"net/url"
+
+	"github.com/tamnd/dbrest/schema"
+)
 
 // QueryKind is the operation a /<table> request performs.
 type QueryKind uint8
@@ -47,19 +51,51 @@ type Root struct {
 
 // Query is a /<table> request.
 type Query struct {
-	Kind      QueryKind
-	Relation  Ref
-	Select    []SelectItem
-	Where     *Cond
-	Order     []OrderTerm
-	Limit     *int
-	Offset    *int
-	Embeds    []Embed
-	Write     *WriteSpec // non-nil for Insert/Update/Upsert/Delete
-	Singular  bool
-	Count     CountKind
+	Kind     QueryKind
+	Relation Ref
+	Select   []SelectItem
+	Where    *Cond
+	Order    []OrderTerm
+	Limit    *int
+	Offset   *int
+	Embeds   []Embed
+	Write    *WriteSpec // non-nil for Insert/Update/Upsert/Delete
+	Singular bool
+	Count    CountKind
+	// CountMax is the db-max-rows threshold an estimated count crosses over at: a
+	// backend that supports estimation runs the exact count while the result stays
+	// at or below it and falls back to the planner estimate above it. Zero means no
+	// threshold was configured. It is only meaningful with Count == CountEstimated.
+	CountMax  int64
 	Prefer    PreferSet
 	FromRange bool // limit/offset came from the Range request header, not ?limit=
+	IsPut     bool // the request method was PUT, so PUT upsert validations apply
+	// Computed maps each of this relation's computed-field names to the schema of
+	// the function that backs it. The planner fills it from the resolved relation
+	// so the compiler can render a selected, filtered, or ordered computed field as
+	// a function call on the row instead of a bare column. Nil when the relation has
+	// no computed fields. Each embed carries its own map for its own relation.
+	Computed map[string]string
+	// Reps maps a column name to the cast functions that drive its data
+	// representation (PostgREST domain representations, spec 11). The planner fills
+	// it from the resolved relation so the compiler reformats the column through the
+	// domain's casts: ToJSON on read output, FromJSON on a write value, FromText on a
+	// filter literal. Nil when no column of the relation carries one; each embed
+	// carries its own map for its own relation.
+	Reps map[string]Rep
+}
+
+// Rep carries the cast functions that drive a column's data representation
+// (PostgREST domain representations, spec 11): a domain type with casts to and
+// from json/text whose functions reformat the wire value. Each field is the
+// schema-qualified function backing that direction, or empty when the domain
+// declares no cast there. ToJSON formats the stored value for a response,
+// FromText parses a query-string filter literal, FromJSON parses a write-body
+// value.
+type Rep struct {
+	ToJSONSchema, ToJSONFunc     string
+	FromTextSchema, FromTextFunc string
+	FromJSONSchema, FromJSONFunc string
 }
 
 // Call is a /rpc/<fn> request.
@@ -72,9 +108,19 @@ type Call struct {
 	Order    []OrderTerm
 	Limit    *int
 	Offset   *int
+	// Embeds are the embedded resources requested on a function returning rows of
+	// a known relation (/rpc/f?select=id,client(*)). They resolve against the
+	// function's result relation exactly as a table read's embeds do; a call over
+	// a function with no relation return carries none.
+	Embeds   []Embed
 	Singular bool
 	Count    CountKind
 	Prefer   PreferSet
+	// RawGet holds a GET call's non-reserved query parameters before the
+	// argument-versus-filter split, which needs the resolved function's
+	// parameter names. PartitionGetArgs consumes it once the planner knows the
+	// signature. It is nil on a POST call.
+	RawGet url.Values
 }
 
 // RootSpec is a GET / request: render the OpenAPI document for a schema.
@@ -105,6 +151,43 @@ type Column struct {
 
 func (Column) isSelect() {}
 
+// ProjectedColumns returns the distinct base column names a plain select list
+// names, in select order, so a write's representation reads back only the
+// columns the client asked for instead of the whole row. It returns nil when
+// the projection is not a simple base-column list (empty, a "*", an aggregate,
+// or an embed present), telling the caller to fall back to every column. A
+// column carrying an alias, a cast, or a JSON sub-path also forces the fallback,
+// because the bare RETURNING/OUTPUT path cannot reshape those (that reshaping is
+// the deferred write-representation embed work, item 01.19).
+func (q *Query) ProjectedColumns() []string {
+	if len(q.Select) == 0 || len(q.Embeds) > 0 {
+		return nil
+	}
+	out := make([]string, 0, len(q.Select))
+	seen := make(map[string]bool, len(q.Select))
+	for _, it := range q.Select {
+		col, ok := it.(Column)
+		if !ok {
+			return nil // an aggregate or an embed reference
+		}
+		if len(col.Path) != 1 || col.Last != JSONNone || col.Cast != "" || col.Alias != "" {
+			return nil
+		}
+		name := col.Path[0]
+		if name == "*" {
+			return nil
+		}
+		if !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // Name returns the output key for the column: its alias if set, else the last
 // path element.
 func (c Column) Name() string {
@@ -128,12 +211,43 @@ const (
 	AggMax
 )
 
-// Aggregate is a column aggregate in the select list.
+// Aggregate is a column aggregate in the select list. Cast is an output cast on
+// the aggregate result; an input cast on the aggregated column rides on Arg.Cast.
+// Legacy marks the pre-v12 bare `count` an embed select may carry: it renders a
+// count of the embedded rows and is exempt from the db-aggregates-enabled gate,
+// where the count()/col.agg() function forms are not.
 type Aggregate struct {
-	Func  AggFunc
-	Arg   *Column // nil for count(*)
-	Cast  string
-	Alias string
+	Func   AggFunc
+	Arg    *Column // nil for count()
+	Cast   string
+	Alias  string
+	Legacy bool
+}
+
+// Name is the response key an aggregate renders under: its explicit alias, else
+// the function name (sum, avg, count, min, max), matching PostgREST's default.
+func (a Aggregate) Name() string {
+	if a.Alias != "" {
+		return a.Alias
+	}
+	return a.Func.String()
+}
+
+// String spells an aggregate function the way it appears in SQL and as the
+// default response key.
+func (f AggFunc) String() string {
+	switch f {
+	case AggSum:
+		return "sum"
+	case AggAvg:
+		return "avg"
+	case AggMin:
+		return "min"
+	case AggMax:
+		return "max"
+	default:
+		return "count"
+	}
 }
 
 func (Aggregate) isSelect() {}
@@ -176,6 +290,12 @@ type Embed struct {
 	Target      Ref // the embedded relation as written; resolved at plan time
 	Query       Query
 	Rel         *schema.Relationship
+
+	// EmptySelect records that the embed was written with empty parentheses,
+	// e.g. client(). PostgREST joins such a relation for filtering but omits its
+	// key from the output entirely, which an absent or rel(*) select does not.
+	// This distinguishes "no column list" from "select every column".
+	EmptySelect bool
 }
 
 // Cond is a node in the filter tree.
@@ -196,6 +316,22 @@ type Not struct{ Kid Cond }
 
 func (Not) isCond() {}
 
+// EmbedPredicate filters the parent on the existence of an embedded resource's
+// rows. It is what an `embed=is.null` / `embed=not.is.null` filter lowers to:
+// the planner reclassifies a Compare whose single-segment path names an embed's
+// OutKey and whose operator is `is null` into this node, so the compiler can
+// emit a semi/anti join instead of rejecting an unknown parent column.
+//
+// Index points into the owning Query's Embeds. Exists is true for not.is.null
+// (the parent must have a matching embedded row, a semi-join / EXISTS) and false
+// for is.null (it must have none, an anti-join / NOT EXISTS). See spec 09.
+type EmbedPredicate struct {
+	Index  int
+	Exists bool
+}
+
+func (EmbedPredicate) isCond() {}
+
 // FTSVariant selects the full-text query grammar of an fts predicate, one per
 // PostgREST operator. Parsing records the variant; each backend maps it onto its
 // own full-text query language (spec 21).
@@ -211,6 +347,7 @@ const (
 // Compare is a single column-operator-value predicate.
 type Compare struct {
 	Path   []string
+	Last   JSONStep // final JSON hop kind when Path carries a -> / ->> sub-path
 	Op     Op
 	Value  Value
 	Quant  Quant
@@ -222,6 +359,11 @@ type Compare struct {
 	FTS      FTSVariant
 	Config   string
 	FullText *schema.FullTextIndex
+	// ColumnType is the canonical type of the column at Path[0], resolved by
+	// the planner from the schema. The dialect uses it to decide whether an
+	// engine-specific operator (e.g. json_each for array ops on SQLite) can
+	// apply; it is empty when the column is unknown or for multi-step paths.
+	ColumnType string
 }
 
 func (Compare) isCond() {}
@@ -277,8 +419,17 @@ type Value struct {
 // OrderTerm is one entry in the order list.
 type OrderTerm struct {
 	Path       []string
+	Last       JSONStep // final JSON hop kind when Path carries a -> / ->> sub-path
 	Desc       bool
 	NullsFirst *bool // nil = PG default (NULLS LAST asc, NULLS FIRST desc)
+
+	// Rel names an embedded resource when the term is order=rel(col): the parent
+	// is ordered by a column of a to-one embed, with Path/Last addressing the
+	// column inside that relation. Empty for an ordinary parent-column term. The
+	// name is the embed's written spelling or alias (client in client(name));
+	// the planner resolves it to a relationship and the compiler lowers it as a
+	// correlated scalar subquery.
+	Rel string
 }
 
 // WriteSpec carries the mutation payload and options (spec 11).
@@ -291,14 +442,22 @@ type WriteSpec struct {
 	Return   ReturnMode
 	MaxRows  *int64
 	Tx       TxMode
+	// ColumnTypes is the canonical type of each written column, resolved by the
+	// planner from the relation. The compiler uses it to decide how a JSON array
+	// payload value lands: a json/jsonb column takes JSON text, an array column
+	// takes a PostgreSQL array literal. It is empty for backends or paths that do
+	// not resolve a schema.
+	ColumnTypes map[string]string
 }
 
 // MissingMode is the Prefer: missing= behavior for absent payload columns.
 type MissingMode uint8
 
+// MissingNull is the zero value because PostgREST inserts SQL NULL for payload
+// columns a row omits; Prefer: missing=default is the opt-in for column DEFAULTs.
 const (
-	MissingDefault MissingMode = iota
-	MissingNull
+	MissingNull MissingMode = iota
+	MissingDefault
 )
 
 // Conflict describes an upsert conflict resolution.
@@ -332,3 +491,32 @@ const (
 	TxCommit
 	TxRollback
 )
+
+// TxEnd is the db-tx-end server policy that governs whether a request may
+// override the transaction outcome with Prefer: tx=. The two allow-override
+// variants honor the preference; the two fixed variants ignore it and force
+// their outcome server-side.
+type TxEnd uint8
+
+const (
+	TxEndCommit TxEnd = iota
+	TxEndCommitAllowOverride
+	TxEndRollback
+	TxEndRollbackAllowOverride
+)
+
+// ParseTxEnd maps a db-tx-end option string to a TxEnd. An empty or unknown
+// value is the default commit, matching the config default; the config layer
+// validates the spelling before this point.
+func ParseTxEnd(s string) TxEnd {
+	switch s {
+	case "commit-allow-override":
+		return TxEndCommitAllowOverride
+	case "rollback":
+		return TxEndRollback
+	case "rollback-allow-override":
+		return TxEndRollbackAllowOverride
+	default:
+		return TxEndCommit
+	}
+}

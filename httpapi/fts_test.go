@@ -45,7 +45,9 @@ func newFTSServer(t testing.TB) *httpapi.Server {
 	if err != nil {
 		t.Fatalf("introspect: %v", err)
 	}
-	return httpapi.NewServer(be, model, nil)
+	srv := httpapi.NewServer(be, model, nil)
+	srv.SetDefaultRole("anon")
+	return srv
 }
 
 // TestFTSMatchSelectsRow exercises the full request path: an fts filter lowers to

@@ -50,6 +50,11 @@ func (Dialect) Placeholder(n int) string { return "@p" + strconv.Itoa(n) }
 // used uniformly.
 func (Dialect) LimitOffset(limit, offset *int, hasOrder bool) string {
 	if limit == nil && offset == nil {
+		if hasOrder {
+			// ORDER BY in a derived table requires OFFSET even when no paging is
+			// requested; OFFSET 0 ROWS keeps all rows while making the ORDER BY valid.
+			return "OFFSET 0 ROWS"
+		}
 		return ""
 	}
 	off := 0
@@ -135,12 +140,13 @@ func (Dialect) JSONObject(pairs []sqlgen.Pair) string {
 	return "JSON_OBJECT(" + strings.Join(parts, ", ") + ")"
 }
 
-// JSONAgg aggregates rows with the SQL Server 2022 JSON_ARRAYAGG. The aggregate
-// takes no ORDER BY argument, so a requested embed order is applied on the
-// derived table feeding the aggregate, not here; orderBy is therefore unused and
-// the row order within the array is best-effort (spec 06).
+// JSONAgg aggregates rows into a JSON array using STRING_AGG. JSON_ARRAYAGG was
+// only added in SQL Server 2025 (version 17); for 2022 compatibility the dialect
+// constructs the array manually: '[' + STRING_AGG(elem,',') + ']'. The elements
+// are cast to NVARCHAR(MAX) so STRING_AGG accepts them. orderBy is unused; a
+// requested embed order is applied on the derived table feeding the aggregate.
 func (Dialect) JSONAgg(elem, _ string) string {
-	return "JSON_ARRAYAGG(" + elem + ")"
+	return "'['+STRING_AGG(CAST((" + elem + ") AS NVARCHAR(MAX)),',')+']'"
 }
 
 // Cast translates a canonical type to a T-SQL CAST target. SQL Server has no
@@ -218,8 +224,38 @@ func (Dialect) SessionWrite(key string) (string, bool) {
 	return "EXEC sp_set_session_context N'" + strings.ReplaceAll(key, "'", "''") + "', " + sqlgen.PatternMark, true
 }
 
-// ArrayOp returns false; SQL Server has no array types or containment operators.
-func (Dialect) ArrayOp(_, _, _ string) (string, bool) { return "", false }
+// ArrayOp implements array containment/overlap operators using OPENJSON, which
+// parses the JSON array argument and the JSON array column for element-level
+// comparisons. val is a bound placeholder (@pN) whose value is a JSON array
+// string (converted from PostgreSQL {a,b} syntax by ArrayLiteral).
+func (Dialect) ArrayOp(col, op, val, _ string) (string, bool) {
+	switch op {
+	case "@>":
+		// col contains every element of val
+		return "NOT EXISTS(SELECT [value] FROM OPENJSON(" + val + ") WHERE [value] NOT IN (SELECT [value] FROM OPENJSON(" + col + ")))", true
+	case "<@":
+		// every element of col exists in val
+		return "NOT EXISTS(SELECT [value] FROM OPENJSON(" + col + ") WHERE [value] NOT IN (SELECT [value] FROM OPENJSON(" + val + ")))", true
+	case "&&":
+		// at least one element in common
+		return "EXISTS(SELECT 1 FROM OPENJSON(" + col + ") a WHERE a.[value] IN (SELECT [value] FROM OPENJSON(" + val + ")))", true
+	}
+	return "", false
+}
+
+// RangeOp declines: SQL Server has no range types, so sl/sr/nxr/nxl/adj are
+// PGRST127.
+func (Dialect) RangeOp(_, _, _ string) (string, bool) { return "", false }
+
+// IsBool renders "col = 1" or "col = 0" for SQL Server BIT columns. SQL
+// Server's IS operator only accepts NULL/UNKNOWN, not integer literals.
+func (Dialect) IsBool(col string, v bool) (string, bool) {
+	return col + " = " + Dialect{}.BoolValue(v), true
+}
+
+// IsUnknown falls back to "col IS NULL"; a BIT boolean column's UNKNOWN state is
+// its NULL, so the row set matches.
+func (Dialect) IsUnknown(string) (string, bool) { return "", false }
 
 // ILike uses plain LIKE; SQL Server's default collation is case-insensitive.
 func (Dialect) ILike(col, val string) (string, bool) { return col + " LIKE " + val, true }
@@ -232,3 +268,46 @@ func (Dialect) BoolValue(v bool) string {
 	}
 	return "0"
 }
+
+// InList reports ok=false: SQL Server has no array-bound ANY, so the compiler
+// emits the expanded col IN ($1, $2, ...) form.
+func (Dialect) InList(_ string) (string, bool) { return "", false }
+
+// ArrayLiteral converts a PostgreSQL {a,b} array literal to a JSON array
+// ["a","b"] so OPENJSON in ArrayOp can iterate over it.
+func (Dialect) ArrayLiteral(pgText string) string {
+	s := strings.TrimSpace(pgText)
+	if len(s) < 2 || s[0] != '{' || s[len(s)-1] != '}' {
+		return pgText
+	}
+	inner := s[1 : len(s)-1]
+	if inner == "" {
+		return "[]"
+	}
+	parts := strings.Split(inner, ",")
+	quoted := make([]string, len(parts))
+	for i, p := range parts {
+		p = strings.TrimSpace(p)
+		switch {
+		case p == "NULL":
+			quoted[i] = "null"
+		case len(p) >= 2 && p[0] == '"' && p[len(p)-1] == '"':
+			// PostgreSQL double-quote escaping: "foo" is already valid JSON; pass through.
+			quoted[i] = p
+		default:
+			quoted[i] = `"` + strings.ReplaceAll(p, `"`, `\"`) + `"`
+		}
+	}
+	return "[" + strings.Join(quoted, ",") + "]"
+}
+
+// ArrayArg stores a payload array as its JSON text: SQL Server has no array
+// columns, so an nvarchar column holds the array and reads it back as JSON.
+// A PostgreSQL {a,b} literal here would corrupt the column.
+func (Dialect) ArrayArg(elems []any, _ string) any { return sqlgen.JSONArrayArg(elems) }
+
+// JSONPath reports ok=false so the compiler raises PGRST127. SQL Server expresses
+// JSON access through JSON_VALUE/JSON_QUERY rather than ->/->>, and lowering them
+// to match PostgREST's typing needs a live server to verify; until then JSON
+// paths are an honest capability gap, the per-driver remainder.
+func (Dialect) JSONPath(string, []string, bool) (string, bool) { return "", false }

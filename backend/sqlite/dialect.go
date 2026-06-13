@@ -146,11 +146,99 @@ func (dialect) SessionRead(string) string { return "" }
 // SessionWrite reports ok=false: there is no engine setting to write.
 func (dialect) SessionWrite(string) (string, bool) { return "", false }
 
-// ArrayOp returns false; SQLite has no array types or containment operators.
-func (dialect) ArrayOp(_, _, _ string) (string, bool) { return "", false }
+// InList reports ok=false: SQLite has no array-bound ANY, so the compiler emits
+// the expanded col IN ($1, $2, ...) form.
+func (dialect) InList(_ string) (string, bool) { return "", false }
 
-// ILike uses plain LIKE which is case-insensitive for ASCII in SQLite.
-func (dialect) ILike(col, val string) (string, bool) { return col + " LIKE " + val, true }
+// ArrayLiteral converts a PostgreSQL {a,b} array literal to a JSON array
+// ["a","b"] so json_each() in ArrayOp can iterate over it.
+func (dialect) ArrayLiteral(pgText string) string {
+	s := strings.TrimSpace(pgText)
+	if len(s) < 2 || s[0] != '{' || s[len(s)-1] != '}' {
+		return pgText // already JSON or empty; pass through
+	}
+	inner := s[1 : len(s)-1]
+	if inner == "" {
+		return "[]"
+	}
+	parts := strings.Split(inner, ",")
+	quoted := make([]string, len(parts))
+	for i, p := range parts {
+		p = strings.TrimSpace(p)
+		if len(p) >= 2 && p[0] == '"' && p[len(p)-1] == '"' {
+			quoted[i] = p // already JSON-quoted
+		} else {
+			quoted[i] = `"` + strings.ReplaceAll(p, `"`, `\"`) + `"`
+		}
+	}
+	return "[" + strings.Join(quoted, ",") + "]"
+}
+
+// ArrayArg stores a payload array as its JSON text: SQLite has no array
+// columns, so a JSON-typed column holds the array and reads it back as JSON.
+// A PostgreSQL {a,b} literal here would corrupt the column.
+func (dialect) ArrayArg(elems []any, _ string) any { return sqlgen.JSONArrayArg(elems) }
+
+// JSONPath lowers a JSON sub-path to SQLite's -> / ->> operators over a single
+// JSON path argument. SQLite's ->> returns the SQL text scalar and -> returns
+// the JSON representation, matching PostgreSQL's ->>/-> typing. Object keys
+// become quoted "label" segments and digit hops become [n] array subscripts, so
+// data->phones->0->>number renders as data ->> '$."phones"[0]."number"'.
+func (dialect) JSONPath(base string, hops []string, asText bool) (string, bool) {
+	var p strings.Builder
+	p.WriteString("$")
+	for _, h := range hops {
+		if sqlgen.IsJSONArrayIndex(h) {
+			p.WriteString("[" + h + "]")
+		} else {
+			p.WriteString(`."` + strings.ReplaceAll(h, `"`, `""`) + `"`)
+		}
+	}
+	op := "->"
+	if asText {
+		op = "->>"
+	}
+	return base + " " + op + " '" + strings.ReplaceAll(p.String(), "'", "''") + "'", true
+}
+
+// ArrayOp implements array containment/overlap via SQLite's json_each(). The
+// column must be declared as JSON type and store a JSON array (e.g.
+// '["cat","work"]'). For any other column type the operator is unsupported
+// (ok=false) so the compiler raises PGRST127. op is one of "@>" (contains),
+// "<@" (contained-by), "&&" (overlaps).
+func (dialect) ArrayOp(col, op, val, colType string) (string, bool) {
+	if colType != "json" && colType != "jsonb" {
+		return "", false
+	}
+	switch op {
+	case "@>": // contains: every element of val appears in col
+		return "NOT EXISTS (SELECT 1 FROM json_each(" + val + ") AS f WHERE f.value NOT IN (SELECT value FROM json_each(" + col + ")))", true
+	case "<@": // contained-by: every element of col appears in val
+		return "NOT EXISTS (SELECT 1 FROM json_each(" + col + ") AS f WHERE f.value NOT IN (SELECT value FROM json_each(" + val + ")))", true
+	case "&&": // overlaps: at least one common element
+		return "EXISTS (SELECT 1 FROM json_each(" + col + ") AS f WHERE f.value IN (SELECT value FROM json_each(" + val + ")))", true
+	}
+	return "", false
+}
+
+// RangeOp declines: SQLite has no range types, so sl/sr/nxr/nxl/adj are PGRST127.
+func (dialect) RangeOp(_, _, _ string) (string, bool) { return "", false }
+
+// ILike folds case explicitly with lower() on both sides. Plain LIKE cannot be
+// relied on for case-insensitivity because the pool sets case_sensitive_like =
+// ON (so the like operator stays case-sensitive like PostgreSQL); lower() folds
+// ASCII, which is the documented best-effort, leaving non-ASCII folding as a gap.
+func (dialect) ILike(col, val string) (string, bool) {
+	return "lower(" + col + ") LIKE lower(" + val + ")", true
+}
+
+// IsBool falls back to the generic "IS 1"/"IS 0" form; SQLite's IS operator is
+// a NULL-safe equality that works with any value.
+func (dialect) IsBool(string, bool) (string, bool) { return "", false }
+
+// IsUnknown has no SQLite spelling; the compiler falls back to "col IS NULL",
+// which selects the same rows for a boolean column.
+func (dialect) IsUnknown(string) (string, bool) { return "", false }
 
 // BoolValue renders a boolean as 1/0; SQLite has no native boolean.
 func (dialect) BoolValue(v bool) string {

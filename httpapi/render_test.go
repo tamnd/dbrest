@@ -47,8 +47,8 @@ func TestCSVCellForms(t *testing.T) {
 		{"null", nil, ""},
 		{"string", "Dune", "Dune"},
 		{"bytes", []byte("blob"), "blob"},
-		{"bool-true", true, "true"},
-		{"bool-false", false, "false"},
+		{"bool-true", true, "t"},
+		{"bool-false", false, "f"},
 		{"json-number", json.Number("42"), "42"},
 		{"float", 3.5, "3.5"},
 		{"int64", int64(-7), "-7"},
@@ -92,6 +92,30 @@ func TestRawJSONForms(t *testing.T) {
 	}
 }
 
+// rawJSONValue embeds a json/jsonb-declared scalar verbatim so a function
+// returning json does not double-encode into a quoted string on a portable
+// backend, where the driver hands the result back as TEXT. A non-json declaration
+// leaves the value untouched, and an invalid-JSON string under a json declaration
+// is left as a string rather than emitted as a broken document.
+func TestRawJSONValue(t *testing.T) {
+	if got, ok := rawJSONValue(`{"a":1}`, "json").(json.RawMessage); !ok || string(got) != `{"a":1}` {
+		t.Errorf("json scalar = %#v, want RawMessage", got)
+	}
+	if got, ok := rawJSONValue(`[1,2]`, "jsonb").(json.RawMessage); !ok || string(got) != `[1,2]` {
+		t.Errorf("jsonb scalar = %#v, want RawMessage", got)
+	}
+	// A non-json declaration passes the text through as a plain string, which the
+	// encoder will quote.
+	if got := rawJSONValue(`{"a":1}`, "text"); got != `{"a":1}` {
+		t.Errorf("text scalar = %#v, want the string unchanged", got)
+	}
+	// Malformed JSON under a json declaration is not wrapped, so the encoder quotes
+	// it rather than emitting an invalid document.
+	if _, ok := rawJSONValue(`{not json`, "json").(json.RawMessage); ok {
+		t.Error("invalid JSON should not become a RawMessage")
+	}
+}
+
 // asAPIError normalizes a backend execution error three ways: an error that is
 // already an API error passes straight through, an engine-native error the
 // backend recognizes becomes whatever it maps to, and anything else falls back
@@ -113,7 +137,7 @@ func TestAsAPIError(t *testing.T) {
 
 	// Branch two: a raw engine error the backend recognizes becomes its mapping.
 	t.Run("backend-maps-it", func(t *testing.T) {
-		mapped := pgerr.ErrUniqueViolation("films_pkey")
+		mapped := pgerr.ErrConstraintViolation("23505", "duplicate key", "", "")
 		b := fakeBackend{mapErr: func(error) *pgerr.APIError { return mapped }}
 		if got := asAPIError(b, errors.New("duplicate key")); got != mapped {
 			t.Errorf("asAPIError = %#v, want the backend mapping %#v", got, mapped)

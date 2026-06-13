@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 
 	sqlitedrv "modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
@@ -68,6 +70,21 @@ func Open(dsn string) (*Backend, error) {
 	if err != nil {
 		return nil, err
 	}
+	// SQLite does not enforce FK constraints by default, and its LIKE folds ASCII
+	// case by default, which makes the like operator silently case-insensitive
+	// unlike PostgreSQL. Pin to one connection so both PRAGMAs stay in effect for
+	// the lifetime of the pool.
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// case_sensitive_like = ON makes the like operator case-sensitive to match
+	// PostgreSQL; ilike folds case explicitly in the dialect (lower() LIKE lower()).
+	if _, err := db.Exec("PRAGMA case_sensitive_like = ON"); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return nil, err
@@ -122,8 +139,13 @@ func (b *Backend) Close() error { return b.db.Close() }
 
 // MapError turns a driver error into the unified envelope. A SQLite constraint
 // violation maps to the PostgreSQL SQLSTATE PostgREST would report (so clients
-// see the same code on every backend) with the matching HTTP status; anything
-// else is surfaced as internal.
+// see the same code on every backend) with the matching HTTP status, and to a
+// PG-shaped message synthesized from what SQLite reports. SQLite names the
+// relation and column in its NOT NULL and UNIQUE text, so those reconstruct
+// PostgreSQL's own wording; it gives no constraint name for a unique key and no
+// offending value, so neither is invented (an emulation limitation, not a
+// fabricated wire contract). The native text is never leaked into details.
+// Anything else is surfaced as internal.
 func (b *Backend) MapError(err error) *pgerr.APIError {
 	if err == nil {
 		return nil
@@ -132,19 +154,55 @@ func (b *Backend) MapError(err error) *pgerr.APIError {
 		// The primary result code is the low byte; the rest is the extended code.
 		switch se.Code() {
 		case sqlite3.SQLITE_CONSTRAINT_UNIQUE, sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY:
-			return pgerr.ErrUniqueViolation(se.Error())
+			return pgerr.ErrConstraintViolation(pgerr.CodeUniqueViolation,
+				"duplicate key value violates unique constraint", "", "")
 		case sqlite3.SQLITE_CONSTRAINT_NOTNULL:
-			return pgerr.ErrNotNullViolation(se.Error())
+			return pgerr.ErrConstraintViolation(pgerr.CodeNotNullViolation,
+				notNullMessage(se.Error()), "", "")
 		case sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY:
-			return pgerr.ErrForeignKeyViolation(se.Error())
+			return pgerr.ErrConstraintViolation(pgerr.CodeForeignKeyViolation,
+				"insert or update on table violates foreign key constraint", "", "")
 		case sqlite3.SQLITE_CONSTRAINT_CHECK:
-			return pgerr.ErrCheckViolation(se.Error())
+			return pgerr.ErrConstraintViolation(pgerr.CodeCheckViolation,
+				checkMessage(se.Error()), "", "")
 		}
 		if se.Code()&0xff == sqlite3.SQLITE_CONSTRAINT {
-			return pgerr.ErrCheckViolation(se.Error())
+			return pgerr.ErrConstraintViolation(pgerr.CodeCheckViolation,
+				"new row violates check constraint", "", "")
 		}
 	}
 	return pgerr.ErrInternal(err.Error())
+}
+
+// constraintTarget matches the "table.column" SQLite names after the colon in a
+// constraint failure ("NOT NULL constraint failed: films.title").
+var constraintTarget = regexp.MustCompile(`([^\s,.]+)\.([^\s,.]+)`)
+
+// notNullMessage reconstructs PostgreSQL's not-null wording from SQLite's "NOT
+// NULL constraint failed: relation.column" text. PostgreSQL reports `null value
+// in column "c" of relation "t" violates not-null constraint`; SQLite supplies
+// both names, so the message matches verbatim. When the text does not parse the
+// generic message stands.
+func notNullMessage(text string) string {
+	if m := constraintTarget.FindStringSubmatch(text); m != nil {
+		return fmt.Sprintf(
+			"null value in column %q of relation %q violates not-null constraint",
+			m[2], m[1])
+	}
+	return "null value violates not-null constraint"
+}
+
+// checkMessage reconstructs PostgreSQL's check wording from SQLite's "CHECK
+// constraint failed: name" text. PostgreSQL names the constraint (`new row for
+// relation "t" violates check constraint "c"`); SQLite gives only the
+// constraint name (or the expression for an anonymous check), so the name rides
+// through when present and the generic message stands otherwise.
+func checkMessage(text string) string {
+	const prefix = "CHECK constraint failed: "
+	if name := strings.TrimPrefix(text, prefix); name != text && name != "" {
+		return fmt.Sprintf("new row violates check constraint %q", name)
+	}
+	return "new row violates check constraint"
 }
 
 // Execute lowers a resolved plan to SQLite operations and returns a streamable
@@ -173,7 +231,7 @@ func (b *Backend) Execute(ctx context.Context, plan *ir.Plan, rc *reqctx.Context
 // (or roll back under Prefer: tx=rollback). The returned rows carry the
 // function's output for the renderer to shape by return kind.
 func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Context) (backend.Result, error) {
-	st, apiErr := sqlgen.CompileCall(dialect{}, plan.Call, plan.Func)
+	st, apiErr := sqlgen.CompileCall(dialect{}, plan.Call, plan.Func, sqlgen.ContextArgs(rc))
 	if apiErr != nil {
 		return nil, apiErr
 	}
@@ -182,7 +240,7 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 		res := &result{controls: rc.Controls()}
 		// A count over a read-only function runs as its own statement, like a read.
 		if plan.Call.Count != ir.CountNone {
-			cst, apiErr := sqlgen.CompileCallCount(dialect{}, plan.Call, plan.Func)
+			cst, apiErr := sqlgen.CompileCallCount(dialect{}, plan.Call, plan.Func, sqlgen.ContextArgs(rc))
 			if apiErr != nil {
 				return nil, apiErr
 			}
@@ -199,6 +257,21 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 		if err != nil {
 			rows.Close()
 			return nil, b.MapError(err)
+		}
+		// A portable function that steers the response projects reserved
+		// response-control columns. Buffer only then, so the common streaming
+		// path is untouched, lift the controls out, and strip them from the body.
+		if backend.HasResponseControlCols(cols) {
+			buf, err := drain(rows, len(cols))
+			rows.Close()
+			if err != nil {
+				return nil, b.MapError(err)
+			}
+			cols, buf, apiErr := backend.LiftResponseControls(cols, buf, res.controls)
+			if apiErr != nil {
+				return nil, apiErr
+			}
+			return &writeResult{cols: cols, rows: buf, count: res.count, hasCount: res.hasCount, controls: res.controls}, nil
 		}
 		res.rows, res.cols = rows, cols
 		return res, nil
@@ -225,7 +298,17 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 		return nil, b.MapError(err)
 	}
 
-	res := &writeResult{cols: cols, rows: buf, controls: rc.Controls()}
+	// A volatile function steers the response the same way a read-only one does:
+	// reserved columns lift into the controls and drop out of the body. An invalid
+	// status or header set fails the call before commit, so the deferred rollback
+	// discards the mutation.
+	controls := rc.Controls()
+	cols, buf, apiErr = backend.LiftResponseControls(cols, buf, controls)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+
+	res := &writeResult{cols: cols, rows: buf, controls: controls}
 	if plan.Call.Prefer.Tx != nil && *plan.Call.Prefer.Tx == ir.TxRollback {
 		return res, nil
 	}
@@ -278,6 +361,19 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 	q := plan.Query
 	returning := returningCols(q, plan.Rel)
 
+	// An empty column set (POST with an empty array, PATCH with an empty object)
+	// is a no-op: nothing is compiled or run, the affected count is zero, and the
+	// representation is the empty array. The HTTP layer turns that into 201/[] for
+	// an insert and 204 or 200/[] for an update.
+	if backend.IsNoOpMutation(q) {
+		return &writeResult{
+			controls: rc.Controls(),
+			cols:     returning,
+			affected: 0,
+			hasAff:   true,
+		}, nil
+	}
+
 	st, apiErr := compileWrite(q, returning)
 	if apiErr != nil {
 		return nil, apiErr
@@ -292,6 +388,19 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 	defer func() { _ = tx.Rollback() }()
 
 	res := &writeResult{controls: rc.Controls()}
+
+	// An upsert's 200-vs-201 status turns on whether any row updated an existing
+	// one. SQLite has no xmax to read back (the PostgreSQL signal), so before the
+	// write we check, in the same transaction, whether any payload row's
+	// conflict-target key already exists; if none does the upsert is all-insert.
+	if q.Kind == ir.Upsert {
+		if inserted, ok, derr := detectUpsertInsert(ctx, tx, q, plan.Rel); derr != nil {
+			return nil, b.MapError(derr)
+		} else if ok {
+			res.controls.UpsertStatusKnown = true
+			res.controls.InsertedRows = inserted
+		}
+	}
 	if len(returning) > 0 {
 		rows, err := tx.QueryContext(ctx, st.SQL, st.Args...)
 		if err != nil {
@@ -307,8 +416,11 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 		if err != nil {
 			return nil, b.MapError(err)
 		}
-		res.cols, res.rows = cols, buf
+		// The affected count is the full mutated set, taken before the
+		// representation is shaped: order/limit/offset bound only the returned
+		// body, not the mutation (v13 dropped limited update/delete).
 		res.affected, res.hasAff = int64(len(buf)), true
+		res.cols, res.rows = cols, backend.ShapeWriteRepresentation(cols, buf, q)
 	} else {
 		out, err := tx.ExecContext(ctx, st.SQL, st.Args...)
 		if err != nil {
@@ -316,6 +428,18 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 		}
 		n, _ := out.RowsAffected()
 		res.affected, res.hasAff = n, true
+	}
+
+	// Prefer: max-affected rolls an over-broad write back instead of committing.
+	if apiErr := backend.EnforceMaxAffected(q.Write, res.affected, res.hasAff); apiErr != nil {
+		return nil, apiErr
+	}
+
+	// A singular write (vnd.pgrst.object+json) that touched zero or many rows
+	// fails closed before commit, so the deferred rollback discards it rather
+	// than the renderer rejecting an already-durable mutation.
+	if apiErr := backend.EnforceSingularWrite(q.Singular, res.affected, res.hasAff); apiErr != nil {
+		return nil, apiErr
 	}
 
 	// Prefer: tx=rollback returns the computed representation but discards the
@@ -327,6 +451,74 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 		return nil, b.MapError(err)
 	}
 	return res, nil
+}
+
+// detectUpsertInsert counts how many of the payload rows the upsert will insert
+// as new (those whose conflict-target key does not already exist) so the HTTP
+// layer can choose 200 vs 201. It runs inside the write transaction, before the
+// upsert statement, and returns ok=false when the target columns are unknown (no
+// explicit on_conflict and no primary key), leaving the status to the default.
+// The conflict target defaults to the relation's primary key, matching the
+// upsert's own ON CONFLICT.
+func detectUpsertInsert(ctx context.Context, tx *sql.Tx, q *ir.Query, rel *schema.Relation) (inserted int, ok bool, err error) {
+	if q.Write == nil || len(q.Write.Rows) == 0 {
+		return 0, false, nil
+	}
+	// Only merge-duplicates can turn into an update; an ignore-duplicates upsert
+	// (ON CONFLICT DO NOTHING) is a no-op insert on a conflict, which PostgreSQL
+	// reports through RETURNING as all-insert and PostgREST renders as 201. So a
+	// PUT (no Conflict spec) and a merge upsert run detection; an ignore upsert
+	// keeps the 201 default.
+	if q.Write.Conflict != nil && q.Write.Conflict.Resolution == ir.ConflictIgnore {
+		return 0, false, nil
+	}
+	target := rel.PrimaryKey
+	if q.Write.Conflict != nil && len(q.Write.Conflict.Target) > 0 {
+		target = q.Write.Conflict.Target
+	}
+	if len(target) == 0 {
+		return 0, false, nil
+	}
+
+	d := dialect{}
+	var where strings.Builder
+	for i, c := range target {
+		if i > 0 {
+			where.WriteString(" AND ")
+		}
+		where.WriteString(d.QuoteIdent(c))
+		where.WriteString(" = ?")
+	}
+	query := "SELECT 1 FROM " + d.QuoteIdent(rel.Name) + " WHERE " + where.String() + " LIMIT 1"
+
+	for _, row := range q.Write.Rows {
+		args := make([]any, len(target))
+		for i, c := range target {
+			// A payload missing a key column cannot match an existing row by it;
+			// treat that row as an insert and move on.
+			v, present := row[c]
+			if !present {
+				args = nil
+				break
+			}
+			args[i] = sqlgen.WriteArg(d, v, q.Write.ColumnTypes[c])
+		}
+		if args == nil {
+			inserted++
+			continue
+		}
+		var dummy int
+		switch scanErr := tx.QueryRowContext(ctx, query, args...).Scan(&dummy); scanErr {
+		case nil:
+			// This row matches an existing key: an ON CONFLICT update, not an insert.
+		case sql.ErrNoRows:
+			// No existing row: this one is a new insert.
+			inserted++
+		default:
+			return 0, false, scanErr
+		}
+	}
+	return inserted, true, nil
 }
 
 // compileWrite dispatches to the right compiler for the mutation kind.
@@ -349,6 +541,9 @@ func compileWrite(q *ir.Query, returning []string) (*sqlgen.Statement, *pgerr.AP
 // nothing and runs as a plain affected-rows statement.
 func returningCols(q *ir.Query, rel *schema.Relation) []string {
 	if q.Write != nil && q.Write.Return == ir.ReturnRepresentation {
+		if cols := q.ProjectedColumns(); cols != nil {
+			return cols
+		}
 		return rel.ColumnNames()
 	}
 	if q.Kind == ir.Insert || q.Kind == ir.Upsert {
@@ -357,9 +552,11 @@ func returningCols(q *ir.Query, rel *schema.Relation) []string {
 	return nil
 }
 
-// drain reads every row of a returning cursor into memory, normalizing []byte to
-// string so text columns render as JSON strings.
+// drain reads every row of a returning cursor into memory, applying the same
+// type coercions as rowStream.Values: []byte→string, BOOLEAN int64→bool,
+// JSON string→json.RawMessage.
 func drain(rows *sql.Rows, ncols int) ([][]any, error) {
+	colTypes, _ := rows.ColumnTypes()
 	var out [][]any
 	for rows.Next() {
 		holders := make([]any, ncols)
@@ -372,7 +569,20 @@ func drain(rows *sql.Rows, ncols int) ([][]any, error) {
 		}
 		for i, v := range holders {
 			if bs, ok := v.([]byte); ok {
-				holders[i] = string(bs)
+				v = string(bs)
+				holders[i] = v
+			}
+			if colTypes != nil && i < len(colTypes) {
+				switch strings.ToUpper(colTypes[i].DatabaseTypeName()) {
+				case "BOOLEAN", "BOOL":
+					if n, ok := v.(int64); ok {
+						holders[i] = n != 0
+					}
+				case "JSON":
+					if str, ok := v.(string); ok && json.Valid([]byte(str)) {
+						holders[i] = json.RawMessage(str)
+					}
+				}
 			}
 		}
 		out = append(out, holders)

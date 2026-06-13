@@ -18,36 +18,188 @@ import (
 
 // CompileCall lowers a resolved RPC call to a parameterized statement. The
 // function's SQL is rendered with its :name placeholders bound to the arguments
-// (defaults filling omitted optional parameters); a table return additionally
-// wraps the result so post-filters compile around it.
-func CompileCall(d Dialect, c *ir.Call, fn *rpc.Function) (*Statement, *pgerr.APIError) {
+// (defaults filling omitted optional parameters); a placeholder that is not a
+// declared parameter binds a reserved request-context value from ctxArgs (see
+// ContextArgs); a table return additionally wraps the result so post-filters
+// compile around it.
+func CompileCall(d Dialect, c *ir.Call, fn *rpc.Function, ctxArgs map[string]any) (*Statement, *pgerr.APIError) {
+	if fn == nil {
+		return nil, pgerr.ErrInternal("CompileCall requires a registry function; native calls compile in the backend")
+	}
 	if fn.Query == nil || strings.TrimSpace(fn.Query.SQL) == "" {
 		return nil, pgerr.ErrUnsupported("this function realization", "sql")
 	}
 	b := newBuilder(d)
+	b.ctxArgs = ctxArgs
+
+	// A call with embeds projects the function's rows as a parent resource and
+	// nests each embedded relation, exactly as a table read does. The function
+	// result is the parent source; bindNamed runs inside the source writer so its
+	// placeholders bind after the projection's, keeping arguments in textual order.
+	if len(c.Embeds) > 0 {
+		return b.writeEmbeddedQuery(callQuery(c), func() *pgerr.APIError {
+			inner, err := b.bindNamed(fn, c.Args)
+			if err != nil {
+				return err
+			}
+			b.sb.WriteString("(")
+			b.sb.WriteString(inner)
+			b.sb.WriteString(")")
+			return nil
+		})
+	}
 
 	inner, err := b.bindNamed(fn, c.Args)
 	if err != nil {
 		return nil, err
 	}
 
-	// Only a table return can be projected, filtered, ordered, and paginated; a
-	// scalar or setof-scalar return is the function's value(s) verbatim.
-	if fn.Returns.Kind != rpc.ReturnTable || !callHasPostFilter(c) {
+	// A single scalar or a void return is the function's value verbatim, with no
+	// row window to slice. Anything else with no post-filter clause is also
+	// verbatim.
+	isTable := fn.Returns.Kind == rpc.ReturnTable
+	isSetof := isTable || fn.Returns.Kind == rpc.ReturnSetOf
+	if !isSetof || !callHasPostFilter(c) {
 		b.sb.WriteString(inner)
 		return &Statement{SQL: b.sb.String(), Args: b.args}, nil
 	}
 
+	// A setof return is wrapped so it can be paginated like a table read. A table
+	// return carries named columns, so it additionally supports projection,
+	// horizontal filters, and ordering; a setof-scalar has one anonymous column,
+	// so it takes only the limit/offset window.
 	const alias = "_rpc"
 	b.sb.WriteString("SELECT ")
-	if err := b.writeSelect(c.Select); err != nil {
-		return nil, err
+	if isTable {
+		if err := b.writeSelect(c.Select); err != nil {
+			return nil, err
+		}
+	} else {
+		b.sb.WriteString("*")
 	}
 	b.sb.WriteString(" FROM (")
 	b.sb.WriteString(inner)
 	b.sb.WriteString(") ")
 	b.sb.WriteString(alias)
 
+	if isTable && c.Where != nil {
+		b.sb.WriteString(" WHERE ")
+		if err := b.writeCond(*c.Where); err != nil {
+			return nil, err
+		}
+	}
+	hasOrder := isTable && len(c.Order) > 0
+	if hasOrder {
+		if err := b.writeOrder(c.Order); err != nil {
+			return nil, err
+		}
+	}
+	if clause := b.d.LimitOffset(c.Limit, c.Offset, hasOrder); clause != "" {
+		b.sb.WriteString(" ")
+		b.sb.WriteString(clause)
+	}
+	return &Statement{SQL: b.sb.String(), Args: b.args}, nil
+}
+
+// CompileNativeCallWrap wraps a backend-built function-call statement in the read
+// clauses a table-valued function result supports: vertical projection, horizontal
+// filters, ordering, and the limit/offset window, aliased as _rpc. A NativeRPC
+// backend (no portable function body, so CompileCall does not apply) renders the
+// inner `SELECT * FROM schema.fn(args)` itself and passes it here so a native call
+// shapes its result the same way the registry path does. With no post-filter
+// clause the inner statement is returned unchanged. The inner statement's bound
+// arguments are preserved and the wrapper's own filters bind after them, so
+// placeholder numbering stays consistent.
+func CompileNativeCallWrap(d Dialect, c *ir.Call, inner *Statement) (*Statement, *pgerr.APIError) {
+	if !callHasPostFilter(c) {
+		return inner, nil
+	}
+	b := newBuilder(d)
+	b.args = append(b.args, inner.Args...)
+
+	const alias = "_rpc"
+	b.sb.WriteString("SELECT ")
+	if len(c.Select) > 0 {
+		if err := b.writeSelect(c.Select); err != nil {
+			return nil, err
+		}
+	} else {
+		b.sb.WriteString("*")
+	}
+	b.sb.WriteString(" FROM (")
+	b.sb.WriteString(inner.SQL)
+	b.sb.WriteString(") ")
+	b.sb.WriteString(alias)
+
+	if c.Where != nil {
+		b.sb.WriteString(" WHERE ")
+		if err := b.writeCond(*c.Where); err != nil {
+			return nil, err
+		}
+	}
+	hasOrder := len(c.Order) > 0
+	if hasOrder {
+		if err := b.writeOrder(c.Order); err != nil {
+			return nil, err
+		}
+	}
+	if clause := b.d.LimitOffset(c.Limit, c.Offset, hasOrder); clause != "" {
+		b.sb.WriteString(" ")
+		b.sb.WriteString(clause)
+	}
+	return &Statement{SQL: b.sb.String(), Args: b.args}, nil
+}
+
+// CompileNativeCallCountWrap wraps a backend-built function-call statement in a
+// count over its rows with the horizontal filter applied, so a native call's
+// count=exact total matches the rows the post-filter returns. The select, order,
+// and window do not change the count. Like CompileNativeCallWrap it is for the
+// NativeRPC path where there is no portable body to drive CompileCallCount.
+func CompileNativeCallCountWrap(d Dialect, c *ir.Call, inner *Statement) (*Statement, *pgerr.APIError) {
+	b := newBuilder(d)
+	b.args = append(b.args, inner.Args...)
+	const alias = "_rpc"
+	b.sb.WriteString("SELECT count(*) FROM (")
+	b.sb.WriteString(inner.SQL)
+	b.sb.WriteString(") ")
+	b.sb.WriteString(alias)
+	if c.Where != nil {
+		b.sb.WriteString(" WHERE ")
+		if err := b.writeCond(*c.Where); err != nil {
+			return nil, err
+		}
+	}
+	return &Statement{SQL: b.sb.String(), Args: b.args}, nil
+}
+
+// CompileNativeCallCountedWrap wraps a backend-built function-call statement so the
+// row query carries the total alongside the page in a single execution. It is the
+// volatile path's count: a STABLE or IMMUTABLE function may be counted with a
+// separate statement (it has no side effects), but a VOLATILE function must run
+// exactly once, so count(*) OVER () rides the projection. The caller reads the
+// total off any returned row and drops the _pgrst_count column. The select,
+// filter, order, and window match CompileNativeCallWrap so the page is identical;
+// count(*) OVER () counts the full filtered set because it is evaluated before the
+// LIMIT. Unlike CompileNativeCallWrap it always wraps, since even a bare call needs
+// the extra column.
+func CompileNativeCallCountedWrap(d Dialect, c *ir.Call, inner *Statement) (*Statement, *pgerr.APIError) {
+	b := newBuilder(d)
+	b.args = append(b.args, inner.Args...)
+	const alias = "_rpc"
+	b.sb.WriteString("SELECT ")
+	if len(c.Select) > 0 {
+		if err := b.writeSelect(c.Select); err != nil {
+			return nil, err
+		}
+	} else {
+		b.sb.WriteString("*")
+	}
+	b.sb.WriteString(`, count(*) OVER () AS "`)
+	b.sb.WriteString(CountColName)
+	b.sb.WriteString(`" FROM (`)
+	b.sb.WriteString(inner.SQL)
+	b.sb.WriteString(") ")
+	b.sb.WriteString(alias)
 	if c.Where != nil {
 		b.sb.WriteString(" WHERE ")
 		if err := b.writeCond(*c.Where); err != nil {
@@ -73,18 +225,61 @@ func CompileCall(d Dialect, c *ir.Call, fn *rpc.Function) (*Statement, *pgerr.AP
 // read-only statement for a count=exact request, exactly as a table read's count
 // does. It is only valid for a read-only function; a volatile function must not
 // run twice.
-func CompileCallCount(d Dialect, c *ir.Call, fn *rpc.Function) (*Statement, *pgerr.APIError) {
+func CompileCallCount(d Dialect, c *ir.Call, fn *rpc.Function, ctxArgs map[string]any) (*Statement, *pgerr.APIError) {
+	if fn == nil {
+		// A native (non-registry) call has no portable body to count; the backend
+		// must build its own count wrapper. Returning an error rather than
+		// dereferencing a nil function keeps a misrouted native call from panicking.
+		return nil, pgerr.ErrInternal("CompileCallCount requires a registry function; native calls count in the backend")
+	}
 	if fn.Query == nil || strings.TrimSpace(fn.Query.SQL) == "" {
 		return nil, pgerr.ErrUnsupported("this function realization", "sql")
 	}
 	b := newBuilder(d)
+	b.ctxArgs = ctxArgs
 	inner, err := b.bindNamed(fn, c.Args)
 	if err != nil {
 		return nil, err
 	}
+	const alias = "_rpc"
 	b.sb.WriteString("SELECT count(*) FROM (")
 	b.sb.WriteString(inner)
-	b.sb.WriteString(") _rpc")
+	b.sb.WriteString(") ")
+	b.sb.WriteString(alias)
+
+	// A count over an embedded call carries the same parent restriction the row
+	// query does: the post-filter WHERE plus one EXISTS per !inner embed, so the
+	// reported total matches the rows returned.
+	if len(c.Embeds) > 0 {
+		b.qual = alias
+		b.parentRef = alias
+		b.embeds = c.Embeds
+		wrote := false
+		if c.Where != nil {
+			b.sb.WriteString(" WHERE ")
+			if err := b.writeCond(*c.Where); err != nil {
+				return nil, err
+			}
+			wrote = true
+		}
+		for i := range c.Embeds {
+			emb := &c.Embeds[i]
+			if emb.Join != ir.JoinInner {
+				continue
+			}
+			if wrote {
+				b.sb.WriteString(" AND ")
+			} else {
+				b.sb.WriteString(" WHERE ")
+				wrote = true
+			}
+			if err := b.writeEmbedExists(emb, alias); err != nil {
+				return nil, err
+			}
+		}
+		return &Statement{SQL: b.sb.String(), Args: b.args}, nil
+	}
+
 	if fn.Returns.Kind == rpc.ReturnTable && c.Where != nil {
 		b.sb.WriteString(" WHERE ")
 		if err := b.writeCond(*c.Where); err != nil {
@@ -92,6 +287,23 @@ func CompileCallCount(d Dialect, c *ir.Call, fn *rpc.Function) (*Statement, *pge
 		}
 	}
 	return &Statement{SQL: b.sb.String(), Args: b.args}, nil
+}
+
+// callQuery projects an RPC call's read shape onto an ir.Query so the embedded
+// read writer (shared with table reads) drives the parent projection, filters,
+// ordering, and window. The relation is the function's resolved result relation,
+// already bound onto each embed by the planner; the embedded writer reads the
+// embeds, not q.Relation, so a bare Ref naming the result relation is enough.
+func callQuery(c *ir.Call) *ir.Query {
+	return &ir.Query{
+		Kind:   ir.Read,
+		Select: c.Select,
+		Where:  c.Where,
+		Order:  c.Order,
+		Limit:  c.Limit,
+		Offset: c.Offset,
+		Embeds: c.Embeds,
+	}
 }
 
 // callHasPostFilter reports whether a call carries any clause that wraps the
@@ -142,17 +354,33 @@ func (b *builder) bindNamed(fn *rpc.Function, args map[string]ir.Value) (string,
 func (b *builder) argValue(fn *rpc.Function, name string, args map[string]ir.Value) (string, *pgerr.APIError) {
 	p, ok := fn.Param(name)
 	if !ok {
+		// Not a declared parameter: a reserved request-context placeholder
+		// binds the frontend-built value (spec 15: the emulated engines bind
+		// context, they never read a session store). A declared parameter of
+		// the same name takes this path only when undeclared, so it cannot be
+		// shadowed away by a caller.
+		if v, isCtx := b.ctxArgs[name]; isCtx {
+			return b.bind(v), nil
+		}
 		return "", pgerr.ErrInternal("rpc body references undeclared parameter :" + name)
 	}
 	if v, ok := args[name]; ok {
-		return b.bind(callArg(v)), nil
+		if p.Variadic {
+			return b.bindVariadic(v), nil
+		}
+		return b.bind(callArg(b.d, v)), nil
+	}
+	if p.Variadic {
+		// A variadic call with no trailing arguments expands to nothing, so a body
+		// spelling the placeholder inside a call list (f(:nums)) becomes f().
+		return "", nil
 	}
 	if p.Optional {
 		return b.bind(p.Default), nil
 	}
 	// A required parameter with no argument cannot happen: Lookup only returns an
 	// overload whose required parameters are all present. Guard anyway.
-	return "", pgerr.ErrNoFunction(fn.Name)
+	return "", pgerr.ErrInternal("rpc call is missing required parameter :" + name)
 }
 
 // singleObjectArgs implements the single-unnamed-argument form: a function whose
@@ -178,14 +406,54 @@ func singleObjectArgs(fn *rpc.Function, args map[string]ir.Value) map[string]ir.
 
 // callArg converts an argument value to a driver argument. A POST argument has a
 // decoded JSON value (numbers preserved, objects/arrays re-encoded to text); a
-// GET argument is the raw query-string text. Type coercion to the declared
-// parameter type lands with the types subsystem (spec 16).
-func callArg(v ir.Value) any {
+// GET argument is the raw query-string text, bound verbatim. An empty query value
+// is an empty string, not NULL: PostgREST passes "" to the parameter, and a NULL
+// is expressed only by omitting the argument (which binds the parameter default).
+func callArg(d Dialect, v ir.Value) any {
 	if v.JSON != nil {
-		return writeArg(v)
+		return writeArg(d, v, "")
+	}
+	return v.Text
+}
+
+// bindVariadic expands a variadic argument into a comma-separated list of bound
+// placeholders, one per collected element, so a body spelling the placeholder
+// inside a call list or an IN (:name) clause receives every value. A GET call
+// arrives as a text list; a POST call arrives as a decoded JSON array (a lone
+// scalar is treated as a one-element list). An empty list binds nothing.
+func (b *builder) bindVariadic(v ir.Value) string {
+	elems := variadicElems(b.d, v)
+	parts := make([]string, len(elems))
+	for i, e := range elems {
+		parts[i] = b.bind(e)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// variadicElems flattens a variadic argument value into its driver elements. A
+// GET text list maps each item verbatim; a POST JSON array maps each element
+// through the write-value path (numbers preserved, nested documents re-encoded);
+// any other single value is a one-element list.
+func variadicElems(d Dialect, v ir.Value) []any {
+	if v.List != nil {
+		out := make([]any, len(v.List))
+		for i, s := range v.List {
+			out[i] = s
+		}
+		return out
+	}
+	if arr, ok := v.JSON.([]any); ok {
+		out := make([]any, len(arr))
+		for i, e := range arr {
+			out[i] = writeArg(d, ir.Value{JSON: e}, "")
+		}
+		return out
+	}
+	if v.JSON != nil {
+		return []any{writeArg(d, v, "")}
 	}
 	if v.Text != "" {
-		return v.Text
+		return []any{v.Text}
 	}
 	return nil
 }

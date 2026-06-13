@@ -51,9 +51,10 @@ func embedModel() *schema.Model {
 	}
 	actors := &schema.Relation{Schema: "public", Name: "actors", Columns: cols("id", "name")}
 	roles := &schema.Relation{
-		Schema:  "public",
-		Name:    "roles",
-		Columns: cols("film_id", "actor_id"),
+		Schema:     "public",
+		Name:       "roles",
+		Columns:    cols("film_id", "actor_id"),
+		PrimaryKey: []string{"film_id", "actor_id"}, // composite PK marks roles a junction
 		ForeignKeys: []*schema.ForeignKey{
 			{Name: "roles_film_id_fkey", Columns: []string{"film_id"}, RefSchema: "public", RefRelation: "films", RefColumns: []string{"id"}},
 			{Name: "roles_actor_id_fkey", Columns: []string{"actor_id"}, RefSchema: "public", RefRelation: "actors", RefColumns: []string{"id"}},
@@ -196,6 +197,153 @@ func TestEmbedInnerAddsExists(t *testing.T) {
 	}
 }
 
+// films?actors=not.is.null filters the parent on the existence of a related
+// actor: a semi-join, the same EXISTS an !inner embed adds, correlated to t0
+// and crossing the roles junction (item 01.12).
+func TestEmbedPredicateNotIsNullSemiJoin(t *testing.T) {
+	m := embedModel()
+	where := ir.Cond(ir.EmbedPredicate{Index: 0, Exists: true})
+	q := &ir.Query{
+		Relation: ir.Ref{Schema: "public", Name: "films"},
+		Select:   []ir.SelectItem{ir.Column{Path: []string{"title"}}, ir.EmbedRef{Index: 0}},
+		Where:    &where,
+		Embeds: []ir.Embed{{
+			OutKey: "actors",
+			Target: ir.Ref{Schema: "public", Name: "actors"},
+			Rel:    relate(t, m, "films", "actors"),
+		}},
+	}
+	got := compileEmbed(t, q).SQL
+	if strings.Contains(got, "NOT EXISTS") {
+		t.Errorf("not.is.null should be a plain EXISTS, not anti-join\n in %q", got)
+	}
+	for _, want := range []string{
+		`WHERE EXISTS (SELECT 1 FROM "public"."actors" x2`,
+		`JOIN "public"."roles" xj2 ON xj2."actor_id" = x2."id"`,
+		`WHERE xj2."film_id" = t0."id"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("semi-join missing %q\n in %q", want, got)
+		}
+	}
+}
+
+// films?actors=is.null is the anti-join complement: a parent with no related
+// actor, lowered to NOT EXISTS over the same relationship (item 01.12).
+func TestEmbedPredicateIsNullAntiJoin(t *testing.T) {
+	m := embedModel()
+	where := ir.Cond(ir.EmbedPredicate{Index: 0, Exists: false})
+	q := &ir.Query{
+		Relation: ir.Ref{Schema: "public", Name: "directors"},
+		Select:   []ir.SelectItem{ir.Column{Path: []string{"name"}}, ir.EmbedRef{Index: 0}},
+		Where:    &where,
+		Embeds: []ir.Embed{{
+			OutKey: "films",
+			Target: ir.Ref{Schema: "public", Name: "films"},
+			Rel:    relate(t, m, "directors", "films"),
+		}},
+	}
+	got := compileEmbed(t, q).SQL
+	if !strings.Contains(got, `WHERE NOT EXISTS (SELECT 1 FROM "public"."films" x2 WHERE x2."director_id" = t0."id")`) {
+		t.Errorf("is.null missing NOT EXISTS anti-join\n in %q", got)
+	}
+}
+
+// The embed-existence predicate composes under or=(...): one disjunct is the
+// semi-join EXISTS, the other an ordinary parent-column compare.
+func TestEmbedPredicateInsideOr(t *testing.T) {
+	m := embedModel()
+	where := ir.Cond(ir.Or{Kids: []ir.Cond{
+		ir.EmbedPredicate{Index: 0, Exists: true},
+		ir.Compare{Path: []string{"name"}, Op: ir.OpEq, Value: ir.Value{Text: "Lynch"}},
+	}})
+	q := &ir.Query{
+		Relation: ir.Ref{Schema: "public", Name: "directors"},
+		Select:   []ir.SelectItem{ir.Column{Path: []string{"name"}}, ir.EmbedRef{Index: 0}},
+		Where:    &where,
+		Embeds: []ir.Embed{{
+			OutKey: "films",
+			Target: ir.Ref{Schema: "public", Name: "films"},
+			Rel:    relate(t, m, "directors", "films"),
+		}},
+	}
+	got := compileEmbed(t, q).SQL
+	if !strings.Contains(got, `WHERE (EXISTS (SELECT 1 FROM "public"."films" x2 WHERE x2."director_id" = t0."id") OR t0."name" = $1)`) {
+		t.Errorf("or= with embed predicate not lowered as expected\n in %q", got)
+	}
+}
+
+// A count over a query carrying an embed-existence filter correlates the EXISTS
+// to the parent by its bare table name, since the count gives it no alias.
+func TestEmbedPredicateInCount(t *testing.T) {
+	m := embedModel()
+	where := ir.Cond(ir.EmbedPredicate{Index: 0, Exists: true})
+	q := &ir.Query{
+		Relation: ir.Ref{Schema: "public", Name: "directors"},
+		Where:    &where,
+		Embeds: []ir.Embed{{
+			OutKey: "films",
+			Target: ir.Ref{Schema: "public", Name: "films"},
+			Rel:    relate(t, m, "directors", "films"),
+		}},
+	}
+	st, err := CompileCount(embedStub{}, q)
+	if err != nil {
+		t.Fatalf("CompileCount: %v", err)
+	}
+	if !strings.Contains(st.SQL, `SELECT count(*) FROM "public"."directors" WHERE EXISTS (SELECT 1 FROM "public"."films" x1 WHERE x1."director_id" = "public"."directors"."id")`) {
+		t.Errorf("count did not correlate embed EXISTS to the bare table\n in %q", st.SQL)
+	}
+}
+
+// A count over a query carrying an !inner embed restricts the parent with the
+// same EXISTS the row query adds, so an exact count matches the filtered body
+// (item 07.7). The EXISTS correlates to the bare table name, since the count
+// gives the parent no alias.
+func TestCountAppliesInnerEmbedExists(t *testing.T) {
+	m := embedModel()
+	q := &ir.Query{
+		Relation: ir.Ref{Schema: "public", Name: "directors"},
+		Embeds: []ir.Embed{{
+			OutKey: "films",
+			Join:   ir.JoinInner,
+			Target: ir.Ref{Schema: "public", Name: "films"},
+			Rel:    relate(t, m, "directors", "films"),
+		}},
+	}
+	st, err := CompileCount(embedStub{}, q)
+	if err != nil {
+		t.Fatalf("CompileCount: %v", err)
+	}
+	want := `SELECT count(*) FROM "public"."directors" ` +
+		`WHERE EXISTS (SELECT 1 FROM "public"."films" x1 ` +
+		`WHERE x1."director_id" = "public"."directors"."id")`
+	if st.SQL != want {
+		t.Errorf("\n got %q\nwant %q", st.SQL, want)
+	}
+}
+
+// A non-inner embed leaves the count unrestricted: only !inner embeds prune the
+// parent, so a plain to-many embed adds no EXISTS to the count.
+func TestCountIgnoresNonInnerEmbed(t *testing.T) {
+	m := embedModel()
+	q := &ir.Query{
+		Relation: ir.Ref{Schema: "public", Name: "directors"},
+		Embeds: []ir.Embed{{
+			OutKey: "films",
+			Target: ir.Ref{Schema: "public", Name: "films"},
+			Rel:    relate(t, m, "directors", "films"),
+		}},
+	}
+	st, err := CompileCount(embedStub{}, q)
+	if err != nil {
+		t.Fatalf("CompileCount: %v", err)
+	}
+	if strings.Contains(st.SQL, "WHERE") {
+		t.Errorf("non-inner embed should add no predicate, got %q", st.SQL)
+	}
+}
+
 // An embed's own horizontal filter is ANDed onto the join predicate, bound, and
 // qualified by the target alias.
 func TestEmbedHorizontalFilterIsBound(t *testing.T) {
@@ -239,22 +387,158 @@ func TestEmbedStarProjectsAllColumns(t *testing.T) {
 	}
 }
 
+// An empty-parenthesis embed, director(), joins for filtering but is not
+// projected: the parent select carries no key for it, the opposite of an absent
+// or star projection which takes every column (item 07.8).
+func TestEmbedEmptySelectHidesKey(t *testing.T) {
+	m := embedModel()
+	q := &ir.Query{
+		Relation: ir.Ref{Schema: "public", Name: "films"},
+		Select: []ir.SelectItem{
+			ir.Column{Path: []string{"title"}},
+			ir.EmbedRef{Index: 0},
+		},
+		Embeds: []ir.Embed{{
+			OutKey:      "director",
+			EmptySelect: true,
+			Target:      ir.Ref{Schema: "public", Name: "directors"},
+			Rel:         relate(t, m, "films", "directors"),
+		}},
+	}
+	got := compileEmbed(t, q).SQL
+	if strings.Contains(got, `"director"`) {
+		t.Errorf("empty-paren embed should project no key, got %q", got)
+	}
+	if !strings.HasPrefix(got, `SELECT t0."title" FROM`) {
+		t.Errorf("parent should project only its own columns, got %q", got)
+	}
+}
+
+// An empty-parenthesis embed marked !inner still restricts the parent through
+// EXISTS even though it projects nothing: the filter-without-fetch idiom.
+func TestEmbedEmptySelectInnerStillFilters(t *testing.T) {
+	m := embedModel()
+	q := &ir.Query{
+		Relation: ir.Ref{Schema: "public", Name: "films"},
+		Select: []ir.SelectItem{
+			ir.Column{Path: []string{"title"}},
+			ir.EmbedRef{Index: 0},
+		},
+		Embeds: []ir.Embed{{
+			OutKey:      "director",
+			EmptySelect: true,
+			Join:        ir.JoinInner,
+			Target:      ir.Ref{Schema: "public", Name: "directors"},
+			Rel:         relate(t, m, "films", "directors"),
+		}},
+	}
+	got := compileEmbed(t, q).SQL
+	if strings.Contains(got, `"director"`) {
+		t.Errorf("empty-paren embed should project no key, got %q", got)
+	}
+	if !strings.Contains(got, `WHERE EXISTS (SELECT 1 FROM "public"."directors"`) {
+		t.Errorf("!inner empty-paren embed should still filter the parent, got %q", got)
+	}
+}
+
 // A spread embed is not yet lowered to SQL; it must report PGRST127 rather than
-// emit something wrong.
-func TestEmbedSpreadUnsupported(t *testing.T) {
+// A to-one spread (...director(name)) lifts the embedded column into the parent
+// row as a correlated scalar subquery aliased to the column name, not nested
+// under a relation key (item 07.9).
+func TestEmbedSpreadToOneLiftsColumns(t *testing.T) {
+	m := embedModel()
+	q := &ir.Query{
+		Relation: ir.Ref{Schema: "public", Name: "films"},
+		Select: []ir.SelectItem{
+			ir.Column{Path: []string{"title"}},
+			ir.EmbedRef{Index: 0},
+		},
+		Embeds: []ir.Embed{{
+			OutKey: "directors",
+			Spread: true,
+			Target: ir.Ref{Schema: "public", Name: "directors"},
+			Rel:    relate(t, m, "films", "directors"),
+			Query:  ir.Query{Select: []ir.SelectItem{ir.Column{Path: []string{"name"}}}},
+		}},
+	}
+	want := `SELECT t0."title", (SELECT t1."name" FROM "public"."directors" t1 ` +
+		`WHERE t1."id" = t0."director_id" LIMIT 1) AS "name" FROM "public"."films" t0`
+	if got := compileEmbed(t, q).SQL; got != want {
+		t.Errorf("\n got %q\nwant %q", got, want)
+	}
+}
+
+// A spread renames the lifted column when written col:alias, and the subquery is
+// aliased to the new name.
+func TestEmbedSpreadRenamesColumn(t *testing.T) {
+	m := embedModel()
+	q := &ir.Query{
+		Relation: ir.Ref{Schema: "public", Name: "films"},
+		Select: []ir.SelectItem{
+			ir.Column{Path: []string{"title"}},
+			ir.EmbedRef{Index: 0},
+		},
+		Embeds: []ir.Embed{{
+			OutKey: "directors",
+			Spread: true,
+			Target: ir.Ref{Schema: "public", Name: "directors"},
+			Rel:    relate(t, m, "films", "directors"),
+			Query:  ir.Query{Select: []ir.SelectItem{ir.Column{Path: []string{"name"}, Alias: "director_name"}}},
+		}},
+	}
+	if got := compileEmbed(t, q).SQL; !strings.Contains(got, `LIMIT 1) AS "director_name"`) {
+		t.Errorf("spread rename not applied, got %q", got)
+	}
+}
+
+// A to-many spread (...films(title)) lifts each column as a JSON array of that
+// column's values across the related rows, COALESCEd to [] for a parent with no
+// children (v12.1 semantics).
+func TestEmbedSpreadToManyLiftsArrays(t *testing.T) {
+	m := embedModel()
+	q := &ir.Query{
+		Relation: ir.Ref{Schema: "public", Name: "directors"},
+		Select: []ir.SelectItem{
+			ir.Column{Path: []string{"name"}},
+			ir.EmbedRef{Index: 0},
+		},
+		Embeds: []ir.Embed{{
+			OutKey: "films",
+			Spread: true,
+			Target: ir.Ref{Schema: "public", Name: "films"},
+			Rel:    relate(t, m, "directors", "films"),
+			Query:  ir.Query{Select: []ir.SelectItem{ir.Column{Path: []string{"title"}}}},
+		}},
+	}
+	got := compileEmbed(t, q).SQL
+	for _, want := range []string{
+		`json_group_array(t1."title")`,
+		`FROM "public"."films" t1 WHERE t1."director_id" = t0."id"`,
+		`) AS "title"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("to-many spread missing %q\n in %q", want, got)
+		}
+	}
+}
+
+// A spread over a many-to-many relationship is not lowered: it reports PGRST127
+// rather than emit wrong SQL.
+func TestEmbedSpreadManyToManyUnsupported(t *testing.T) {
 	m := embedModel()
 	q := &ir.Query{
 		Relation: ir.Ref{Schema: "public", Name: "films"},
 		Select:   []ir.SelectItem{ir.EmbedRef{Index: 0}},
 		Embeds: []ir.Embed{{
-			OutKey: "director",
+			OutKey: "actors",
 			Spread: true,
-			Target: ir.Ref{Schema: "public", Name: "directors"},
-			Rel:    relate(t, m, "films", "directors"),
+			Target: ir.Ref{Schema: "public", Name: "actors"},
+			Rel:    relate(t, m, "films", "actors"),
+			Query:  ir.Query{Select: []ir.SelectItem{ir.Column{Path: []string{"name"}}}},
 		}},
 	}
 	if _, err := CompileRead(embedStub{}, q); err == nil || err.Code != "PGRST127" {
-		t.Fatalf("spread embed err = %v, want PGRST127", err)
+		t.Fatalf("many-to-many spread err = %v, want PGRST127", err)
 	}
 }
 

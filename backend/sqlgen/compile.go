@@ -9,6 +9,7 @@ import (
 
 	"github.com/tamnd/dbrest/ir"
 	"github.com/tamnd/dbrest/pgerr"
+	"github.com/tamnd/dbrest/pgtypes"
 )
 
 // CountColName is the synthetic column appended by CompileReadCounted to carry
@@ -36,6 +37,35 @@ type builder struct {
 	args   []any
 	qual   string
 	aliasN int
+	// parentRef is how an EmbedPredicate's EXISTS/NOT EXISTS correlates back to the
+	// outer row: the parent alias (t0) in an embedded read, or the qualified table
+	// name in a count where the parent has no alias. embeds is the parent query's
+	// embed list an EmbedPredicate indexes into.
+	parentRef string
+	embeds    []ir.Embed
+	// groupBy collects the non-aggregate projected column expressions while the
+	// select list is written; when the projection also carries an aggregate, these
+	// become the GROUP BY so the aggregate folds per distinct value. hasAgg records
+	// whether any aggregate was seen.
+	groupBy []string
+	hasAgg  bool
+	// ctxArgs are the reserved :request_* values an RPC body may bind when a
+	// placeholder is not a declared parameter; see ContextArgs.
+	ctxArgs map[string]any
+	// computed maps the current relation's computed-field names to the schema of
+	// the function backing each, so colRef can render a computed field as a function
+	// call on the row instead of a bare column. It is swapped alongside qual when
+	// descending into an embed, since each relation has its own computed fields.
+	// rootRow is the row reference passed to a computed-field function when no alias
+	// is in force (qual is empty): the unqualified base-relation name, which names
+	// the row of the single FROM relation. See spec 11 (computed fields).
+	computed map[string]string
+	rootRow  string
+	// reps maps the current relation's column names to their data-representation
+	// cast functions (spec 11), swapped alongside computed when descending into an
+	// embed. A column with one reformats on the wire: ToJSON on read, FromJSON on a
+	// write value, FromText on a filter literal.
+	reps map[string]ir.Rep
 }
 
 // newBuilder starts a builder with an empty output buffer.
@@ -66,10 +96,83 @@ func (b *builder) bind(v any) string {
 // colRef renders a column reference, qualified by the current table alias when
 // one is set (inside an embed subquery) and bare otherwise.
 func (b *builder) colRef(name string) string {
+	if sch, ok := b.computed[name]; ok {
+		// A computed field renders as schema.func(row): the row is the current alias
+		// inside an embed, or the bare relation name at the top level (qual empty).
+		rowArg := b.qual
+		if rowArg == "" {
+			rowArg = b.rootRow
+		}
+		return b.d.QuoteIdent(sch) + "." + b.d.QuoteIdent(name) + "(" + rowArg + ")"
+	}
 	if b.qual == "" {
 		return b.d.QuoteIdent(name)
 	}
 	return b.qual + "." + b.d.QuoteIdent(name)
+}
+
+// useRelation points the builder's computed-field and data-representation
+// rendering at one relation: the name-to-schema map for its computed fields, the
+// column-to-cast map for its representations, and the unqualified name to pass as
+// the row argument when no alias is in force. It returns the previous trio so a
+// caller descending into an embed can restore the parent's on the way out.
+func (b *builder) useRelation(q *ir.Query, relName string) (map[string]string, map[string]ir.Rep, string) {
+	savedC, savedReps, savedR := b.computed, b.reps, b.rootRow
+	b.computed = q.Computed
+	b.reps = q.Reps
+	b.rootRow = b.d.QuoteIdent(relName)
+	return savedC, savedReps, savedR
+}
+
+// repCall renders a representation cast-function call: schema.func(arg). It is how
+// a domain's to-json/from-text/from-json cast is applied, since PostgreSQL ignores
+// the cast in the `::` operator and only the function does the reformatting.
+func (b *builder) repCall(funcSchema, funcName, arg string) string {
+	return b.d.QuoteIdent(funcSchema) + "." + b.d.QuoteIdent(funcName) + "(" + arg + ")"
+}
+
+// fromTextValue binds a filter operand, parsing it through the column's from-text
+// data representation when one is present (spec 11). It mirrors PostgREST's
+// pgFmtUnknownLiteralForField: the domain's text cast wraps the operand for every
+// operator that compares against a typed value (eq, neq, the orderings, regex
+// match, the array/range operators, and each IN element). The placeholder is
+// typed text so the schema-qualified cast function resolves as a call rather than
+// as the domain's own input syntax. PostgREST skips the parse for like/ilike (the
+// operand is a wildcard pattern), full-text search, and is, so those callers bind
+// the literal directly instead of going through here. A JSON-path operand is
+// never a represented column, and a column with no from-text cast binds the
+// literal unchanged.
+func (b *builder) fromTextValue(colName string, isJSON bool, raw string) string {
+	ph := b.bind(raw)
+	if isJSON {
+		return ph
+	}
+	if rep, ok := b.reps[colName]; ok && rep.FromTextFunc != "" {
+		return b.repCall(rep.FromTextSchema, rep.FromTextFunc, ph+"::text")
+	}
+	return ph
+}
+
+// filterValue binds a comparison literal through the column's from-text data
+// representation, the common path for eq/neq and the orderings.
+func (b *builder) filterValue(c ir.Compare) string {
+	return b.fromTextValue(c.Path[0], len(c.Path) > 1, c.Value.Text)
+}
+
+// writeValue binds an insert/update value, parsing it through the column's
+// from-json data representation when one is present (spec 11): the body value is
+// bound as json text and passed to the domain's json cast, the same parse
+// PostgREST applies to a write. A column with no from-json cast binds the coerced
+// value through writeArg as usual.
+func (b *builder) writeValue(col string, v ir.Value, colType string) string {
+	if rep, ok := b.reps[col]; ok && rep.FromJSONFunc != "" {
+		js, err := json.Marshal(v.JSON)
+		if err != nil {
+			js = []byte("null")
+		}
+		return b.repCall(rep.FromJSONSchema, rep.FromJSONFunc, b.bind(string(js))+"::json")
+	}
+	return b.bind(writeArg(b.d, v, colType))
 }
 
 // CompileRead lowers a resolved read query to a row-returning SELECT. The result
@@ -104,6 +207,7 @@ func CompileReadCounted(d Dialect, q *ir.Query) (*Statement, *pgerr.APIError) {
 // can extract the total alongside the result rows.
 func compileReadPlain(d Dialect, q *ir.Query, withCount bool) (*Statement, *pgerr.APIError) {
 	b := newBuilder(d)
+	b.useRelation(q, q.Relation.Name)
 	b.sb.WriteString("SELECT ")
 
 	if err := b.writeSelect(q.Select); err != nil {
@@ -124,6 +228,14 @@ func compileReadPlain(d Dialect, q *ir.Query, withCount bool) (*Statement, *pger
 		if err := b.writeCond(*q.Where); err != nil {
 			return nil, err
 		}
+	}
+
+	// An aggregate folds over the rest of the projection: the plain columns become
+	// the GROUP BY keys. With only aggregates and no plain column, the whole
+	// relation is one group and no GROUP BY is emitted.
+	if b.hasAgg && len(b.groupBy) > 0 {
+		b.sb.WriteString(" GROUP BY ")
+		b.sb.WriteString(strings.Join(b.groupBy, ", "))
 	}
 
 	hasOrder := len(q.Order) > 0
@@ -148,14 +260,68 @@ func compileReadPlain(d Dialect, q *ir.Query, withCount bool) (*Statement, *pger
 func CompileCount(d Dialect, q *ir.Query) (*Statement, *pgerr.APIError) {
 	b := newBuilder(d)
 	b.sb.WriteString("SELECT count(*) FROM ")
-	b.sb.WriteString(b.qualify(q.Relation))
+	if err := b.writeCountFromAndPredicates(q); err != nil {
+		return nil, err
+	}
+	return &Statement{SQL: b.sb.String(), Args: b.args}, nil
+}
+
+// CompileRowEstimateSource lowers a read query to a row-producing SELECT over the
+// same relation and predicates the count covers, with no aggregate. A backend
+// that estimates a count (count=planned / count=estimated) EXPLAINs this query
+// and reads the planner's row estimate off the root node; the count(*) wrapper
+// would instead estimate the aggregate's single output row. The empty target
+// list (SELECT FROM) keeps it estimate-only: it is never fetched (item 07.7).
+func CompileRowEstimateSource(d Dialect, q *ir.Query) (*Statement, *pgerr.APIError) {
+	b := newBuilder(d)
+	b.sb.WriteString("SELECT FROM ")
+	if err := b.writeCountFromAndPredicates(q); err != nil {
+		return nil, err
+	}
+	return &Statement{SQL: b.sb.String(), Args: b.args}, nil
+}
+
+// writeCountFromAndPredicates emits the parent relation and the predicates a
+// count ranges over: the horizontal WHERE and an EXISTS per !inner embed, the
+// same set the windowed read applies so an exact count matches its body. The
+// caller has already written the SELECT list up to FROM.
+func (b *builder) writeCountFromAndPredicates(q *ir.Query) *pgerr.APIError {
+	b.useRelation(q, q.Relation.Name)
+	parent := b.qualify(q.Relation)
+	b.sb.WriteString(parent)
+
+	// An embed-existence filter and an !inner embed's EXISTS both correlate to the
+	// parent by its bare table name here, since a count gives the parent no alias.
+	b.parentRef = parent
+	b.embeds = q.Embeds
+
+	wrote := false
 	if q.Where != nil {
 		b.sb.WriteString(" WHERE ")
 		if err := b.writeCond(*q.Where); err != nil {
-			return nil, err
+			return err
+		}
+		wrote = true
+	}
+	// The row query restricts the parent with an EXISTS per !inner embed
+	// (compileReadEmbedded), so the count must carry the same predicates or
+	// Content-Range disagrees with the body it accompanies.
+	for i := range q.Embeds {
+		emb := &q.Embeds[i]
+		if emb.Join != ir.JoinInner {
+			continue
+		}
+		if wrote {
+			b.sb.WriteString(" AND ")
+		} else {
+			b.sb.WriteString(" WHERE ")
+			wrote = true
+		}
+		if err := b.writeEmbedExists(emb, parent); err != nil {
+			return err
 		}
 	}
-	return &Statement{SQL: b.sb.String(), Args: b.args}, nil
+	return nil
 }
 
 // CompileInsert lowers an insert (or upsert) to a parameterized INSERT. Every
@@ -170,6 +336,7 @@ func CompileInsert(d Dialect, q *ir.Query, returning []string) (*Statement, *pge
 		return nil, pgerr.ErrParse("insert payload is empty")
 	}
 	b := newBuilder(d)
+	b.useRelation(q, q.Relation.Name)
 	b.sb.WriteString("INSERT INTO ")
 	b.sb.WriteString(b.qualify(q.Relation))
 
@@ -195,7 +362,7 @@ func CompileInsert(d Dialect, q *ir.Query, returning []string) (*Statement, *pge
 					b.sb.WriteString(", ")
 				}
 				if val, ok := row[c]; ok {
-					b.sb.WriteString(b.bind(writeArg(val)))
+					b.sb.WriteString(b.writeValue(c, val, w.ColumnTypes[c]))
 				} else if w.Missing == ir.MissingNull {
 					b.sb.WriteString(b.bind(nil))
 				} else {
@@ -206,7 +373,12 @@ func CompileInsert(d Dialect, q *ir.Query, returning []string) (*Statement, *pge
 		}
 	}
 
-	if w.Conflict != nil {
+	// An upsert with no resolvable conflict target (a table or view without a
+	// primary key, no on_conflict given) has nothing to merge or ignore on, so it
+	// degrades to a plain INSERT, the same as PostgREST: a merge or ignore POST to
+	// a key-less table inserts the rows and returns 201. Emitting ON CONFLICT here
+	// would produce invalid SQL ("ON CONFLICT DO UPDATE requires inference").
+	if w.Conflict != nil && len(w.Conflict.Target) > 0 {
 		if err := b.writeConflict(w); err != nil {
 			return nil, err
 		}
@@ -226,6 +398,7 @@ func CompileUpdate(d Dialect, q *ir.Query, returning []string) (*Statement, *pge
 		return nil, pgerr.ErrParse("update payload is empty")
 	}
 	b := newBuilder(d)
+	b.useRelation(q, q.Relation.Name)
 	b.sb.WriteString("UPDATE ")
 	b.sb.WriteString(b.qualify(q.Relation))
 	b.sb.WriteString(" SET ")
@@ -236,7 +409,7 @@ func CompileUpdate(d Dialect, q *ir.Query, returning []string) (*Statement, *pge
 		}
 		b.sb.WriteString(d.QuoteIdent(c))
 		b.sb.WriteString(" = ")
-		b.sb.WriteString(b.bind(writeArg(w.Set[c])))
+		b.sb.WriteString(b.writeValue(c, w.Set[c], w.ColumnTypes[c]))
 	}
 	if q.Where != nil {
 		b.sb.WriteString(" WHERE ")
@@ -254,6 +427,7 @@ func CompileUpdate(d Dialect, q *ir.Query, returning []string) (*Statement, *pge
 // update, a delete without a filter removes every row.
 func CompileDelete(d Dialect, q *ir.Query, returning []string) (*Statement, *pgerr.APIError) {
 	b := newBuilder(d)
+	b.useRelation(q, q.Relation.Name)
 	b.sb.WriteString("DELETE FROM ")
 	b.sb.WriteString(b.qualify(q.Relation))
 	if q.Where != nil {
@@ -301,6 +475,15 @@ func (b *builder) writeReturning(cols []string) *pgerr.APIError {
 	}
 	quoted := make([]string, len(cols))
 	for i, c := range cols {
+		// A data-representation column reads back through its to-json cast, the same
+		// formatting a read applies, so return=representation carries what a later GET
+		// would return (spec 11). The cast function would otherwise name the output
+		// column after itself, so alias it back to the column name.
+		if rep, ok := b.reps[c]; ok && rep.ToJSONFunc != "" {
+			id := b.d.QuoteIdent(c)
+			quoted[i] = b.repCall(rep.ToJSONSchema, rep.ToJSONFunc, id) + " AS " + id
+			continue
+		}
 		quoted[i] = b.d.QuoteIdent(c)
 	}
 	clause, ok := b.d.Returning(quoted)
@@ -313,14 +496,18 @@ func (b *builder) writeReturning(cols []string) *pgerr.APIError {
 }
 
 // WriteArg converts a decoded JSON payload value to a driver argument. Numbers
-// arrive as json.Number (the decoder preserves integer precision); objects and
-// arrays are re-encoded to their JSON text so they land in a json/text column.
-// It is exported for backends (e.g. the COPY path) that need the same coercion
-// without going through the SQL builder.
-func WriteArg(v ir.Value) any { return writeArg(v) }
+// arrive as json.Number (the decoder preserves integer precision); objects are
+// re-encoded to their JSON text so they land in a json/text column; arrays go
+// through the dialect, which knows whether the engine wants a PostgreSQL
+// {a,b} array literal or JSON text. It is exported for backends (e.g. the
+// MERGE path) that need the same coercion without going through the SQL
+// builder.
+func WriteArg(d Dialect, v ir.Value, colType string) any { return writeArg(d, v, colType) }
 
-// writeArg is the unexported implementation used by the builder methods.
-func writeArg(v ir.Value) any {
+// writeArg is the unexported implementation used by the builder methods. colType
+// is the target column's canonical type, which steers how a JSON array value is
+// bound (see Dialect.ArrayArg); an empty colType keeps the engine default.
+func writeArg(d Dialect, v ir.Value, colType string) any {
 	switch x := v.JSON.(type) {
 	case nil:
 		return nil
@@ -333,10 +520,7 @@ func writeArg(v ir.Value) any {
 		}
 		return x.String()
 	case []any:
-		// PostgreSQL array columns use {elem1,elem2} input syntax, not JSON
-		// ["elem1","elem2"]. Build the array literal so the server-side cast
-		// from text to text[]/int4[]/etc. succeeds with or without type OIDs.
-		return pgArrayLiteral(x)
+		return d.ArrayArg(x, colType)
 	case map[string]any:
 		bs, err := json.Marshal(x)
 		if err != nil {
@@ -348,13 +532,43 @@ func writeArg(v ir.Value) any {
 	}
 }
 
-// pgArrayLiteral converts a JSON array into a PostgreSQL array literal string
+// IsJSONArrayIndex reports whether a JSON path segment is an array index: a
+// non-empty run of ASCII digits. PostgREST treats a digit hop (data->arr->0) as
+// an array subscript rather than an object key, and the dialects spell it as
+// one. A leading-zero or oversized run still counts as an index; the engine
+// decides what a missing element yields.
+func IsJSONArrayIndex(seg string) bool {
+	if seg == "" {
+		return false
+	}
+	for i := 0; i < len(seg); i++ {
+		if seg[i] < '0' || seg[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// JSONArrayArg re-encodes a decoded JSON array to its JSON text. It is the
+// ArrayArg implementation for engines without array columns, where a write
+// payload array lands in a json/text column and must read back as JSON.
+func JSONArrayArg(elems []any) any {
+	bs, err := json.Marshal(elems)
+	if err != nil {
+		return nil
+	}
+	return string(bs)
+}
+
+// PGArrayLiteral converts a JSON array into a PostgreSQL array literal string
 // of the form {elem1,"elem with spaces",NULL}. Elements that are plain
 // alphanumeric strings (and json.Number/bool) are emitted unquoted; strings
 // that contain commas, braces, backslashes, double-quotes, or whitespace are
 // double-quoted with internal backslash escaping, matching PostgreSQL's own
-// array output format.
-func pgArrayLiteral(elems []any) string {
+// array output format. It is the PostgreSQL Dialect's ArrayArg: the literal
+// text lets the server-side cast from text to text[]/int4[]/etc. succeed with
+// or without type OIDs.
+func PGArrayLiteral(elems []any) string {
 	var sb strings.Builder
 	sb.WriteByte('{')
 	for i, e := range elems {
@@ -447,27 +661,75 @@ func (b *builder) writeSelect(items []ir.SelectItem) *pgerr.APIError {
 		if i > 0 {
 			b.sb.WriteString(", ")
 		}
-		col, ok := it.(ir.Column)
-		if !ok {
-			return pgerr.ErrUnsupported("aggregates and embedded resources in select", "sql")
-		}
-		expr, err := b.columnExpr(col)
-		if err != nil {
-			return err
-		}
-		b.sb.WriteString(expr)
-		// Alias the output so the renderer sees the PostgREST key, not the raw
-		// column. Only needed when the key differs from the bare column name.
-		if name := col.Name(); name != "" && name != lastPath(col.Path) {
+		switch v := it.(type) {
+		case ir.Column:
+			expr, err := b.columnExpr(v)
+			if err != nil {
+				return err
+			}
+			b.sb.WriteString(expr)
+			// Alias the output so the renderer sees the PostgREST key, not the raw
+			// column expression. Always alias when a cast is present, an explicit
+			// alias was set, the column is a JSON path (data->>x names its column
+			// after the last hop, the way upstream does), or a data representation
+			// wrapped the column in a cast function (which would otherwise name the
+			// output column after the function, not the column).
+			if name := v.Name(); name != "" && (name != lastPath(v.Path) || v.Cast != "" || len(v.Path) > 1 || b.repAppliedToJSON(v)) {
+				b.sb.WriteString(" AS ")
+				b.sb.WriteString(b.d.QuoteIdent(name))
+			}
+			// A plain column alongside an aggregate is a GROUP BY key.
+			b.groupBy = append(b.groupBy, expr)
+		case ir.Aggregate:
+			expr, err := b.aggregateExpr(v)
+			if err != nil {
+				return err
+			}
+			b.sb.WriteString(expr)
 			b.sb.WriteString(" AS ")
-			b.sb.WriteString(b.d.QuoteIdent(name))
+			b.sb.WriteString(b.d.QuoteIdent(v.Name()))
+			b.hasAgg = true
+		default:
+			return pgerr.ErrUnsupported("embedded resources in select", "sql")
 		}
 	}
 	return nil
 }
 
-// columnExpr renders a base column with an optional cast. JSON sub-paths are a
-// later subsystem; a column carrying one is rejected explicitly.
+// aggregateExpr renders an aggregate call: count(*) for a bare count, or
+// func(arg) over the aggregated column, with an optional input cast on the
+// column and an optional output cast wrapping the result.
+func (b *builder) aggregateExpr(a ir.Aggregate) (string, *pgerr.APIError) {
+	fn := a.Func.String()
+	var inner string
+	if a.Arg == nil {
+		inner = fn + "(*)"
+	} else {
+		arg, err := b.columnExpr(*a.Arg)
+		if err != nil {
+			return "", err
+		}
+		inner = fn + "(" + arg + ")"
+	}
+	if a.Cast != "" {
+		inner = b.d.Cast(inner, a.Cast)
+	}
+	return inner, nil
+}
+
+// jsonPathExpr lowers a base column carrying a JSON sub-path through the dialect.
+// hops are the segments after the base; last reports the final ->/->> kind. An
+// engine without JSON paths reports ok=false and the request is PGRST127.
+func (b *builder) jsonPathExpr(base string, hops []string, last ir.JSONStep) (string, *pgerr.APIError) {
+	frag, ok := b.d.JSONPath(base, hops, last == ir.JSONArrow2)
+	if !ok {
+		return "", pgerr.ErrUnsupported("JSON path", "sql")
+	}
+	return frag, nil
+}
+
+// columnExpr renders a base column with an optional cast, lowering a JSON
+// sub-path (col->a->>b) through the dialect when the column carries one.
 func (b *builder) columnExpr(c ir.Column) (string, *pgerr.APIError) {
 	if len(c.Path) == 1 && c.Path[0] == "*" && c.Last == ir.JSONNone && c.Cast == "" {
 		if b.qual == "" {
@@ -475,14 +737,42 @@ func (b *builder) columnExpr(c ir.Column) (string, *pgerr.APIError) {
 		}
 		return b.qual + ".*", nil
 	}
-	if len(c.Path) != 1 || c.Last != ir.JSONNone {
-		return "", pgerr.ErrUnsupported("JSON path projection", "sql")
+	var expr string
+	if len(c.Path) > 1 {
+		frag, err := b.jsonPathExpr(b.colRef(c.Path[0]), c.Path[1:], c.Last)
+		if err != nil {
+			return "", err
+		}
+		expr = frag
+	} else {
+		expr = b.colRef(c.Path[0])
+		// A data-representation column reformats on output through its to-json cast
+		// (spec 11): the stored value is passed to the cast function, which yields the
+		// json the response carries. An explicit client cast (col::type) opts out, the
+		// client having asked for a specific rendering instead.
+		if c.Cast == "" {
+			if rep, ok := b.reps[c.Path[0]]; ok && rep.ToJSONFunc != "" {
+				expr = b.repCall(rep.ToJSONSchema, rep.ToJSONFunc, expr)
+			}
+		}
 	}
-	expr := b.colRef(c.Path[0])
 	if c.Cast != "" {
 		expr = b.d.Cast(expr, c.Cast)
 	}
 	return expr, nil
+}
+
+// repAppliedToJSON reports whether a plain base column carries a to-json data
+// representation that columnExpr will apply, so writeSelect knows to alias the
+// projection to the column name (the cast function would otherwise name the output
+// column after itself). A JSON sub-path or an explicit client cast opts out, the
+// same conditions columnExpr checks.
+func (b *builder) repAppliedToJSON(c ir.Column) bool {
+	if len(c.Path) != 1 || c.Cast != "" {
+		return false
+	}
+	rep, ok := b.reps[c.Path[0]]
+	return ok && rep.ToJSONFunc != ""
 }
 
 func lastPath(path []string) string {
@@ -508,9 +798,26 @@ func (b *builder) writeCond(c ir.Cond) *pgerr.APIError {
 		return nil
 	case ir.Compare:
 		return b.writeCompare(n)
+	case ir.EmbedPredicate:
+		return b.writeEmbedPredicate(n)
 	default:
 		return pgerr.ErrInternal(fmt.Sprintf("unknown filter node %T", c))
 	}
+}
+
+// writeEmbedPredicate lowers an embed-existence filter (films?actors=is.null /
+// not.is.null). not.is.null is a semi-join, the same EXISTS an !inner embed
+// adds; is.null is its anti-join complement (NOT EXISTS). The correlation hangs
+// off parentRef so the predicate works both in an embedded read (alias t0) and
+// in a plain count (the bare table name). See item 01.12.
+func (b *builder) writeEmbedPredicate(p ir.EmbedPredicate) *pgerr.APIError {
+	if p.Index < 0 || p.Index >= len(b.embeds) {
+		return pgerr.ErrInternal("embed predicate index out of range")
+	}
+	if !p.Exists {
+		b.sb.WriteString("NOT ")
+	}
+	return b.writeEmbedExists(&b.embeds[p.Index], b.parentRef)
 }
 
 func (b *builder) writeLogical(kids []ir.Cond, sep string) *pgerr.APIError {
@@ -530,13 +837,32 @@ func (b *builder) writeLogical(kids []ir.Cond, sep string) *pgerr.APIError {
 	return nil
 }
 
-// writeCompare lowers a single column-operator-value predicate. The column is a
-// base column for now (JSON-path filters arrive with the JSON subsystem).
+// writeCompare lowers a single column-operator-value predicate. A column may
+// carry a JSON sub-path (data->>field), lowered through the dialect.
 func (b *builder) writeCompare(c ir.Compare) *pgerr.APIError {
-	if len(c.Path) != 1 {
-		return pgerr.ErrUnsupported("JSON path filters", "sql")
-	}
 	col := b.colRef(c.Path[0])
+	isJSON := len(c.Path) > 1
+	if isJSON {
+		frag, err := b.jsonPathExpr(col, c.Path[1:], c.Last)
+		if err != nil {
+			return err
+		}
+		col = frag
+	}
+
+	// A quantified filter (op(any)/op(all) over a {…} list) expands to a disjunction
+	// or conjunction of the real operator, one predicate per element (item 01.1).
+	if c.Quant != ir.QNone {
+		frag, err := b.writeQuantified(col, c)
+		if err != nil {
+			return err
+		}
+		if c.Negate {
+			frag = "NOT (" + frag + ")"
+		}
+		b.sb.WriteString(frag)
+		return nil
+	}
 
 	var frag string
 	var err *pgerr.APIError
@@ -544,33 +870,35 @@ func (b *builder) writeCompare(c ir.Compare) *pgerr.APIError {
 	case ir.OpEq, ir.OpNeq:
 		// Boolean literals "true"/"false" are rendered via BoolValue so engines
 		// without a native BOOL type (MySQL TINYINT) produce correct predicates
-		// (e.g. done = 1 rather than done = 'true' which MySQL coerces to 0).
-		switch c.Value.Text {
-		case "true":
+		// (e.g. done = 1 rather than done = 'true' which MySQL coerces to 0). The
+		// coercion is column-type-aware: against a non-boolean column (a text
+		// column literally holding the word "true") the words stay text, matching
+		// PostgreSQL's type-driven coercion (item 07.4). An unknown column type
+		// keeps the boolean rendering, the common ?col=is-not-the-point filter.
+		// A JSON ->>/-> extract is a text/json value, never a typed boolean column,
+		// so the words "true"/"false" bind as text and a JSON field holding the
+		// string still matches (the eq.true coercion is column-type driven).
+		boolColumn := !isJSON && (c.ColumnType == "" || pgtypes.ClassOf(c.ColumnType) == pgtypes.ClassBool)
+		switch {
+		case c.Value.Text == "true" && boolColumn:
 			frag = col + " " + binaryOp(c.Op) + " " + b.d.BoolValue(true)
-		case "false":
+		case c.Value.Text == "false" && boolColumn:
 			frag = col + " " + binaryOp(c.Op) + " " + b.d.BoolValue(false)
 		default:
-			frag = col + " " + binaryOp(c.Op) + " " + b.bind(c.Value.Text)
+			frag = col + " " + binaryOp(c.Op) + " " + b.filterValue(c)
 		}
-	case ir.OpGt, ir.OpGte, ir.OpLt, ir.OpLte, ir.OpLike:
-		if c.Quant != ir.QNone {
-			frag, err = b.writeLikeQuantified(col, ir.OpLike, c.Quant, c.Value.List)
-		} else {
-			frag = col + " " + binaryOp(c.Op) + " " + b.bind(c.Value.Text)
-		}
+	case ir.OpGt, ir.OpGte, ir.OpLt, ir.OpLte:
+		frag = col + " " + binaryOp(c.Op) + " " + b.filterValue(c)
+	case ir.OpLike:
+		frag = col + " " + binaryOp(c.Op) + " " + b.bind(c.Value.Text)
 	case ir.OpILike:
-		if c.Quant != ir.QNone {
-			frag, err = b.writeLikeQuantified(col, ir.OpILike, c.Quant, c.Value.List)
-		} else {
-			var ok bool
-			frag, ok = b.d.ILike(col, b.bind(c.Value.Text))
-			if !ok {
-				return pgerr.ErrUnsupported("case-insensitive LIKE", "sql")
-			}
+		var ok bool
+		frag, ok = b.d.ILike(col, b.bind(c.Value.Text))
+		if !ok {
+			return pgerr.ErrUnsupported("case-insensitive LIKE", "sql")
 		}
 	case ir.OpIn:
-		frag, err = b.writeIn(col, c.Value.List)
+		frag, err = b.writeIn(col, c.Path[0], isJSON, c.Value.List)
 	case ir.OpIs:
 		frag, err = b.writeIs(col, c.Value.Text)
 	case ir.OpMatch, ir.OpIMatch:
@@ -585,8 +913,9 @@ func (b *builder) writeCompare(c ir.Compare) *pgerr.APIError {
 			return pgerr.ErrUnsupported("regular-expression match", "sql")
 		}
 		// Regex returns an already-formed boolean expression carrying PatternMark
-		// where the bound pattern placeholder goes.
-		frag = strings.Replace(expr, PatternMark, b.bind(c.Value.Text), 1)
+		// where the bound pattern placeholder goes. A represented column parses the
+		// pattern through its from-text cast, as PostgREST does for match/imatch.
+		frag = strings.Replace(expr, PatternMark, b.fromTextValue(c.Path[0], isJSON, c.Value.Text), 1)
 	case ir.OpFTS:
 		frag, err = b.writeFTS(c, col)
 	case ir.OpIsDistinct:
@@ -601,11 +930,34 @@ func (b *builder) writeCompare(c ir.Compare) *pgerr.APIError {
 		default:
 			sqlOp = "&&"
 		}
-		val := b.bind(c.Value.Text)
+		// Normalize the PostgreSQL {a,b} array literal to the engine's format
+		// before binding; the dialect is a no-op for engines that accept {a,b}. A
+		// represented column parses the literal through its from-text cast, matching
+		// PostgREST's simple-operator path.
+		val := b.fromTextValue(c.Path[0], isJSON, b.d.ArrayLiteral(c.Value.Text))
 		var ok bool
-		frag, ok = b.d.ArrayOp(col, sqlOp, val)
+		frag, ok = b.d.ArrayOp(col, sqlOp, val, c.ColumnType)
 		if !ok {
 			return pgerr.ErrUnsupported("array operator "+sqlOp, "sql")
+		}
+	case ir.OpRangeSL, ir.OpRangeSR, ir.OpRangeNXR, ir.OpRangeNXL, ir.OpRangeAdj:
+		var rop string
+		switch c.Op {
+		case ir.OpRangeSL:
+			rop = "<<"
+		case ir.OpRangeSR:
+			rop = ">>"
+		case ir.OpRangeNXR:
+			rop = "&<"
+		case ir.OpRangeNXL:
+			rop = "&>"
+		default:
+			rop = "-|-"
+		}
+		var ok bool
+		frag, ok = b.d.RangeOp(col, rop, b.fromTextValue(c.Path[0], isJSON, c.Value.Text))
+		if !ok {
+			return pgerr.ErrUnsupported("range operator "+opName(c.Op), "sql")
 		}
 	default:
 		return pgerr.ErrUnsupported("filter operator "+opName(c.Op), "sql")
@@ -637,57 +989,112 @@ func (b *builder) writeFTS(c ir.Compare, col string) (string, *pgerr.APIError) {
 			RowidRef: b.colRef(rowid),
 		}
 	}
-	expr, bindVal, ok := b.d.FullText(col, ref, c.FTS, c.Config, c.Value.Text)
+	expr, bindVal, ok := b.d.FullText(col, c.ColumnType, ref, c.FTS, c.Config, c.Value.Text)
 	if !ok {
 		return "", pgerr.ErrFullTextUnavailable(c.Path[0], "sql")
 	}
 	return strings.Replace(expr, PatternMark, b.bind(bindVal), 1), nil
 }
 
-func (b *builder) writeIn(col string, list []string) (string, *pgerr.APIError) {
+func (b *builder) writeIn(col, colName string, isJSON bool, list []string) (string, *pgerr.APIError) {
 	if len(list) == 0 {
 		// `col IN ()` is a syntax error; an empty IN matches nothing.
 		return "1 = 0", nil
 	}
+	rep, hasRep := b.reps[colName]
+	useRep := !isJSON && hasRep && rep.FromTextFunc != ""
+	// On an engine that binds the list as a single array (PostgreSQL's = ANY), every
+	// list length is one prepared statement instead of one per length. The element
+	// quoting is PostgreSQL's array-literal format, the same the array operators use,
+	// so a value with a comma or brace stays a single element. The bind happens only
+	// on this branch so the expansion path's placeholder numbering is unaffected.
+	if frag, ok := b.d.InList(col); ok {
+		elems := make([]any, len(list))
+		for i, v := range list {
+			elems[i] = v
+		}
+		ph := b.bind(PGArrayLiteral(elems))
+		operand := ph
+		if useRep {
+			// A represented column parses each element through its from-text cast,
+			// applied over the unpacked array, matching PostgREST's
+			// pgFmtArrayLiteralForField.
+			operand = "(SELECT " + b.repCall(rep.FromTextSchema, rep.FromTextFunc, "unnest("+ph+"::text[])") + ")"
+		}
+		return strings.Replace(frag, PatternMark, operand, 1), nil
+	}
 	parts := make([]string, len(list))
 	for i, v := range list {
-		parts[i] = b.bind(v)
+		if useRep {
+			parts[i] = b.repCall(rep.FromTextSchema, rep.FromTextFunc, b.bind(v)+"::text")
+		} else {
+			parts[i] = b.bind(v)
+		}
 	}
 	return col + " IN (" + strings.Join(parts, ", ") + ")", nil
 }
 
-// writeLikeQuantified expands like(any)/{...} and like(all)/{...} into a
-// conjunction or disjunction of individual LIKE / ILIKE predicates. An empty
-// list generates a no-match literal (1 = 0) for ANY and always-match (1 = 1)
-// for ALL, consistent with SQL ANY/ALL semantics over an empty set.
-func (b *builder) writeLikeQuantified(col string, op ir.Op, q ir.Quant, list []string) (string, *pgerr.APIError) {
+// writeQuantified expands a quantified filter (op(any)/op(all) over a {…} list)
+// into a disjunction (ANY) or conjunction (ALL) of the real operator, one
+// predicate per element. An empty list is a no-match literal (1 = 0) for ANY and
+// always-match (1 = 1) for ALL, consistent with SQL ANY/ALL over an empty set,
+// though the parser now rejects an empty list upstream. See item 01.1.
+func (b *builder) writeQuantified(col string, c ir.Compare) (string, *pgerr.APIError) {
+	list := c.Value.List
 	if len(list) == 0 {
-		if q == ir.QAny {
+		if c.Quant == ir.QAny {
 			return "1 = 0", nil
 		}
 		return "1 = 1", nil
 	}
 	sep := " OR "
-	if q == ir.QAll {
+	if c.Quant == ir.QAll {
 		sep = " AND "
 	}
+	colName := c.Path[0]
+	isJSON := len(c.Path) > 1
 	parts := make([]string, len(list))
-	for i, pat := range list {
-		bound := b.bind(pat)
-		if op == ir.OpILike {
-			expr, ok := b.d.ILike(col, bound)
-			if !ok {
-				return "", pgerr.ErrUnsupported("case-insensitive LIKE", "sql")
-			}
-			parts[i] = expr
-		} else {
-			parts[i] = col + " LIKE " + bound
+	for i, v := range list {
+		frag, err := b.quantElem(col, colName, isJSON, c.Op, v)
+		if err != nil {
+			return "", err
 		}
+		parts[i] = frag
 	}
 	if len(parts) == 1 {
 		return parts[0], nil
 	}
 	return "(" + strings.Join(parts, sep) + ")", nil
+}
+
+// quantElem lowers one element of a quantified list to its single-operator SQL
+// predicate, using the operator's real infix/regex/ILIKE form.
+func (b *builder) quantElem(col, colName string, isJSON bool, op ir.Op, v string) (string, *pgerr.APIError) {
+	switch op {
+	case ir.OpEq, ir.OpGt, ir.OpGte, ir.OpLt, ir.OpLte:
+		return col + " " + binaryOp(op) + " " + b.fromTextValue(colName, isJSON, v), nil
+	case ir.OpLike:
+		// like carries a wildcard pattern, so PostgREST binds it raw even on a
+		// represented column.
+		return col + " " + binaryOp(op) + " " + b.bind(v), nil
+	case ir.OpILike:
+		expr, ok := b.d.ILike(col, b.bind(v))
+		if !ok {
+			return "", pgerr.ErrUnsupported("case-insensitive LIKE", "sql")
+		}
+		return expr, nil
+	case ir.OpMatch, ir.OpIMatch:
+		if feat := b.d.RegexFeatureGap(v); feat != "" {
+			return "", pgerr.ErrUnsupported(feat, "sql")
+		}
+		expr, ok := b.d.Regex(col, v, op == ir.OpIMatch)
+		if !ok {
+			return "", pgerr.ErrUnsupported("regular-expression match", "sql")
+		}
+		return strings.Replace(expr, PatternMark, b.fromTextValue(colName, isJSON, v), 1), nil
+	default:
+		return "", pgerr.ErrUnsupported("quantifier on "+opName(op), "sql")
+	}
 }
 
 func (b *builder) writeIs(col, text string) (string, *pgerr.APIError) {
@@ -697,9 +1104,20 @@ func (b *builder) writeIs(col, text string) (string, *pgerr.APIError) {
 	case "not_null":
 		return col + " IS NOT NULL", nil
 	case "true":
+		if frag, ok := b.d.IsBool(col, true); ok {
+			return frag, nil
+		}
 		return col + " IS " + b.d.BoolValue(true), nil
 	case "false":
+		if frag, ok := b.d.IsBool(col, false); ok {
+			return frag, nil
+		}
 		return col + " IS " + b.d.BoolValue(false), nil
+	case "unknown":
+		if frag, ok := b.d.IsUnknown(col); ok {
+			return frag, nil
+		}
+		return col + " IS NULL", nil
 	default:
 		return "", pgerr.ErrParse("unknown is value " + text)
 	}
@@ -707,12 +1125,29 @@ func (b *builder) writeIs(col, text string) (string, *pgerr.APIError) {
 
 // writeOrder emits the ORDER BY, delegating NULLs placement to the dialect.
 func (b *builder) writeOrder(terms []ir.OrderTerm) *pgerr.APIError {
+	// The parent reference for a related-order subquery is the qualifier in force
+	// as the ORDER BY is written (t0 in an embedded read, the bare table name in a
+	// count).
+	parentAlias := b.qual
 	var sortKeys, orderTerms []string
 	for _, t := range terms {
-		if len(t.Path) != 1 {
-			return pgerr.ErrUnsupported("JSON path ordering", "sql")
+		var col string
+		if t.Rel != "" {
+			frag, err := b.relatedOrderExpr(t, parentAlias)
+			if err != nil {
+				return err
+			}
+			col = frag
+		} else {
+			col = b.colRef(t.Path[0])
+			if len(t.Path) > 1 {
+				frag, err := b.jsonPathExpr(col, t.Path[1:], t.Last)
+				if err != nil {
+					return err
+				}
+				col = frag
+			}
 		}
-		col := b.colRef(t.Path[0])
 		dir := "ASC"
 		if t.Desc {
 			dir = "DESC"
@@ -728,6 +1163,59 @@ func (b *builder) writeOrder(terms []ir.OrderTerm) *pgerr.APIError {
 	all = append(all, sortKeys...)
 	all = append(all, orderTerms...)
 	b.sb.WriteString(strings.Join(all, ", "))
+	return nil
+}
+
+// relatedOrderExpr lowers an order=rel(col) term to a correlated scalar subquery
+// selecting the embed's column for the matching to-one row: a parent with no
+// related row yields NULL, which the dialect's NULLs placement then orders. The
+// embed is matched by the same written name the planner validated, and its
+// to-one join condition correlates the subquery back to the parent (item 07.6).
+func (b *builder) relatedOrderExpr(t ir.OrderTerm, parentAlias string) (string, *pgerr.APIError) {
+	emb := b.findEmbed(t.Rel)
+	if emb == nil {
+		// The planner validates the relation is embedded; reaching here is a bug.
+		return "", pgerr.ErrInternal("related order names an unresolved embed: " + t.Rel)
+	}
+	rel := emb.Rel
+	b.aliasN++
+	alias := "o" + strconv.Itoa(b.aliasN)
+
+	saved := b.qual
+	b.qual = alias
+	savedC, savedReps, savedR := b.useRelation(&emb.Query, rel.Target.Name)
+	col := b.colRef(t.Path[0])
+	if len(t.Path) > 1 {
+		frag, err := b.jsonPathExpr(col, t.Path[1:], t.Last)
+		if err != nil {
+			b.qual = saved
+			b.computed, b.reps, b.rootRow = savedC, savedReps, savedR
+			return "", err
+		}
+		col = frag
+	}
+	b.qual = saved
+	b.computed, b.reps, b.rootRow = savedC, savedReps, savedR
+
+	from, cond := b.embedSource(rel, alias, parentAlias)
+	return "(SELECT " + col + " FROM " + from + " WHERE " + cond + ")", nil
+}
+
+// findEmbed returns the embed an order=rel(col) term refers to, matched by the
+// embed's alias or, when it has none, its written target name. It mirrors the
+// planner's findEmbedByName so the compiler resolves the same relation the
+// planner validated.
+func (b *builder) findEmbed(name string) *ir.Embed {
+	for i := range b.embeds {
+		emb := &b.embeds[i]
+		written := emb.Alias
+		if written == "" {
+			written = emb.Target.Name
+		}
+		if written == name {
+			return emb
+		}
+	}
 	return nil
 }
 

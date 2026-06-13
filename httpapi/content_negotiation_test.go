@@ -176,12 +176,14 @@ func TestPostUnsupportedMediaType(t *testing.T) {
 	resp := send(t, srv, http.MethodPost, "/films", "<film/>", map[string]string{
 		"Content-Type": "application/xml",
 	})
-	if resp.StatusCode != http.StatusUnsupportedMediaType {
-		t.Fatalf("status = %d, want 415", resp.StatusCode)
+	// Live v14 answers 400 PGRST102 for an unparseable request Content-Type;
+	// the docs' PGRST107/415 row is stale (see compat/errors_v14_test.go).
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
 	}
 	env := decodeEnvelope(t, resp)
-	if env["code"] != "PGRST107" {
-		t.Errorf("code = %v, want PGRST107", env["code"])
+	if env["code"] != "PGRST102" {
+		t.Errorf("code = %v, want PGRST102", env["code"])
 	}
 }
 

@@ -28,18 +28,32 @@ type rendered struct {
 func renderFor(media string, res backend.Result, rawCols map[string]bool) (*rendered, *pgerr.APIError) {
 	switch media {
 	case mediaJSON, mediaArray:
-		out, err := renderRows(res, false, rawCols)
+		out, err := renderRows(res, false, rawCols, false)
 		if err != nil {
 			return nil, err
 		}
 		out.contentType = "application/json; charset=utf-8"
 		return out, nil
+	case mediaArrayStripped:
+		out, err := renderRows(res, false, rawCols, true)
+		if err != nil {
+			return nil, err
+		}
+		out.contentType = "application/vnd.pgrst.array+json; nulls=stripped; charset=utf-8"
+		return out, nil
 	case mediaObject:
-		out, err := renderRows(res, true, rawCols)
+		out, err := renderRows(res, true, rawCols, false)
 		if err != nil {
 			return nil, err
 		}
 		out.contentType = singularMediaType + "; charset=utf-8"
+		return out, nil
+	case mediaObjectStripped:
+		out, err := renderRows(res, true, rawCols, true)
+		if err != nil {
+			return nil, err
+		}
+		out.contentType = "application/vnd.pgrst.object+json; nulls=stripped; charset=utf-8"
 		return out, nil
 	case mediaCSV:
 		return renderCSV(res)
@@ -60,7 +74,8 @@ func renderFor(media string, res backend.Result, rawCols map[string]bool) (*rend
 // singular request. fnName is the bare function name; it is used for native-RPC
 // heuristic detection when fn is nil.
 func renderCall(media string, res backend.Result, fn *rpc.Function, fnName string) (*rendered, *pgerr.APIError) {
-	if fn == nil {
+	switch {
+	case fn == nil:
 		// Native RPC: detect scalar vs table by inspecting column names.
 		// res.Rows().Columns() does not advance the cursor; the stream remains
 		// fully readable for the render path below.
@@ -70,8 +85,12 @@ func renderCall(media string, res backend.Result, fn *rpc.Function, fnName strin
 		} else {
 			return renderFor(media, res, nil)
 		}
-	} else if fn.Returns.Kind == rpc.ReturnTable {
+	case fn.Returns.Kind == rpc.ReturnTable:
 		return renderFor(media, res, nil)
+	case fn.Returns.Kind == rpc.ReturnObject:
+		return renderCallObject(media, res)
+	case fn.Returns.Kind == rpc.ReturnVoid:
+		return renderVoid(res)
 	}
 	switch media {
 	case mediaCSV:
@@ -98,7 +117,7 @@ func renderCall(media string, res backend.Result, fn *rpc.Function, fnName strin
 		}
 		// A scalar function projects one column; if a registry declares scalar
 		// over a wider statement, the first column is the value.
-		vals = append(vals, row[0])
+		vals = append(vals, rawJSONValue(row[0], fn.Returns.Type))
 	}
 	if err := rs.Err(); err != nil {
 		return nil, pgerr.ErrInternal(err.Error())
@@ -109,9 +128,10 @@ func renderCall(media string, res backend.Result, fn *rpc.Function, fnName strin
 		out.total, out.hasTotl = total, true
 	}
 
-	if media == mediaObject {
+	if singularMedia(media) {
 		if len(vals) != 1 {
-			return nil, pgerr.ErrSingularZeroMany()
+			return nil, pgerr.ErrSingularZeroMany().
+				WithDetails(fmt.Sprintf("The result contains %d rows", len(vals)))
 		}
 		body, aerr := marshalCall(vals[0])
 		if aerr != nil {
@@ -145,6 +165,98 @@ func renderCall(media string, res backend.Result, fn *rpc.Function, fnName strin
 	return out, nil
 }
 
+// renderCallObject shapes a function that returns a single composite row (RETURNS
+// <composite>, not SETOF): PostgREST renders it as one bare JSON object, never an
+// array, and a null body when the function produced no row. The CSV and scalar
+// media types fall back to the column/row shapers a table read uses. The singular
+// object media type keeps its content type; every other JSON media renders the
+// same single object under application/json.
+func renderCallObject(media string, res backend.Result) (*rendered, *pgerr.APIError) {
+	switch media {
+	case mediaCSV:
+		return renderCSV(res)
+	case mediaOctet:
+		return renderScalar(res, false)
+	case mediaText:
+		return renderScalar(res, true)
+	}
+
+	rs := res.Rows()
+	defer rs.Close()
+	cols := rs.Columns()
+
+	var obj []byte
+	n := 0
+	for rs.Next() {
+		if n == 0 {
+			vals, err := rs.Values()
+			if err != nil {
+				return nil, pgerr.ErrInternal(err.Error())
+			}
+			rb, err := encodeRowObject(cols, vals, nil, false)
+			if err != nil {
+				return nil, pgerr.ErrInternal(err.Error())
+			}
+			obj = rb
+		}
+		n++
+	}
+	if err := rs.Err(); err != nil {
+		return nil, pgerr.ErrInternal(err.Error())
+	}
+
+	out := &rendered{nRows: n}
+	if total, ok := res.Count(); ok {
+		out.total, out.hasTotl = total, true
+	}
+	if obj == nil {
+		obj = []byte("null")
+	}
+	out.body = obj
+	out.contentType = "application/json; charset=utf-8"
+	if singularMedia(media) {
+		out.contentType = singularMediaType + "; charset=utf-8"
+	}
+	return out, nil
+}
+
+// renderVoid shapes a void-returning function: PostgREST answers 200 with a null
+// JSON body, never 204, so dbrest pins the same contract across backends rather
+// than letting a portable scalar-with-no-rows or a native 204 special case decide
+// it. The result is drained so the statement runs to completion, then discarded.
+func renderVoid(res backend.Result) (*rendered, *pgerr.APIError) {
+	rs := res.Rows()
+	defer rs.Close()
+	for rs.Next() {
+		if _, err := rs.Values(); err != nil {
+			return nil, pgerr.ErrInternal(err.Error())
+		}
+	}
+	if err := rs.Err(); err != nil {
+		return nil, pgerr.ErrInternal(err.Error())
+	}
+	return &rendered{
+		body:        []byte("null"),
+		contentType: "application/json; charset=utf-8",
+	}, nil
+}
+
+// rawJSONValue embeds a json-declared scalar verbatim. An engine expression
+// (a registry SELECT json_object(...), say) carries no column type the driver
+// could key the conversion on, so the declared return type decides here: a
+// valid-JSON string under a json/jsonb declaration becomes a RawMessage and
+// the encoder emits the document rather than a quoted string, matching how
+// PostgreSQL functions returning json behave through PostgREST.
+func rawJSONValue(v any, declared string) any {
+	if declared != "json" && declared != "jsonb" {
+		return v
+	}
+	if s, ok := v.(string); ok && json.Valid([]byte(s)) {
+		return json.RawMessage(s)
+	}
+	return v
+}
+
 // marshalCall encodes one RPC value (a scalar or an array of scalars) to JSON
 // without HTML escaping and without the trailing newline the encoder appends.
 func marshalCall(v any) ([]byte, *pgerr.APIError) {
@@ -165,7 +277,7 @@ func marshalCall(v any) ([]byte, *pgerr.APIError) {
 // This is the Go-shaped assembly path (Result.Rows). The engine-assembled path
 // (Result.Body) is used once the embedding subsystem emits in-engine JSON; the
 // observable body is identical either way.
-func renderRows(res backend.Result, singular bool, rawCols map[string]bool) (*rendered, *pgerr.APIError) {
+func renderRows(res backend.Result, singular bool, rawCols map[string]bool, stripNulls bool) (*rendered, *pgerr.APIError) {
 	rs := res.Rows()
 	defer rs.Close()
 	cols := rs.Columns()
@@ -180,23 +292,13 @@ func renderRows(res backend.Result, singular bool, rawCols map[string]bool) (*re
 		if err != nil {
 			return nil, pgerr.ErrInternal(err.Error())
 		}
-		obj := make(map[string]any, len(cols))
-		for i, c := range cols {
-			if rawCols[c] {
-				obj[c] = rawJSON(vals[i])
-			} else {
-				obj[c] = vals[i]
-			}
-		}
 		// Encode each row independently so a large result streams in bounded
 		// memory once the engine-assembled path replaces this shaper.
-		var rb bytes.Buffer
-		re := json.NewEncoder(&rb)
-		re.SetEscapeHTML(false)
-		if err := re.Encode(obj); err != nil {
+		rb, err := encodeRowObject(cols, vals, rawCols, stripNulls)
+		if err != nil {
 			return nil, pgerr.ErrInternal(err.Error())
 		}
-		rows = append(rows, json.RawMessage(bytes.TrimRight(rb.Bytes(), "\n")))
+		rows = append(rows, json.RawMessage(rb))
 	}
 	if err := rs.Err(); err != nil {
 		return nil, pgerr.ErrInternal(err.Error())
@@ -209,7 +311,8 @@ func renderRows(res backend.Result, singular bool, rawCols map[string]bool) (*re
 
 	if singular {
 		if len(rows) != 1 {
-			return nil, pgerr.ErrSingularZeroMany()
+			return nil, pgerr.ErrSingularZeroMany().
+				WithDetails(fmt.Sprintf("The result contains %d rows", len(rows)))
 		}
 		out.body = rows[0]
 		return out, nil
@@ -220,6 +323,58 @@ func renderRows(res backend.Result, singular bool, rawCols map[string]bool) (*re
 	}
 	out.body = bytes.TrimRight(buf.Bytes(), "\n")
 	return out, nil
+}
+
+// encodeRowObject serializes one row as a JSON object whose keys appear in
+// projection (column) order, the way PostgREST preserves select order rather
+// than the alphabetical order a Go map would impose. A rawCols column carries
+// engine-assembled JSON emitted verbatim; every other value is encoded normally.
+func encodeRowObject(cols []string, vals []any, rawCols map[string]bool, stripNulls bool) ([]byte, error) {
+	var rb bytes.Buffer
+	rb.WriteByte('{')
+	first := true
+	for i, c := range cols {
+		var v any
+		if rawCols[c] {
+			v = rawJSON(vals[i])
+		} else {
+			v = vals[i]
+		}
+		// nulls=stripped drops a key whose value is SQL NULL (a nil after the raw
+		// embed unwrap), so the object omits it entirely.
+		if stripNulls && v == nil {
+			continue
+		}
+		if !first {
+			rb.WriteByte(',')
+		}
+		first = false
+		key, err := jsonNoEscape(c)
+		if err != nil {
+			return nil, err
+		}
+		rb.Write(key)
+		rb.WriteByte(':')
+		val, err := jsonNoEscape(v)
+		if err != nil {
+			return nil, err
+		}
+		rb.Write(val)
+	}
+	rb.WriteByte('}')
+	return rb.Bytes(), nil
+}
+
+// jsonNoEscape encodes a value to JSON the way PostgREST does: HTML characters
+// stay unescaped and the encoder's trailing newline is trimmed.
+func jsonNoEscape(v any) ([]byte, error) {
+	var b bytes.Buffer
+	e := json.NewEncoder(&b)
+	e.SetEscapeHTML(false)
+	if err := e.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(b.Bytes(), "\n"), nil
 }
 
 // renderCSV writes a header row of column names followed by one RFC 4180 record
@@ -294,10 +449,12 @@ func csvCell(v any) string {
 	case []byte:
 		return string(t)
 	case bool:
+		// PostgreSQL's text output (what PostgREST's CSV mirrors) renders booleans
+		// as t/f, not the JSON true/false.
 		if t {
-			return "true"
+			return "t"
 		}
-		return "false"
+		return "f"
 	case json.Number:
 		return t.String()
 	case float64:

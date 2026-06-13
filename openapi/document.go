@@ -17,11 +17,21 @@ type document struct {
 	Definitions         map[string]*schemaObject   `json:"definitions"`
 	Parameters          map[string]*parameter      `json:"parameters,omitempty"`
 	SecurityDefinitions map[string]*securityScheme `json:"securityDefinitions,omitempty"`
+	Security            []map[string][]string      `json:"security,omitempty"`
+	ExternalDocs        *externalDocs              `json:"externalDocs,omitempty"`
 }
 
 type info struct {
-	Title   string `json:"title"`
-	Version string `json:"version"`
+	Title       string `json:"title"`
+	Description string `json:"description,omitempty"`
+	Version     string `json:"version"`
+}
+
+// externalDocs is the document-level pointer at the API reference, the block
+// PostgREST emits pointing at its own documentation.
+type externalDocs struct {
+	Description string `json:"description,omitempty"`
+	URL         string `json:"url"`
 }
 
 type pathItem struct {
@@ -32,33 +42,43 @@ type pathItem struct {
 }
 
 type operation struct {
-	Tags       []string              `json:"tags,omitempty"`
-	Summary    string                `json:"summary,omitempty"`
-	Parameters []*parameter          `json:"parameters,omitempty"`
-	Responses  map[string]*response  `json:"responses"`
-	Security   []map[string][]string `json:"security,omitempty"`
+	Tags        []string             `json:"tags,omitempty"`
+	Summary     string               `json:"summary,omitempty"`
+	Description string               `json:"description,omitempty"`
+	Produces    []string             `json:"produces,omitempty"`
+	Parameters  []*parameter         `json:"parameters,omitempty"`
+	Responses   map[string]*response `json:"responses"`
 }
 
+// parameter is either a $ref to a shared definition (only Ref set) or an
+// inline definition. Required is a pointer so a defined parameter carries an
+// explicit "required": false the way PostgREST emits it, while a pure $ref
+// entry carries nothing but the reference.
 type parameter struct {
 	Ref         string        `json:"$ref,omitempty"`
 	Name        string        `json:"name,omitempty"`
 	In          string        `json:"in,omitempty"`
 	Description string        `json:"description,omitempty"`
-	Required    bool          `json:"required,omitempty"`
+	Required    *bool         `json:"required,omitempty"`
 	Type        string        `json:"type,omitempty"`
 	Format      string        `json:"format,omitempty"`
+	Enum        []string      `json:"enum,omitempty"`
+	Default     any           `json:"default,omitempty"`
 	Schema      *schemaObject `json:"schema,omitempty"`
 }
 
 type response struct {
-	Description string `json:"description"`
+	Description string        `json:"description"`
+	Schema      *schemaObject `json:"schema,omitempty"`
 }
 
 type schemaObject struct {
-	Ref        string                     `json:"$ref,omitempty"`
-	Type       string                     `json:"type,omitempty"`
-	Required   []string                   `json:"required,omitempty"`
-	Properties map[string]*propertySchema `json:"properties,omitempty"`
+	Ref         string                     `json:"$ref,omitempty"`
+	Description string                     `json:"description,omitempty"`
+	Type        string                     `json:"type,omitempty"`
+	Items       *schemaObject              `json:"items,omitempty"`
+	Required    []string                   `json:"required,omitempty"`
+	Properties  map[string]*propertySchema `json:"properties,omitempty"`
 }
 
 type propertySchema struct {
@@ -68,7 +88,8 @@ type propertySchema struct {
 }
 
 type securityScheme struct {
-	Type string `json:"type"`
-	Name string `json:"name"`
-	In   string `json:"in"`
+	Type        string `json:"type"`
+	Name        string `json:"name"`
+	In          string `json:"in"`
+	Description string `json:"description,omitempty"`
 }

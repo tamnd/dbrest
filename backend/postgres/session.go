@@ -22,9 +22,28 @@ func queueSessionItems(batch *pgx.Batch, b *Backend, rc *reqctx.Context) int {
 	if rc.Role != "" {
 		batch.Queue("SET LOCAL ROLE " + (Dialect{}).QuoteIdent(rc.Role))
 		n++
+		// Replay the impersonated role's ALTER ROLE ... SET settings as
+		// transaction-scoped settings, after the role switch and before the main
+		// statement, matching PostgREST. default_transaction_isolation is not here;
+		// it cannot be set after a statement has run, so it is applied at BeginTx.
+		for _, s := range b.roleSettings[rc.Role] {
+			batch.Queue("SELECT set_config($1,$2,true)", s.name, s.value)
+			n++
+		}
 	}
-	if b.searchPathSQL != "" {
-		batch.Queue(b.searchPathSQL)
+	if sp := b.searchPathValue(rc); sp != "" {
+		// set_config(...,true) is SET LOCAL search_path. PostgREST sets it the same
+		// way rather than with SET ... TO <idents>, so the GUC string is the literal
+		// quoted value verbatim ("schema", "public"); a SET ... TO would let the
+		// server re-canonicalize and strip quotes from simple names, so a policy that
+		// reads current_setting('search_path') would see a different string.
+		batch.Queue("SELECT set_config('search_path',$1,true)", sp)
+		n++
+	}
+	if rc.TimeZone != "" {
+		// set_config(...,true) is the SET LOCAL timezone analog, parameterized so a
+		// name with a slash (America/Los_Angeles) needs no identifier quoting.
+		batch.Queue("SELECT set_config('timezone',$1,true)", rc.TimeZone)
 		n++
 	}
 	batch.Queue(
@@ -36,7 +55,27 @@ func queueSessionItems(batch *pgx.Batch, b *Backend, rc *reqctx.Context) int {
 		"request.headers", string(rc.HeadersJSON()),
 		"request.cookies", string(rc.CookiesJSON()),
 	)
-	return n + 1
+	n++
+	if rc.PreRequest != "" {
+		// db-pre-request runs after the transaction-scoped settings and before the
+		// main query, in the same transaction, so it sees the request context and
+		// can raise to abort or write response.status/response.headers. A raised
+		// error surfaces when the batch is drained and aborts the request.
+		batch.Queue("SELECT " + preRequestCall(rc.PreRequest) + "()")
+		n++
+	}
+	return n
+}
+
+// preRequestCall renders the db-pre-request function name as a quoted, possibly
+// schema-qualified callable, so a name like auth.check or one needing quoting is
+// safe to interpolate.
+func preRequestCall(fn string) string {
+	parts := strings.Split(fn, ".")
+	for i, p := range parts {
+		parts[i] = (Dialect{}).QuoteIdent(p)
+	}
+	return strings.Join(parts, ".")
 }
 
 // applySession sends the per-request GUC setup as a SINGLE batch within tx,
@@ -86,19 +125,23 @@ func readResponseControls(ctx context.Context, tx pgx.Tx, controls *reqctx.Respo
 	return nil
 }
 
-// buildSearchPathSQL pre-computes the SET LOCAL search_path statement for a
-// Backend so the string is built once and reused per request.
-func buildSearchPathSQL(schemas []string) string {
-	if len(schemas) == 0 {
+// searchPathValue builds the per-request search_path GUC value. The path is the
+// request's active schema (the Accept-Profile/Content-Profile choice, or the
+// first configured schema by default) followed by db-extra-search-path, matching
+// PostgREST: only the active schema is on the path, not the whole exposed set,
+// and the extra entries are appended without deduplication. Each name is quoted,
+// so the joined string is the literal value PostgREST writes ("schema", "public").
+// An empty active schema (the emulated-namespace marker the engines without named
+// schemas use) yields an empty value, so no search_path is set.
+func (b *Backend) searchPathValue(rc *reqctx.Context) string {
+	active := b.callSchema(rc)
+	if active == "" {
 		return ""
 	}
-	var b strings.Builder
-	b.WriteString("SET LOCAL search_path TO ")
+	schemas := append([]string{active}, b.extraSearchPath...)
+	parts := make([]string, len(schemas))
 	for i, s := range schemas {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteString((Dialect{}).QuoteIdent(s))
+		parts[i] = (Dialect{}).QuoteIdent(s)
 	}
-	return b.String()
+	return strings.Join(parts, ", ")
 }

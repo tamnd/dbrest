@@ -4,6 +4,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/tamnd/dbrest/backend"
 )
 
 // The response media types dbrest can produce, in preference order. A wildcard
@@ -22,13 +24,30 @@ const (
 
 var supportedMedia = []string{mediaJSON, mediaArray, mediaObject, mediaPlan, mediaCSV, mediaOctet, mediaText}
 
+// The internal media keys for the nulls=stripped variants of the vendor array
+// and object types. They are not real Accept literals; negotiate returns them so
+// the render path knows to drop null-valued keys and echo the parameterized
+// Content-Type.
+const (
+	mediaArrayStripped  = "application/vnd.pgrst.array+json;nulls=stripped"
+	mediaObjectStripped = "application/vnd.pgrst.object+json;nulls=stripped"
+)
+
+// singularMedia reports whether a negotiated media type asks for a single object
+// (the object vendor type or its nulls=stripped variant).
+func singularMedia(media string) bool {
+	return media == mediaObject || media == mediaObjectStripped
+}
+
 // mediaRange is one parsed entry of an Accept header: a type/subtype pair, its
-// quality value, and its position in the header for stable tie-breaking.
+// quality value, its position in the header for stable tie-breaking, and whether
+// it carried the nulls=stripped parameter.
 type mediaRange struct {
-	typ   string
-	sub   string
-	q     float64
-	order int
+	typ        string
+	sub        string
+	q          float64
+	order      int
+	stripNulls bool
 }
 
 // parseAccept parses the Accept header values into media ranges sorted by
@@ -48,14 +67,19 @@ func parseAccept(headers []string) []mediaRange {
 				continue
 			}
 			q := 1.0
+			stripNulls := false
 			for _, p := range segs[1:] {
-				if v, ok := strings.CutPrefix(strings.TrimSpace(p), "q="); ok {
+				p = strings.TrimSpace(p)
+				if v, ok := strings.CutPrefix(p, "q="); ok {
 					if f, err := strconv.ParseFloat(v, 64); err == nil {
 						q = f
 					}
 				}
+				if v, ok := strings.CutPrefix(strings.ToLower(p), "nulls="); ok && strings.TrimSpace(v) == "stripped" {
+					stripNulls = true
+				}
 			}
-			ranges = append(ranges, mediaRange{strings.ToLower(typ), strings.ToLower(sub), q, n})
+			ranges = append(ranges, mediaRange{strings.ToLower(typ), strings.ToLower(sub), q, n, stripNulls})
 			n++
 		}
 	}
@@ -63,31 +87,80 @@ func parseAccept(headers []string) []mediaRange {
 	return ranges
 }
 
-// planAnalyze reports whether the Accept header for vnd.pgrst.plan+json carries
-// "options=analyze", which asks for EXPLAIN ANALYZE rather than plain EXPLAIN.
-func planAnalyze(headers []string) bool {
+// planSubtypes are the application/vnd.pgrst.plan family subtypes dbrest
+// recognizes, mapping each to its output format. The bare type and the +text
+// suffix are PostgREST's text default; +json is the machine-readable form.
+var planSubtypes = map[string]backend.PlanFormat{
+	"vnd.pgrst.plan":      backend.PlanText,
+	"vnd.pgrst.plan+text": backend.PlanText,
+	"vnd.pgrst.plan+json": backend.PlanJSON,
+}
+
+// parsePlan scans the Accept header for the application/vnd.pgrst.plan family and
+// returns the parsed plan options. The second return is false when no plan type
+// is present. Output defaults to text (the bare type and +text); +json selects
+// the JSON form. The for="<media>" parameter (default application/json) and the
+// options=a|b|c flags (analyze, verbose, settings, buffers, wal) ride along.
+func parsePlan(headers []string) (backend.PlanOptions, bool) {
 	for _, h := range headers {
 		for part := range strings.SplitSeq(h, ",") {
-			part = strings.TrimSpace(part)
-			segs := strings.Split(part, ";")
+			segs := strings.Split(strings.TrimSpace(part), ";")
 			typ, sub, ok := strings.Cut(strings.TrimSpace(segs[0]), "/")
 			if !ok {
 				continue
 			}
-			if strings.ToLower(typ)+"/"+strings.ToLower(sub) != "application/vnd.pgrst.plan+json" {
+			typ = strings.ToLower(strings.TrimSpace(typ))
+			sub = strings.ToLower(strings.TrimSpace(sub))
+			format, isPlan := planSubtypes[sub]
+			if typ != "application" || !isPlan {
 				continue
 			}
+			opts := backend.PlanOptions{Format: format, For: mediaJSON}
 			for _, p := range segs[1:] {
-				p = strings.TrimSpace(p)
-				if v, ok := strings.CutPrefix(strings.ToLower(p), "options="); ok {
-					if strings.Contains(v, "analyze") {
-						return true
+				k, v, ok := strings.Cut(strings.TrimSpace(p), "=")
+				if !ok {
+					continue
+				}
+				k = strings.ToLower(strings.TrimSpace(k))
+				v = strings.Trim(strings.TrimSpace(v), `"`)
+				switch k {
+				case "for":
+					opts.For = v
+				case "options":
+					for _, o := range strings.Split(strings.ToLower(v), "|") {
+						switch strings.TrimSpace(o) {
+						case "analyze":
+							opts.Analyze = true
+						case "verbose":
+							opts.Verbose = true
+						case "settings":
+							opts.Settings = true
+						case "buffers":
+							opts.Buffers = true
+						case "wal":
+							opts.Wal = true
+						}
 					}
 				}
 			}
+			return opts, true
 		}
 	}
-	return false
+	return backend.PlanOptions{}, false
+}
+
+// vendorSynonym maps the suffixless PostgREST vendor spellings to their +json
+// forms, which PostgREST accepts as synonyms. Any other type passes through
+// unchanged.
+func vendorSynonym(full string) string {
+	switch full {
+	case "application/vnd.pgrst.array":
+		return mediaArray
+	case "application/vnd.pgrst.object":
+		return mediaObject
+	default:
+		return full
+	}
 }
 
 // negotiate picks the best supported response media type for the Accept header.
@@ -114,9 +187,27 @@ func negotiate(headers []string) (string, bool) {
 				}
 			}
 		default:
-			full := r.typ + "/" + r.sub
+			// The plan family (bare, +text, +json) negotiates to the single plan
+			// sentinel; parsePlan recovers the exact format and options later.
+			if r.typ == "application" {
+				if _, isPlan := planSubtypes[r.sub]; isPlan {
+					return mediaPlan, true
+				}
+			}
+			full := vendorSynonym(r.typ + "/" + r.sub)
 			for _, m := range supportedMedia {
 				if m == full {
+					// nulls=stripped applies only to the vendor array and object
+					// types; on plain application/json the parameter is ignored,
+					// matching PostgREST.
+					if r.stripNulls {
+						switch m {
+						case mediaArray:
+							return mediaArrayStripped, true
+						case mediaObject:
+							return mediaObjectStripped, true
+						}
+					}
 					return m, true
 				}
 			}

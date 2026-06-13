@@ -9,7 +9,6 @@ package schema
 
 import (
 	"slices"
-	"strings"
 )
 
 // Kind distinguishes the relation flavors the planner cares about.
@@ -28,15 +27,57 @@ type Model struct {
 	relations map[string]*Relation
 	// order preserves a deterministic relation order for OpenAPI and tests.
 	order []string
+	// schemaComments holds the database comment on each exposed schema, the
+	// source of the OpenAPI info title and description (first line and rest).
+	schemaComments map[string]string
+	// declared holds relationships supplied outside the catalog: config-declared
+	// edges on an FK-less backend (MongoDB) and emulated computed relationships.
+	// The planner treats them like derived edges; a declared edge whose name
+	// equals a derived one overrides it (spec 09). Empty on a pure catalog model.
+	declared []DeclaredRel
+}
+
+// AddDeclaredRelationship registers a relationship that does not come from a
+// foreign key: a config-declared edge or an emulated computed relationship. It
+// is called during introspection or config load, before the model is published.
+// The planner resolves it alongside catalog edges, and it overrides a derived
+// edge of the same name, the way a computed relationship overrides an
+// auto-detected one in PostgREST (spec 09).
+func (m *Model) AddDeclaredRelationship(d DeclaredRel) {
+	m.declared = append(m.declared, d)
+}
+
+// SetSchemaComment records a schema's database comment. It is called during
+// introspection, before the model is published; readers use SchemaComment.
+func (m *Model) SetSchemaComment(schemaName, comment string) {
+	if m.schemaComments == nil {
+		m.schemaComments = make(map[string]string)
+	}
+	m.schemaComments[schemaName] = comment
+}
+
+// SchemaComment returns the database comment on the named schema, or "" when
+// none was recorded.
+func (m *Model) SchemaComment(schemaName string) string {
+	return m.schemaComments[schemaName]
 }
 
 // Relation is one table or view in the exposed schema.
 type Relation struct {
-	Schema     string
-	Name       string
-	Kind       Kind
+	Schema string
+	Name   string
+	Kind   Kind
+	// Comment is the database comment on the relation (COMMENT ON TABLE, or
+	// the declared-schema equivalent). The OpenAPI generator splits it into
+	// the operation summary (first line) and description (rest), as v14 does.
+	Comment    string
 	Columns    []*Column
 	PrimaryKey []string // column names forming the PK, in order; may be empty
+	// Unique are the relation's unique constraints, each a set of column names. A
+	// foreign key whose columns match the PK or one of these is one-to-one from the
+	// referenced side, so the reverse embed renders as an object (spec 09). An
+	// engine whose introspector does not read unique constraints leaves this empty.
+	Unique [][]string
 	// ForeignKeys are the relation's outgoing foreign keys, the raw material the
 	// planner resolves embeds from (spec 09). Empty on an engine without them.
 	ForeignKeys []*ForeignKey
@@ -45,19 +86,108 @@ type Relation struct {
 	// from the FTS5 virtual tables that shadow a base table; an engine with
 	// column-agnostic full-text (PostgreSQL's tsvector) leaves it empty.
 	FullText []*FullTextIndex
+	// ViewColumns maps this view's output columns to the base-relation columns
+	// they project, when the relation is a view whose definition the introspector
+	// resolved to simple base-column references. It is empty for tables and for
+	// views the introspector does not project (UNIONs, expression columns). The
+	// model projects base-table foreign keys onto the view through it, so a view
+	// embeds the way the base table does (spec 09).
+	ViewColumns []ViewColumn
+	// Computed are the relation's computed fields: functions taking the relation's
+	// row type and returning a scalar, exposed as virtual columns the client can
+	// select, filter, and order by (PostgREST computed fields). The planner accepts
+	// their names where a real column is accepted and the compiler renders each as a
+	// function call on the row. Empty for engines or relations without any.
+	Computed []ComputedField
+	// ComputedRels are the relation's computed relationships: functions taking the
+	// relation's row type and returning a set (to-many) or a single row (to-one) of
+	// another relation, exposed as embeddable edges (PostgREST computed
+	// relationships, the escape hatch for recursive embeds). The planner resolves an
+	// embed name against them like a foreign-key edge and the compiler embeds by
+	// calling the function on the parent row. Empty for relations without any.
+	ComputedRels []ComputedRel
 
-	byName map[string]*Column
+	byName     map[string]*Column
+	byComputed map[string]*ComputedField
+}
+
+// ComputedRel is a function-backed embeddable edge: a function taking the parent
+// relation's row type and returning rows of a target relation. Name is the edge
+// name a client embeds by (the function name); FuncSchema is the schema the
+// function lives in; Target names the relation its rows belong to; Card is to-many
+// when the function is set-returning, to-one when it returns a single row.
+type ComputedRel struct {
+	Name         string
+	FuncSchema   string
+	TargetSchema string
+	TargetName   string
+	Card         Card
+}
+
+// ComputedField is a function-backed virtual column: a function taking the
+// relation's row type and returning a scalar. Name is the field as the client
+// selects it (the function name); FuncSchema is the schema the function lives in
+// (PostgREST requires it to match the relation's schema); Type is the canonical
+// return type, surfaced in OpenAPI and used for type-driven coercion.
+type ComputedField struct {
+	Name       string
+	FuncSchema string
+	Type       string
+}
+
+// ViewColumn records that a view's output column projects one base-relation
+// column. The introspector emits these by parsing the view definition; the model
+// uses them to carry base-table foreign keys onto the view.
+type ViewColumn struct {
+	Name         string // the view's output column name
+	BaseSchema   string
+	BaseRelation string
+	BaseColumn   string
 }
 
 // Column is one attribute of a relation.
 type Column struct {
-	Name       string
-	Type       string // canonical PG type name (spec 16)
+	Name string
+	Type string // canonical PG type name (spec 16)
+	// Comment is the database comment on the column. The OpenAPI generator
+	// surfaces it on the column's rowFilter parameter and ahead of the pk/fk
+	// notes in the definition property, matching v14.
+	Comment    string
 	Nullable   bool
 	HasDefault bool
+	// Identity reports whether the column is an auto-generated identity/serial
+	// column (IDENTITY on SQL Server, SERIAL/GENERATED ALWAYS AS IDENTITY on
+	// PostgreSQL). Backends that support explicit-identity inserts (e.g. SQL
+	// Server's IDENTITY_INSERT) use this to decide whether to enable it.
+	Identity bool
 	// Position is the 1-based ordinal, used for stable ordering.
 	Position int
+	// Rep, when non-nil, is the column's data-representation cast set: the column's
+	// type is a domain whose casts to and from json/text reformat the wire value
+	// (PostgREST domain representations, spec 11). Nil for an ordinary column.
+	Rep *Representation
 }
+
+// Representation is a column's data-representation cast set (PostgREST domain
+// representations, spec 11): a domain type whose casts to and from json/text
+// reformat the wire value. ToJSON formats the stored value for a response,
+// FromText parses a query-string filter literal, FromJSON parses a write-body
+// value. A direction the domain declares no cast for is the zero FuncRef.
+type Representation struct {
+	ToJSON   FuncRef
+	FromText FuncRef
+	FromJSON FuncRef
+}
+
+// FuncRef names a schema-qualified function. The zero value (empty Name) marks
+// an absent cast in a Representation.
+type FuncRef struct {
+	Schema string
+	Name   string
+}
+
+// IsZero reports whether the reference names no function (an absent cast).
+func (f FuncRef) IsZero() bool { return f.Name == "" }
 
 // FullTextIndex is an engine-side full-text facility covering one or more of a
 // relation's columns. The planner attaches the covering index to an fts predicate
@@ -96,6 +226,7 @@ func NewModel(rels []*Relation) *Model {
 		}
 		m.relations[key] = r
 	}
+	m.projectViews()
 	return m
 }
 
@@ -103,6 +234,10 @@ func (r *Relation) index() {
 	r.byName = make(map[string]*Column, len(r.Columns))
 	for _, c := range r.Columns {
 		r.byName[c.Name] = c
+	}
+	r.byComputed = make(map[string]*ComputedField, len(r.Computed))
+	for i := range r.Computed {
+		r.byComputed[r.Computed[i].Name] = &r.Computed[i]
 	}
 }
 
@@ -116,6 +251,14 @@ func (r *Relation) Column(name string) (*Column, bool) {
 func (r *Relation) HasColumn(name string) bool {
 	_, ok := r.byName[name]
 	return ok
+}
+
+// ComputedFieldFor returns the named computed field and whether it exists. A
+// computed field is selectable, filterable, and orderable like a real column but
+// is backed by a function call rather than stored data.
+func (r *Relation) ComputedFieldFor(name string) (*ComputedField, bool) {
+	c, ok := r.byComputed[name]
+	return c, ok
 }
 
 // ColumnNames returns the column names in ordinal order. It is the whole-row
@@ -139,21 +282,37 @@ func Key(schemaName, rel string) string {
 	return schemaName + "." + rel
 }
 
-// Lookup resolves a possibly-qualified relation name. An unqualified name
-// (no dot) is matched first directly, then against each schema in searchPath in
-// order, mirroring PostgREST's exposed-schema / search-path resolution.
+// Lookup resolves a relation name against the search path, trying each schema
+// in order. Request resolution passes the single active schema (selected by
+// the profile headers, defaulting to the first exposed schema), so a request
+// can never reach a relation outside it: PostgREST treats the path segment as
+// a bare name within the active schema, never as a qualified reference. With
+// an empty searchPath the name is matched directly against the model keys,
+// the mode introspection-internal callers use.
 func (m *Model) Lookup(name string, searchPath []string) (*Relation, bool) {
-	if r, ok := m.relations[name]; ok {
+	if len(searchPath) == 0 {
+		r, ok := m.relations[name]
 		return r, ok
 	}
-	if !strings.Contains(name, ".") {
-		for _, s := range searchPath {
-			if r, ok := m.relations[Key(s, name)]; ok {
-				return r, ok
-			}
+	for _, s := range searchPath {
+		if r, ok := m.relations[Key(s, name)]; ok {
+			return r, ok
 		}
 	}
 	return nil, false
+}
+
+// RelationsIn returns the relations of one schema in deterministic insertion
+// order. It is the per-schema view the OpenAPI root builds its document from,
+// so two same-named relations in different schemas can never collide there.
+func (m *Model) RelationsIn(schemaName string) []*Relation {
+	var out []*Relation
+	for _, k := range m.order {
+		if r := m.relations[k]; r.Schema == schemaName {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // Relations returns the relations in deterministic insertion order.

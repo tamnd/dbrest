@@ -6,7 +6,7 @@ import (
 )
 
 func TestParseCallGetArgsFromQuery(t *testing.T) {
-	c, err := ParseCall("add_them", "a=2&b=3", nil, true, "", nil)
+	c, err := ParseCall("add_them", "a=2&b=3", nil, true, "", nil, "", "")
 	if err != nil {
 		t.Fatalf("ParseCall: %v", err)
 	}
@@ -25,7 +25,7 @@ func TestParseCallGetArgsFromQuery(t *testing.T) {
 }
 
 func TestParseCallGetReservedKeysArePostFilters(t *testing.T) {
-	c, err := ParseCall("list_films", "select=title&order=year.desc&limit=5&year=gte.2000", nil, true, "", nil)
+	c, err := ParseCall("list_films", "select=title&order=year.desc&limit=5&year=gte.2000", nil, true, "", nil, "", "")
 	if err != nil {
 		t.Fatalf("ParseCall: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestParseCallGetReservedKeysArePostFilters(t *testing.T) {
 }
 
 func TestParseCallPostArgsFromBody(t *testing.T) {
-	c, err := ParseCall("add_them", "", nil, false, "application/json", []byte(`{"a":2,"b":3}`))
+	c, err := ParseCall("add_them", "", nil, false, "application/json", []byte(`{"a":2,"b":3}`), "", "")
 	if err != nil {
 		t.Fatalf("ParseCall: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestParseCallPostArgsFromBody(t *testing.T) {
 }
 
 func TestParseCallPostQueryStringIsPostFilter(t *testing.T) {
-	c, err := ParseCall("list_films", "year=gte.2000&order=year", nil, false, "application/json", []byte(`{"genre":"scifi"}`))
+	c, err := ParseCall("list_films", "year=gte.2000&order=year", nil, false, "application/json", []byte(`{"genre":"scifi"}`), "", "")
 	if err != nil {
 		t.Fatalf("ParseCall: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestParseCallPostQueryStringIsPostFilter(t *testing.T) {
 }
 
 func TestParseCallPostNoBody(t *testing.T) {
-	c, err := ParseCall("now", "", nil, false, "application/json", nil)
+	c, err := ParseCall("now", "", nil, false, "application/json", nil, "", "")
 	if err != nil {
 		t.Fatalf("ParseCall: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestParseCallPostNoBody(t *testing.T) {
 }
 
 func TestParseCallCountPrefer(t *testing.T) {
-	c, err := ParseCall("list_films", "", []string{"count=exact"}, true, "", nil)
+	c, err := ParseCall("list_films", "", []string{"count=exact"}, true, "", nil, "", "")
 	if err != nil {
 		t.Fatalf("ParseCall: %v", err)
 	}
@@ -104,7 +104,56 @@ func TestParseCallCountPrefer(t *testing.T) {
 }
 
 func TestParseCallBadJSONBody(t *testing.T) {
-	if _, err := ParseCall("f", "", nil, false, "application/json", []byte(`{nope`)); err == nil {
+	if _, err := ParseCall("f", "", nil, false, "application/json", []byte(`{nope`), "", ""); err == nil {
 		t.Error("malformed body should error")
+	}
+}
+
+// TestParseCallRawBodyJSON checks the single-unnamed-parameter form: a JSON body
+// binds whole to the named raw-body parameter, keeping its JSON type, rather than
+// being read as an object of named arguments.
+func TestParseCallRawBodyJSON(t *testing.T) {
+	c, err := ParseCall("echo", "", nil, false, "application/json", []byte(`{"a":1}`), "payload", "json")
+	if err != nil {
+		t.Fatalf("ParseCall: %v", err)
+	}
+	if len(c.Args) != 1 {
+		t.Fatalf("args = %v, want one raw-body arg", c.Args)
+	}
+	obj, ok := c.Args["payload"].JSON.(map[string]any)
+	if !ok || obj["a"] == nil {
+		t.Errorf("payload = %+v, want the whole JSON object", c.Args["payload"])
+	}
+}
+
+// TestParseCallRawBodyText checks a text body binds to the raw-body parameter as
+// text under text/plain, the form an unnamed text parameter takes.
+func TestParseCallRawBodyText(t *testing.T) {
+	c, err := ParseCall("shout", "", nil, false, "text/plain", []byte("hello"), "line", "text")
+	if err != nil {
+		t.Fatalf("ParseCall: %v", err)
+	}
+	if c.Args["line"].Text != "hello" || c.Args["line"].JSON != nil {
+		t.Errorf("line = %+v, want text hello", c.Args["line"])
+	}
+}
+
+// TestParseCallRawBodyOctetStream checks application/octet-stream binds the raw
+// bytes to the parameter as text, the bytea-bound form.
+func TestParseCallRawBodyOctetStream(t *testing.T) {
+	c, err := ParseCall("store", "", nil, false, "application/octet-stream", []byte{0x1, 0x2}, "blob", "bytea")
+	if err != nil {
+		t.Fatalf("ParseCall: %v", err)
+	}
+	if c.Args["blob"].Text != string([]byte{0x1, 0x2}) {
+		t.Errorf("blob = %+v, want the raw bytes", c.Args["blob"])
+	}
+}
+
+// TestParseCallRawBodyUnsupportedMedia checks a media type the raw-body binder
+// does not accept is the caller's 415, not a silent empty bind.
+func TestParseCallRawBodyUnsupportedMedia(t *testing.T) {
+	if _, err := ParseCall("store", "", nil, false, "image/png", []byte("x"), "blob", "bytea"); err == nil {
+		t.Error("an unsupported media type must reject the raw body")
 	}
 }

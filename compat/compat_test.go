@@ -106,6 +106,13 @@ type compatCase struct {
 	// for responses whose status code depends on non-deterministic state (e.g.
 	// planner statistics that differ between two independent database instances).
 	skipStatusMatch bool
+
+	// cleanupPath: if non-empty, a DELETE is issued to this path on the target
+	// server immediately before the case runs. Both servers share one database,
+	// so an insert into a UNIQUE-constrained column would collide on the second
+	// server's turn; clearing the row first lets each server's write be tested
+	// against a clean slot.
+	cleanupPath string
 }
 
 // All test cases, grouped by the compat matrix sections.
@@ -225,30 +232,38 @@ var cases = []compatCase{
 		bodyMode: "schema"},
 
 	// ── Group 10: Inserts ─────────────────────────────────────────────────
+	// todos.task is UNIQUE in the shared rig DB; cleanupPath clears each row so
+	// both servers insert into a clean slot (a no-op on the two-DB docker rig).
 	{name: "10.1 insert minimal 201", method: "POST", path: "/todos",
-		headers:    map[string]string{"Content-Type": "application/json"},
-		body:       `{"task":"compat insert minimal"}`,
-		wantStatus: 201, bodyMode: "empty"},
+		headers:     map[string]string{"Content-Type": "application/json"},
+		body:        `{"task":"compat insert minimal"}`,
+		cleanupPath: "/todos?task=eq.compat%20insert%20minimal",
+		wantStatus:  201, bodyMode: "empty"},
 	{name: "10.2 insert return=representation 201", method: "POST", path: "/todos",
-		headers:    map[string]string{"Content-Type": "application/json", "Prefer": "return=representation"},
-		body:       `{"task":"compat insert repr"}`,
-		wantStatus: 201, bodyMode: "schema"},
+		headers:     map[string]string{"Content-Type": "application/json", "Prefer": "return=representation"},
+		body:        `{"task":"compat insert repr"}`,
+		cleanupPath: "/todos?task=eq.compat%20insert%20repr",
+		wantStatus:  201, bodyMode: "schema"},
 	{name: "10.3 insert return=headers-only 201", method: "POST", path: "/todos",
-		headers:    map[string]string{"Content-Type": "application/json", "Prefer": "return=headers-only"},
-		body:       `{"task":"compat insert headers-only"}`,
-		wantStatus: 201, bodyMode: "empty",
+		headers:     map[string]string{"Content-Type": "application/json", "Prefer": "return=headers-only"},
+		body:        `{"task":"compat insert headers-only"}`,
+		cleanupPath: "/todos?task=eq.compat%20insert%20headers-only",
+		wantStatus:  201, bodyMode: "empty",
 		wantLocationPrefix: "/todos?id=eq."},
 	{name: "10.4 bulk insert 201", method: "POST", path: "/todos",
-		headers:    map[string]string{"Content-Type": "application/json", "Prefer": "return=representation"},
-		body:       `[{"task":"bulk a"},{"task":"bulk b"}]`,
-		wantStatus: 201, bodyMode: "schema"},
+		headers:     map[string]string{"Content-Type": "application/json", "Prefer": "return=representation"},
+		body:        `[{"task":"bulk a"},{"task":"bulk b"}]`,
+		cleanupPath: "/todos?task=like.bulk%20*",
+		wantStatus:  201, bodyMode: "schema"},
 	{name: "10.5 insert missing=default 201", method: "POST", path: "/todos",
-		headers:    map[string]string{"Content-Type": "application/json", "Prefer": "missing=default,return=representation"},
-		body:       `{"task":"compat missing default"}`,
-		wantStatus: 201, bodyMode: "schema"},
+		headers:     map[string]string{"Content-Type": "application/json", "Prefer": "missing=default,return=representation"},
+		body:        `{"task":"compat missing default"}`,
+		cleanupPath: "/todos?task=eq.compat%20missing%20default",
+		wantStatus:  201, bodyMode: "schema"},
 	{name: "10.6 insert Location header", method: "POST", path: "/todos",
 		headers:            map[string]string{"Content-Type": "application/json"},
 		body:               `{"task":"compat location test"}`,
+		cleanupPath:        "/todos?task=eq.compat%20location%20test",
 		wantStatus:         201,
 		bodyMode:           "empty",
 		wantLocationPrefix: "/todos?id=eq."},
@@ -306,9 +321,10 @@ var cases = []compatCase{
 		body:       `{"id":1,"task":"put upsert","done":false}`,
 		wantStatus: 200, bodyMode: "schema"},
 	{name: "13.5 PUT upsert new 201", method: "PUT", path: "/todos?id=eq.9999",
-		headers:    map[string]string{"Content-Type": "application/json", "Prefer": "return=representation"},
-		body:       `{"id":9999,"task":"new via put","done":false}`,
-		wantStatus: 201, bodyMode: "schema"},
+		headers:     map[string]string{"Content-Type": "application/json", "Prefer": "return=representation"},
+		body:        `{"id":9999,"task":"new via put","done":false}`,
+		cleanupPath: "/todos?id=eq.9999",
+		wantStatus:  201, bodyMode: "schema"},
 
 	// ── Group 15: tx=rollback ─────────────────────────────────────────────
 	{name: "15.1 tx=rollback insert", method: "POST", path: "/todos",
@@ -327,9 +343,10 @@ var cases = []compatCase{
 		headers: map[string]string{"Content-Type": "application/json"}, body: `{}`,
 		wantStatus: 200, bodyMode: "status"},
 	{name: "16.3 volatile fn POST", method: "POST", path: "/rpc/add_todo",
-		headers:    map[string]string{"Content-Type": "application/json"},
-		body:       `{"task":"rpc insert"}`,
-		wantStatus: 200, bodyMode: "status"},
+		headers:     map[string]string{"Content-Type": "application/json"},
+		body:        `{"task":"rpc insert"}`,
+		cleanupPath: "/todos?task=eq.rpc%20insert",
+		wantStatus:  200, bodyMode: "status"},
 	{name: "16.4 volatile tx=rollback", method: "POST", path: "/rpc/add_todo",
 		headers:    map[string]string{"Content-Type": "application/json", "Prefer": "tx=rollback"},
 		body:       `{"task":"rpc rollback"}`,
@@ -365,7 +382,9 @@ var cases = []compatCase{
 		body: `{"task":"no content type"}`,
 		// PostgREST v14.13 infers JSON when Content-Type is absent and body looks
 		// like JSON; it no longer rejects with 415. Test that both servers agree.
-		bodyMode: "status"},
+		// todos.task is UNIQUE in the shared rig DB, so clear the row first.
+		cleanupPath: "/todos?task=eq.no%20content%20type",
+		bodyMode:    "status"},
 	{name: "20.3 bad value for int col 400", method: "GET", path: "/todos?id=eq.notanint",
 		wantStatus: 400, bodyMode: "status"},
 	{name: "20.4 bad operator 400", method: "GET", path: "/todos?id=badop.1",
@@ -395,6 +414,7 @@ var cases = []compatCase{
 	{name: "22.1 pref-applied return=representation", method: "POST", path: "/todos",
 		headers:         map[string]string{"Content-Type": "application/json", "Prefer": "return=representation"},
 		body:            `{"task":"pref applied test"}`,
+		cleanupPath:     "/todos?task=eq.pref%20applied%20test",
 		wantStatus:      201,
 		bodyMode:        "schema",
 		wantPrefApplied: "return=representation"},
@@ -766,6 +786,13 @@ type response struct {
 
 func doRequest(t *testing.T, base string, c compatCase) response {
 	t.Helper()
+	if c.cleanupPath != "" {
+		req, _ := http.NewRequest(http.MethodDelete, base+c.cleanupPath, nil)
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+	}
 	var bodyReader io.Reader
 	if c.body != "" {
 		bodyReader = strings.NewReader(c.body)

@@ -81,7 +81,8 @@ func (b *Backend) columns(ctx context.Context, table string) ([]*schema.Column, 
 			c.IS_NULLABLE,
 			c.COLUMN_DEFAULT,
 			CASE WHEN k.COLUMN_NAME IS NOT NULL THEN 1 ELSE 0 END AS is_pk,
-			ISNULL(k.ORDINAL_POSITION, 0) AS pk_ord
+			ISNULL(k.ORDINAL_POSITION, 0) AS pk_ord,
+			COLUMNPROPERTY(OBJECT_ID(SCHEMA_NAME()+'.'+c.TABLE_NAME), c.COLUMN_NAME, 'IsIdentity') AS is_identity
 		FROM INFORMATION_SCHEMA.COLUMNS c
 		LEFT JOIN (
 			SELECT kcu.COLUMN_NAME, kcu.ORDINAL_POSITION
@@ -113,16 +114,17 @@ func (b *Backend) columns(ctx context.Context, table string) ([]*schema.Column, 
 	for rows.Next() {
 		var name, dataType, isNullable string
 		var colDefault sql.NullString
-		var isPK, pkOrd int
-		if err := rows.Scan(&name, &dataType, &isNullable, &colDefault, &isPK, &pkOrd); err != nil {
+		var isPK, pkOrd, isIdentity int
+		if err := rows.Scan(&name, &dataType, &isNullable, &colDefault, &isPK, &pkOrd, &isIdentity); err != nil {
 			return nil, nil, err
 		}
-		hasDefault := isPK == 1 || colDefault.Valid
+		hasDefault := isPK == 1 || colDefault.Valid || isIdentity == 1
 		col := &schema.Column{
 			Name:       name,
 			Type:       sqlServerCanonicalType(dataType),
 			Nullable:   isNullable == "YES",
 			HasDefault: hasDefault,
+			Identity:   isIdentity == 1,
 		}
 		colRows = append(colRows, colRow{col: col, isPK: isPK == 1, pkOrd: pkOrd})
 	}

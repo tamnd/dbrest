@@ -52,6 +52,7 @@ func Open(dsn string) (*Backend, error) {
 		return nil, fmt.Errorf("invalid MySQL DSN: %w", err)
 	}
 	cfg.ParseTime = true
+	cfg.ClientFoundRows = true           // report matched rows, not changed rows (UPDATE re-select gate)
 	delete(cfg.Params, "tinyInt1IsBool") // removed in v1.8; schema-layer handles coercion
 
 	connector, err := mysqldrv.NewConnector(cfg)
@@ -122,15 +123,23 @@ func (b *Backend) MapError(err error) *pgerr.APIError {
 
 // mapMySQLError builds the unified API error from a MySQL driver error.
 func mapMySQLError(me *mysqldrv.MySQLError) *pgerr.APIError {
+	// Class-23 violations carry PostgreSQL's wording, not the native MySQL text:
+	// the MySQL driver gives no constraint name or offending value in a form that
+	// reconstructs PG's message, so neither is invented and the native text is not
+	// leaked into details (an emulation limitation, documented in the spec).
 	switch me.Number {
 	case 1062: // ER_DUP_ENTRY
-		return pgerr.ErrUniqueViolation(me.Message)
+		return pgerr.ErrConstraintViolation(pgerr.CodeUniqueViolation,
+			"duplicate key value violates unique constraint", "", "")
 	case 1048: // ER_BAD_NULL_ERROR
-		return pgerr.ErrNotNullViolation(me.Message)
+		return pgerr.ErrConstraintViolation(pgerr.CodeNotNullViolation,
+			"null value violates not-null constraint", "", "")
 	case 1406, 1264: // ER_DATA_TOO_LONG, ER_WARN_DATA_OUT_OF_RANGE
-		return pgerr.ErrCheckViolation(me.Message)
+		return pgerr.ErrConstraintViolation(pgerr.CodeCheckViolation,
+			"new row violates check constraint", "", "")
 	case 1451, 1452: // ER_ROW_IS_REFERENCED_2, ER_NO_REFERENCED_ROW_2
-		return pgerr.ErrForeignKeyViolation(me.Message)
+		return pgerr.ErrConstraintViolation(pgerr.CodeForeignKeyViolation,
+			"insert or update on table violates foreign key constraint", "", "")
 	case 1054, 1247: // ER_BAD_FIELD_ERROR, ER_ILLEGAL_REFERENCE
 		return pgerr.New(400, "42703", me.Message)
 	case 1146: // ER_NO_SUCH_TABLE

@@ -16,6 +16,7 @@
 package postgres
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -86,6 +87,13 @@ func (Dialect) Returning(cols []string) (string, bool) {
 // row, so a merge sets each column to its excluded value. An empty update set or
 // an ignore request becomes DO NOTHING.
 func (Dialect) Upsert(spec sqlgen.UpsertSpec) (string, error) {
+	// DO UPDATE without a conflict target is not valid PostgreSQL ("ON CONFLICT DO
+	// UPDATE requires inference specification or constraint name"). The compiler
+	// already degrades a no-target upsert to a plain INSERT, so this guards against
+	// a future caller emitting the invalid form.
+	if !spec.Ignore && len(spec.Update) > 0 && len(spec.Target) == 0 {
+		return "", fmt.Errorf("merge upsert needs a conflict target")
+	}
 	var sb strings.Builder
 	sb.WriteString("ON CONFLICT")
 	if len(spec.Target) > 0 {
@@ -110,12 +118,34 @@ func (Dialect) Upsert(spec sqlgen.UpsertSpec) (string, error) {
 // JSONObject assembles a JSON object with json_build_object, the function whose
 // argument order fixes the key order to the select order (spec 06, "JSON
 // assembly"). Keys are JSON string literals; values are already-compiled SQL.
+//
+// PostgreSQL caps a function call at 100 arguments (FUNC_MAX_ARGS), and each pair
+// is two arguments, so an object of more than 50 keys (a wide embedded table)
+// would raise 54023. Past that threshold the object is built in chunks of 50
+// pairs with jsonb_build_object and concatenated with jsonb's || , then cast back
+// to json so the result type matches the unchunked form for json_agg and the
+// json cast downstream.
 func (Dialect) JSONObject(pairs []sqlgen.Pair) string {
-	parts := make([]string, 0, len(pairs)*2)
-	for _, p := range pairs {
-		parts = append(parts, "'"+strings.ReplaceAll(p.Key, "'", "''")+"'", p.Value)
+	const maxPairs = 50
+	buildChunk := func(chunk []sqlgen.Pair, fn string) string {
+		parts := make([]string, 0, len(chunk)*2)
+		for _, p := range chunk {
+			parts = append(parts, "'"+strings.ReplaceAll(p.Key, "'", "''")+"'", p.Value)
+		}
+		return fn + "(" + strings.Join(parts, ", ") + ")"
 	}
-	return "json_build_object(" + strings.Join(parts, ", ") + ")"
+	if len(pairs) <= maxPairs {
+		return buildChunk(pairs, "json_build_object")
+	}
+	var chunks []string
+	for i := 0; i < len(pairs); i += maxPairs {
+		end := i + maxPairs
+		if end > len(pairs) {
+			end = len(pairs)
+		}
+		chunks = append(chunks, buildChunk(pairs[i:end], "jsonb_build_object"))
+	}
+	return "to_json(" + strings.Join(chunks, " || ") + ")"
 }
 
 // JSONAgg aggregates rows with json_agg. PostgreSQL takes an ORDER BY inside the
@@ -130,15 +160,18 @@ func (Dialect) JSONAgg(elem, orderBy string) string {
 
 // Cast translates a canonical type to a PostgreSQL ::type cast, the form PG
 // itself uses. The expression is parenthesized so the cast binds to the whole
-// expression, not just its tail. An unknown canonical type falls back to text,
-// which is the safe rendering for an opaque value.
+// expression, not just its tail. The type name is passed through to PostgreSQL
+// after the parser has validated it against a safe grammar (ir.validCastType),
+// so casts to money, interval, an enum, a domain, or an array type resolve the
+// same way they do under PostgREST rather than degrading to text.
 func (Dialect) Cast(expr, canonicalType string) string {
 	return "(" + expr + ")::" + pgType(canonicalType)
 }
 
-// pgType maps a canonical type name to its PostgreSQL spelling. The canonical
-// names are the PG type names already in most cases, so the map mostly
-// normalizes aliases (int->int4, bool->boolean stays bool) to one spelling.
+// pgType normalizes a handful of canonical aliases to one PostgreSQL spelling
+// (int->int4 and friends) and passes every other type name through unchanged.
+// The name has already been validated as a safe type spelling by the parser, so
+// PostgreSQL resolves it directly the way PostgREST relies on.
 func pgType(canonical string) string {
 	switch canonical {
 	case "int", "integer", "int4":
@@ -172,7 +205,7 @@ func pgType(canonical string) string {
 	case "jsonb":
 		return "jsonb"
 	default:
-		return "text"
+		return canonical
 	}
 }
 
@@ -222,7 +255,12 @@ func sqlLiteral(s string) string {
 }
 
 // ArrayOp renders a PostgreSQL array containment/overlap expression.
-func (Dialect) ArrayOp(col, op, val string) (string, bool) {
+func (Dialect) ArrayOp(col, op, val, _ string) (string, bool) {
+	return col + " " + op + " " + val, true
+}
+
+// RangeOp renders PostgreSQL's native range operators (<<, >>, &<, &>, -|-).
+func (Dialect) RangeOp(col, op, val string) (string, bool) {
 	return col + " " + op + " " + val, true
 }
 
@@ -235,4 +273,55 @@ func (Dialect) BoolValue(v bool) string {
 		return "TRUE"
 	}
 	return "FALSE"
+}
+
+// IsBool falls back to the generic "IS TRUE"/"IS FALSE" form; PostgreSQL
+// supports IS <bool> natively.
+func (Dialect) IsBool(string, bool) (string, bool) { return "", false }
+
+// IsUnknown renders PostgreSQL's native three-valued "col IS UNKNOWN" test.
+func (Dialect) IsUnknown(col string) (string, bool) { return col + " IS UNKNOWN", true }
+
+// InList renders an in-list as col = ANY($n), the form PostgREST uses so a list
+// of any length binds as one array parameter and reuses a single prepared
+// statement. The rows are identical to an expanded IN.
+func (Dialect) InList(col string) (string, bool) {
+	return col + " = ANY(" + sqlgen.PatternMark + ")", true
+}
+
+// ArrayLiteral returns the PostgreSQL {a,b} array literal unchanged; PostgreSQL
+// accepts it natively.
+func (Dialect) ArrayLiteral(pgText string) string { return pgText }
+
+// ArrayArg renders a payload array for the target column. A JSON array bound for
+// a json/jsonb column is JSON, not a PostgreSQL array, so it is kept as JSON
+// text; for an array column it becomes the {a,b} array-literal text so the
+// server-side cast from text to text[]/int4[]/etc. succeeds with or without type
+// OIDs. An unknown column type keeps the array-literal default.
+func (Dialect) ArrayArg(elems []any, colType string) any {
+	if colType == "json" || colType == "jsonb" {
+		return sqlgen.JSONArrayArg(elems)
+	}
+	return sqlgen.PGArrayLiteral(elems)
+}
+
+// JSONPath emits PostgreSQL's native -> / ->> operator chain: every hop is ->
+// (json) except the final one, which is ->> when the access was text. A digit
+// segment becomes an integer array index; any other segment is a quoted key.
+func (Dialect) JSONPath(base string, hops []string, asText bool) (string, bool) {
+	var b strings.Builder
+	b.WriteString(base)
+	for i, h := range hops {
+		op := "->"
+		if asText && i == len(hops)-1 {
+			op = "->>"
+		}
+		b.WriteString(op)
+		if sqlgen.IsJSONArrayIndex(h) {
+			b.WriteString(h)
+		} else {
+			b.WriteString("'" + strings.ReplaceAll(h, "'", "''") + "'")
+		}
+	}
+	return b.String(), true
 }

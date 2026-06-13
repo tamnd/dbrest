@@ -98,7 +98,7 @@ func TestJSON(t *testing.T) {
 	if obj != "JSON_OBJECT('name': d.[name], 'year': d.[year])" {
 		t.Errorf("JSONObject = %q", obj)
 	}
-	if got := d.JSONAgg("t", "t.[id] DESC"); got != "JSON_ARRAYAGG(t)" {
+	if got := d.JSONAgg("t", "t.[id] DESC"); got != "'['+STRING_AGG(CAST((t) AS NVARCHAR(MAX)),',')+']'" {
 		t.Errorf("JSONAgg = %q", got)
 	}
 }

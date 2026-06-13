@@ -110,6 +110,39 @@ func TestCompileRegexSnapshot(t *testing.T) {
 	}
 }
 
+// An in-list lowers to col = ANY($1) binding a single array literal, the form
+// PostgREST uses so a list of any length reuses one prepared statement. Finding
+// P13.
+func TestCompileInListSnapshot(t *testing.T) {
+	where := ir.Cond(ir.Compare{Path: []string{"id"}, Op: ir.OpIn, Value: ir.Value{List: []string{"1", "2", "3"}}})
+	st, err := sqlgen.CompileRead(d, &ir.Query{Relation: ir.Ref{Name: "films"}, Where: &where})
+	if err != nil {
+		t.Fatalf("CompileRead: %v", err)
+	}
+	want := `SELECT * FROM "films" WHERE "id" = ANY($1)`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+	// One bound argument carries the whole list as a PostgreSQL array literal.
+	if len(st.Args) != 1 || st.Args[0] != "{1,2,3}" {
+		t.Errorf("Args = %v, want [{1,2,3}]", st.Args)
+	}
+}
+
+// A negated in-list keeps the single-parameter form under a NOT wrapper, which
+// returns the same rows as PostgREST's <> ALL.
+func TestCompileNotInListSnapshot(t *testing.T) {
+	where := ir.Cond(ir.Compare{Path: []string{"id"}, Op: ir.OpIn, Negate: true, Value: ir.Value{List: []string{"1", "2"}}})
+	st, err := sqlgen.CompileRead(d, &ir.Query{Relation: ir.Ref{Name: "films"}, Where: &where})
+	if err != nil {
+		t.Fatalf("CompileRead: %v", err)
+	}
+	want := `SELECT * FROM "films" WHERE NOT ("id" = ANY($1))`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+}
+
 func TestCompileFTSSnapshot(t *testing.T) {
 	where := ir.Cond(ir.Compare{Path: []string{"body"}, Op: ir.OpFTS, FTS: ir.FTSWeb, Value: ir.Value{Text: "cat dog"}})
 	st, err := sqlgen.CompileRead(d, &ir.Query{Relation: ir.Ref{Name: "docs"}, Where: &where})

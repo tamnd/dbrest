@@ -64,5 +64,26 @@
       "body": "{\"code\":\"PGRST127\",\"message\":\"\",\"details\":\"\",\"hint\":\"\"}"
     },
     "mask": ["/message", "/details", "/hint"]
+  },
+  {
+    "name": "like is case-sensitive: a lowercase pattern matches nothing",
+    "request": { "method": "GET", "path": "/films", "query": "title=like.bl*" },
+    "golden": { "status": 200, "body": "[]" }
+  },
+  {
+    "name": "like is case-sensitive: the title-cased pattern matches",
+    "request": { "method": "GET", "path": "/films", "query": "title=like.Bl*" },
+    "golden": {
+      "status": 200,
+      "body": "[{\"id\":2,\"title\":\"Blade Runner\",\"year\":1982,\"rating\":\"R\"}]"
+    }
+  },
+  {
+    "name": "ilike folds case: a lowercase pattern matches the title-cased row",
+    "request": { "method": "GET", "path": "/films", "query": "title=ilike.bl*" },
+    "golden": {
+      "status": 200,
+      "body": "[{\"id\":2,\"title\":\"Blade Runner\",\"year\":1982,\"rating\":\"R\"}]"
+    }
   }
 ]

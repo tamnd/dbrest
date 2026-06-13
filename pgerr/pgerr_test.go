@@ -45,6 +45,54 @@ func TestWithDetailsHintImmutable(t *testing.T) {
 	}
 }
 
+// PGRST201 returns details as a JSON array of candidate relationship objects;
+// the envelope must carry it as an array, not a quoted string, while string
+// details and null keep their existing encodings.
+func TestDetailsCanCarryNonStringJSON(t *testing.T) {
+	candidates := []map[string]string{{
+		"cardinality":  "many-to-one",
+		"embedding":    "orders with addresses",
+		"relationship": "billing using orders(billing_address_id) and addresses(id)",
+	}}
+	base := ErrAmbiguousEmbed("orders", "addresses", nil)
+	e := base.WithDetailsJSON(candidates)
+	if base.RawDetails != nil {
+		t.Error("WithDetailsJSON mutated the receiver")
+	}
+
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(e.JSON(), &m); err != nil {
+		t.Fatalf("envelope not valid json: %v", err)
+	}
+	var got []map[string]string
+	if err := json.Unmarshal(m["details"], &got); err != nil {
+		t.Fatalf("details is not a JSON array: %v: %s", err, m["details"])
+	}
+	if len(got) != 1 || got[0]["embedding"] != "orders with addresses" {
+		t.Errorf("details round-trip = %v", got)
+	}
+
+	// A string details still renders as a JSON string.
+	var sm map[string]json.RawMessage
+	se := ErrParse("x").WithDetails("plain text")
+	if err := json.Unmarshal(se.JSON(), &sm); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if string(sm["details"]) != `"plain text"` {
+		t.Errorf("string details = %s, want %q", sm["details"], `"plain text"`)
+	}
+
+	// Raw details win over a previously set string.
+	both := se.WithDetailsJSON([]int{1, 2})
+	var bm map[string]json.RawMessage
+	if err := json.Unmarshal(both.JSON(), &bm); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if string(bm["details"]) != "[1,2]" {
+		t.Errorf("raw details = %s, want [1,2]", bm["details"])
+	}
+}
+
 func TestUnsupportedNamesFeatureAndBackend(t *testing.T) {
 	e := ErrUnsupported("range operator 'sl'", "mysql")
 	if e.HTTPStatus != http.StatusBadRequest {
@@ -64,12 +112,17 @@ func TestUnsupportedNamesFeatureAndBackend(t *testing.T) {
 
 func TestWriteSetsStatusAndContentType(t *testing.T) {
 	rec := httptest.NewRecorder()
-	ErrUnknownTable("films").Write(rec)
+	ErrUnknownTable("public", "films").Write(rec)
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", rec.Code)
 	}
 	if ct := rec.Header().Get("Content-Type"); ct != "application/json; charset=utf-8" {
 		t.Errorf("content-type = %q", ct)
+	}
+	// v14 names the error code in Proxy-Status so HEAD requests can identify
+	// the failure; the value matches a live v14's byte for byte.
+	if ps := rec.Header().Get("Proxy-Status"); ps != "PostgREST; error=PGRST205" {
+		t.Errorf("Proxy-Status = %q, want %q", ps, "PostgREST; error=PGRST205")
 	}
 	var b body
 	if err := json.Unmarshal(rec.Body.Bytes(), &b); err != nil {
@@ -77,6 +130,35 @@ func TestWriteSetsStatusAndContentType(t *testing.T) {
 	}
 	if b.Code != CodeUnknownTable {
 		t.Errorf("code = %s", b.Code)
+	}
+	if h := rec.Header().Get("WWW-Authenticate"); h != "" {
+		t.Errorf("a non-auth error must not carry WWW-Authenticate, got %q", h)
+	}
+}
+
+func TestWriteEmitsWWWAuthenticate(t *testing.T) {
+	rec := httptest.NewRecorder()
+	ErrJWTClaims("JWT expired").Write(rec)
+	want := `Bearer error="invalid_token", error_description="JWT expired"`
+	if h := rec.Header().Get("WWW-Authenticate"); h != want {
+		t.Errorf("WWW-Authenticate = %q, want %q", h, want)
+	}
+}
+
+// A full-control raised error carries response headers that Write must merge
+// onto the response, while the fixed envelope headers still win (item 04.9).
+func TestWriteEmitsCarriedHeaders(t *testing.T) {
+	rec := httptest.NewRecorder()
+	e := New(402, "123", "Payment Required").WithHeaders(map[string]string{
+		"X-Reason":     "quota",
+		"Content-Type": "text/plain", // a function must not be able to break the body
+	})
+	e.Write(rec)
+	if h := rec.Header().Get("X-Reason"); h != "quota" {
+		t.Errorf("X-Reason = %q, want quota", h)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json; charset=utf-8" {
+		t.Errorf("content-type = %q, want the reserved envelope type to win", ct)
 	}
 }
 

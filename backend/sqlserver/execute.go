@@ -3,6 +3,8 @@ package sqlserver
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"strconv"
 	"strings"
 
 	"github.com/tamnd/dbrest/backend"
@@ -110,6 +112,19 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 	q := plan.Query
 	returning := returningCols(q, plan.Rel)
 
+	// An empty column set (POST with an empty array, PATCH with an empty object)
+	// is a no-op: nothing is compiled or run, the affected count is zero, and the
+	// representation is the empty array. The HTTP layer turns that into 201/[] for
+	// an insert and 204 or 200/[] for an update.
+	if backend.IsNoOpMutation(q) {
+		return &writeResult{
+			controls: rc.Controls(),
+			cols:     returning,
+			affected: 0,
+			hasAff:   true,
+		}, nil
+	}
+
 	tx, err := b.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, b.MapError(err)
@@ -132,6 +147,11 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 		return nil, b.MapError(err)
 	}
 
+	// Prefer: max-affected rolls an over-broad write back instead of committing.
+	if apiErr := backend.EnforceMaxAffected(q.Write, res.affected, res.hasAff); apiErr != nil {
+		return nil, apiErr
+	}
+
 	if q.Write != nil && q.Write.Tx == ir.TxRollback {
 		return res, nil
 	}
@@ -145,11 +165,17 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 // The compiler emits: INSERT INTO [t] ([c1],[c2]) VALUES (@p1,@p2)
 // The data plane rewrites to: INSERT INTO [t] ([c1],[c2]) OUTPUT INSERTED.[c1],... VALUES (@p1,@p2)
 // by injecting the OUTPUT fragment before the " VALUES " marker.
+// Upsert (on_conflict) is routed to executeUpsert instead of the single-statement
+// compiler, which returns errUpsertMultiStatement.
 func (b *Backend) executeInsert(
 	ctx context.Context, tx *sql.Tx,
 	q *ir.Query, returning []string, rel *schema.Relation,
 	res *writeResult,
 ) error {
+	if q.Kind == ir.Upsert {
+		return b.executeUpsert(ctx, tx, q, returning, rel, res)
+	}
+
 	st, apiErr := sqlgen.CompileInsert(Dialect{}, q, nil)
 	if apiErr != nil {
 		return apiErr
@@ -185,6 +211,209 @@ func (b *Backend) executeInsert(
 	n, _ := out.RowsAffected()
 	res.affected, res.hasAff = n, true
 	return nil
+}
+
+// executeUpsert implements the SQL Server upsert as a single MERGE statement per
+// batch. MERGE avoids the semicolon-separated multi-statement pattern that
+// go-mssqldb rejects when sent via sp_executesql.
+//
+// All rows are merged in one statement: the source is a VALUES(...) table with
+// one row-tuple per input row; the ON clause matches the conflict (primary-key)
+// columns; WHEN MATCHED updates non-key columns; WHEN NOT MATCHED inserts.
+// The OUTPUT clause captures written rows when returning is requested.
+func (b *Backend) executeUpsert(
+	ctx context.Context, tx *sql.Tx,
+	q *ir.Query, returning []string, rel *schema.Relation,
+	res *writeResult,
+) error {
+	w := q.Write
+	if len(w.Rows) == 0 {
+		res.affected, res.hasAff = 0, true
+		return nil
+	}
+
+	d := Dialect{}
+	sch := q.Relation.Schema
+	if sch == "" {
+		sch = b.schema
+		if sch == "" {
+			sch = "dbo"
+		}
+	}
+	tableName := d.QuoteIdent(sch) + "." + d.QuoteIdent(q.Relation.Name)
+
+	conflictCols := w.Conflict.Target
+	conflictSet := make(map[string]bool, len(conflictCols))
+	for _, c := range conflictCols {
+		conflictSet[c] = true
+	}
+	nonConflictCols := make([]string, 0, len(w.Columns))
+	for _, c := range w.Columns {
+		if !conflictSet[c] {
+			nonConflictCols = append(nonConflictCols, c)
+		}
+	}
+
+	// Collect args; @pN bind positions match the order we append.
+	raw := []any{}
+	argN := 0
+	bind := func(v any) string {
+		argN++
+		raw = append(raw, v)
+		return "@p" + strconv.Itoa(argN)
+	}
+
+	// Build the source alias column names: s0, s1, ...
+	srcCols := make([]string, len(w.Columns))
+	for i := range w.Columns {
+		srcCols[i] = "s" + strconv.Itoa(i)
+	}
+
+	var sb strings.Builder
+
+	// MERGE INTO target USING (VALUES (...),(...)) AS src(s0,s1,...)
+	sb.WriteString("MERGE INTO ")
+	sb.WriteString(tableName)
+	sb.WriteString(" WITH (HOLDLOCK) AS [_target] USING (VALUES ")
+	for ri, row := range w.Rows {
+		if ri > 0 {
+			sb.WriteString(",")
+		}
+		sb.WriteString("(")
+		for ci, c := range w.Columns {
+			if ci > 0 {
+				sb.WriteString(",")
+			}
+			sb.WriteString(bind(sqlgen.WriteArg(d, row[c], w.ColumnTypes[c])))
+		}
+		sb.WriteString(")")
+	}
+	sb.WriteString(") AS [_src](")
+	for i, sc := range srcCols {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		sb.WriteString(d.QuoteIdent(sc))
+	}
+	sb.WriteString(") ON (")
+	// ON conflict columns match
+	for i, c := range conflictCols {
+		if i > 0 {
+			sb.WriteString(" AND ")
+		}
+		ci := colIndex(w.Columns, c)
+		sb.WriteString("[_target]." + d.QuoteIdent(c) + "=[_src]." + d.QuoteIdent(srcCols[ci]))
+	}
+	sb.WriteString(")")
+
+	// WHEN MATCHED THEN UPDATE (skip if ignore or no non-conflict cols)
+	if w.Conflict.Resolution != ir.ConflictIgnore && len(nonConflictCols) > 0 {
+		sb.WriteString(" WHEN MATCHED THEN UPDATE SET ")
+		for i, c := range nonConflictCols {
+			if i > 0 {
+				sb.WriteString(",")
+			}
+			ci := colIndex(w.Columns, c)
+			sb.WriteString("[_target]." + d.QuoteIdent(c) + "=[_src]." + d.QuoteIdent(srcCols[ci]))
+		}
+	}
+
+	// WHEN NOT MATCHED THEN INSERT
+	sb.WriteString(" WHEN NOT MATCHED THEN INSERT (")
+	for i, c := range w.Columns {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		sb.WriteString(d.QuoteIdent(c))
+	}
+	sb.WriteString(") VALUES (")
+	for i, sc := range srcCols {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		sb.WriteString("[_src]." + d.QuoteIdent(sc))
+	}
+	sb.WriteString(")")
+
+	// OUTPUT clause when returning is requested
+	if len(returning) > 0 {
+		sb.WriteString(" OUTPUT ")
+		for i, c := range returning {
+			if i > 0 {
+				sb.WriteString(",")
+			}
+			sb.WriteString("INSERTED." + d.QuoteIdent(c))
+		}
+	}
+
+	// MERGE requires a terminating semicolon.
+	sb.WriteString(";")
+
+	// When any conflict column is an IDENTITY column and the user provided
+	// an explicit value, SQL Server requires IDENTITY_INSERT to be ON.
+	needIdentityInsert := rel != nil && hasIdentityConflictCol(rel, conflictCols, w.Columns)
+	if needIdentityInsert {
+		if _, err := tx.ExecContext(ctx, "SET IDENTITY_INSERT "+tableName+" ON"); err != nil {
+			return err
+		}
+		defer func() { _, _ = tx.ExecContext(ctx, "SET IDENTITY_INSERT "+tableName+" OFF") }()
+	}
+
+	if len(returning) > 0 {
+		rows, err := tx.QueryContext(ctx, sb.String(), namedArgs(raw)...)
+		if err != nil {
+			return err
+		}
+		cols, err := rows.Columns()
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		jsonIdx, timeIdx := buildColMaps(rows, nil)
+		buf, err := drain(rows, cols, jsonIdx, timeIdx)
+		rows.Close()
+		if err != nil {
+			return err
+		}
+		res.cols, res.rows = cols, buf
+		res.affected, res.hasAff = int64(len(buf)), true
+		return nil
+	}
+
+	out, err := tx.ExecContext(ctx, sb.String(), namedArgs(raw)...)
+	if err != nil {
+		return err
+	}
+	n, _ := out.RowsAffected()
+	res.affected, res.hasAff = n, true
+	return nil
+}
+
+// hasIdentityConflictCol reports whether any conflict column is an identity
+// column AND is present in payloadCols (the user provided an explicit value).
+// When IDENTITY_INSERT is ON, SQL Server requires an explicit value, so we only
+// enable it when the identity column is actually in the payload.
+func hasIdentityConflictCol(rel *schema.Relation, conflictCols, payloadCols []string) bool {
+	payload := make(map[string]bool, len(payloadCols))
+	for _, c := range payloadCols {
+		payload[c] = true
+	}
+	for _, c := range conflictCols {
+		if col, ok := rel.Column(c); ok && col.Identity && payload[c] {
+			return true
+		}
+	}
+	return false
+}
+
+// colIndex returns the position of name in cols, or 0 as a safe fallback.
+func colIndex(cols []string, name string) int {
+	for i, c := range cols {
+		if c == name {
+			return i
+		}
+	}
+	return 0
 }
 
 // executeUpdate runs UPDATE [t] SET ... OUTPUT INSERTED.* WHERE ...
@@ -279,15 +508,27 @@ func (b *Backend) executeDelete(
 
 // executeCall runs a stored procedure or portable RPC function.
 func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Context) (backend.Result, error) {
-	st, apiErr := sqlgen.CompileCall(Dialect{}, plan.Call, plan.Func)
+	var st *sqlgen.Statement
+	var apiErr *pgerr.APIError
+	if plan.Func != nil {
+		// Portable registry function: the function body is a parameterised SQL
+		// statement whose :name placeholders are bound by CompileCall.
+		st, apiErr = sqlgen.CompileCall(Dialect{}, plan.Call, plan.Func, sqlgen.ContextArgs(rc))
+	} else {
+		// Native RPC (NativeRPC=true): no registry function — generate EXEC
+		// [schema].[name] @param = @pN from the call's argument map.
+		st, apiErr = b.compileNativeCall(plan.Call)
+	}
 	if apiErr != nil {
 		return nil, apiErr
 	}
 
 	if plan.ReadOnly {
 		res := &result{controls: rc.Controls()}
-		if plan.Call.Count != ir.CountNone {
-			cst, apiErr := sqlgen.CompileCallCount(Dialect{}, plan.Call, plan.Func)
+		// count=exact is only supported for portable registry functions; native
+		// stored procedures cannot be wrapped in SELECT count(*) in T-SQL.
+		if plan.Call.Count != ir.CountNone && plan.Func != nil {
+			cst, apiErr := sqlgen.CompileCallCount(Dialect{}, plan.Call, plan.Func, sqlgen.ContextArgs(rc))
 			if apiErr != nil {
 				return nil, apiErr
 			}
@@ -379,12 +620,66 @@ func injectBeforeWhere(sqlStr, fragment string) string {
 // returningCols decides which columns to read back after a write.
 func returningCols(q *ir.Query, rel *schema.Relation) []string {
 	if q.Write != nil && q.Write.Return == ir.ReturnRepresentation {
+		if cols := q.ProjectedColumns(); cols != nil {
+			return cols
+		}
 		return rel.ColumnNames()
 	}
 	if q.Kind == ir.Insert || q.Kind == ir.Upsert {
 		return rel.PrimaryKey
 	}
 	return nil
+}
+
+// compileNativeCall generates EXEC [schema].[name] @arg1 = @p1, @arg2 = @p2 for
+// the NativeRPC path (plan.Func == nil). SQL Server stored procedures accept
+// named parameters in any order, so the argument map can be emitted as-is.
+// Scalar stored procedures should SELECT the result in a column named after the
+// function (e.g. SELECT @a + @b AS [add]) so renderCall can detect scalar return
+// by seeing a single column whose name matches the function name.
+func (b *Backend) compileNativeCall(c *ir.Call) (*sqlgen.Statement, *pgerr.APIError) {
+	sch := b.schema
+	if sch == "" {
+		sch = "dbo"
+	}
+	d := Dialect{}
+	var sb strings.Builder
+	sb.WriteString("EXEC ")
+	sb.WriteString(d.QuoteIdent(sch))
+	sb.WriteString(".")
+	sb.WriteString(d.QuoteIdent(c.Function.Name))
+
+	args := make([]any, 0, len(c.Args))
+	i := 1
+	for name, val := range c.Args {
+		if i == 1 {
+			sb.WriteString(" ")
+		} else {
+			sb.WriteString(", ")
+		}
+		sb.WriteString("@" + name + " = @p" + strconv.Itoa(i))
+		// A POST arg has a decoded JSON value; a GET arg is raw text.
+		if val.JSON != nil {
+			args = append(args, nativeArgValue(val.JSON))
+		} else {
+			args = append(args, val.Text)
+		}
+		i++
+	}
+	return &sqlgen.Statement{SQL: sb.String(), Args: args}, nil
+}
+
+// nativeArgValue converts a decoded JSON argument value to a driver-ready type.
+// Scalars (string, float64, bool, nil) pass through; composite values are
+// re-encoded as JSON text so the stored procedure can receive them as NVARCHAR.
+func nativeArgValue(v any) any {
+	switch v.(type) {
+	case string, float64, bool, nil:
+		return v
+	default:
+		b, _ := json.Marshal(v)
+		return string(b)
+	}
 }
 
 // _ is a compile-time check that Backend implements backend.DB.

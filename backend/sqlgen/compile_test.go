@@ -67,7 +67,7 @@ func (stub) RegexFeatureGap(string) string             { return "" }
 
 // FullText models a PostgreSQL-flavored, column-agnostic full text: the index is
 // ignored (tsvector works on any column), so a nil idx is fine.
-func (stub) FullText(col string, _ *FullTextRef, v ir.FTSVariant, _, _ string) (string, string, bool) {
+func (stub) FullText(col, _ string, _ *FullTextRef, v ir.FTSVariant, _, _ string) (string, string, bool) {
 	ctor := map[ir.FTSVariant]string{
 		ir.FTSPlain: "to_tsquery", ir.FTSPlainText: "plainto_tsquery",
 		ir.FTSPhrase: "phraseto_tsquery", ir.FTSWeb: "websearch_to_tsquery",
@@ -76,15 +76,41 @@ func (stub) FullText(col string, _ *FullTextRef, v ir.FTSVariant, _, _ string) (
 }
 func (stub) SessionRead(k string) string          { return "" }
 func (stub) SessionWrite(k string) (string, bool) { return "", false }
-func (stub) ArrayOp(col, op, val string) (string, bool) {
+func (stub) ArrayOp(col, op, val, _ string) (string, bool) {
 	return col + " " + op + " " + val, true
 }
+func (stub) RangeOp(col, op, val string) (string, bool) {
+	return col + " " + op + " " + val, true
+}
+func (stub) ArrayLiteral(s string) string         { return s }
+func (stub) InList(_ string) (string, bool)       { return "", false }
+func (stub) ArrayArg(e []any, _ string) any       { return JSONArrayArg(e) }
 func (stub) ILike(col, val string) (string, bool) { return col + " ILIKE " + val, true }
 func (stub) BoolValue(v bool) string {
 	if v {
 		return "TRUE"
 	}
 	return "FALSE"
+}
+func (stub) IsBool(string, bool) (string, bool) { return "", false }
+func (stub) IsUnknown(string) (string, bool)    { return "", false }
+
+// JSONPath mirrors the PostgreSQL native ->/->> chain so the shared compiler's
+// JSON-path routing is assertable without a real engine.
+func (stub) JSONPath(base string, hops []string, asText bool) (string, bool) {
+	expr := base
+	for i, h := range hops {
+		op := "->"
+		if asText && i == len(hops)-1 {
+			op = "->>"
+		}
+		if IsJSONArrayIndex(h) {
+			expr += op + h
+		} else {
+			expr += op + "'" + h + "'"
+		}
+	}
+	return expr, true
 }
 
 func compile(t *testing.T, q *ir.Query) *Statement {
@@ -229,6 +255,76 @@ func TestCompileEmptyInMatchesNothing(t *testing.T) {
 	}
 }
 
+// TestCompileQuantifiedEqExpandsToOr checks eq(any) over a list fans out into an
+// OR of equalities, each value bound (item 01.1).
+func TestCompileQuantifiedEqExpandsToOr(t *testing.T) {
+	where := ir.Cond(ir.Compare{
+		Path:  []string{"id"},
+		Op:    ir.OpEq,
+		Quant: ir.QAny,
+		Value: ir.Value{List: []string{"1", "2", "3"}},
+	})
+	st := compile(t, &ir.Query{Relation: ir.Ref{Name: "t"}, Where: &where})
+	want := `SELECT * FROM "t" WHERE ("id" = $1 OR "id" = $2 OR "id" = $3)`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+	if len(st.Args) != 3 || st.Args[0] != "1" || st.Args[2] != "3" {
+		t.Errorf("Args = %v", st.Args)
+	}
+}
+
+// TestCompileQuantifiedGtExpandsToAnd checks gt(all) fans out into an AND.
+func TestCompileQuantifiedGtExpandsToAnd(t *testing.T) {
+	where := ir.Cond(ir.Compare{
+		Path:  []string{"year"},
+		Op:    ir.OpGt,
+		Quant: ir.QAll,
+		Value: ir.Value{List: []string{"1990", "2000"}},
+	})
+	st := compile(t, &ir.Query{Relation: ir.Ref{Name: "t"}, Where: &where})
+	want := `SELECT * FROM "t" WHERE ("year" > $1 AND "year" > $2)`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+}
+
+// TestCompileQuantifiedMatchUsesDialectRegex checks match(any) routes each
+// element through the dialect regex seam (PatternMark replaced by the bind).
+func TestCompileQuantifiedMatchUsesDialectRegex(t *testing.T) {
+	where := ir.Cond(ir.Compare{
+		Path:  []string{"c"},
+		Op:    ir.OpMatch,
+		Quant: ir.QAny,
+		Value: ir.Value{List: []string{"^a", "b$"}},
+	})
+	st := compile(t, &ir.Query{Relation: ir.Ref{Name: "t"}, Where: &where})
+	want := `SELECT * FROM "t" WHERE ("c" ~ $1 OR "c" ~ $2)`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+	if len(st.Args) != 2 || st.Args[0] != "^a" || st.Args[1] != "b$" {
+		t.Errorf("Args = %v", st.Args)
+	}
+}
+
+// TestCompileQuantifiedNegated checks a negated quantified compare wraps the
+// whole fan-out in NOT (…).
+func TestCompileQuantifiedNegated(t *testing.T) {
+	where := ir.Cond(ir.Compare{
+		Path:   []string{"id"},
+		Op:     ir.OpEq,
+		Quant:  ir.QAny,
+		Negate: true,
+		Value:  ir.Value{List: []string{"1", "2"}},
+	})
+	st := compile(t, &ir.Query{Relation: ir.Ref{Name: "t"}, Where: &where})
+	want := `SELECT * FROM "t" WHERE NOT (("id" = $1 OR "id" = $2))`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+}
+
 func TestCompileCount(t *testing.T) {
 	st, err := CompileCount(stub{}, &ir.Query{Relation: ir.Ref{Name: "films"}})
 	if err != nil {
@@ -300,23 +396,23 @@ func TestCompileInsertMultiRow(t *testing.T) {
 }
 
 func TestCompileInsertMissingDefaultAndNull(t *testing.T) {
-	// A row missing a column takes DEFAULT under missing=default ...
+	// A row missing a column takes DEFAULT only under an explicit missing=default ...
 	st, _ := CompileInsert(stub{}, &ir.Query{
 		Relation: ir.Ref{Name: "t"},
 		Write: &ir.WriteSpec{
 			Columns: []string{"a", "b"},
+			Missing: ir.MissingDefault,
 			Rows:    []map[string]ir.Value{{"a": jstr("x")}},
 		},
 	}, nil)
 	if st.SQL != `INSERT INTO "t" ("a", "b") VALUES ($1, DEFAULT)` {
 		t.Errorf("default: SQL = %q", st.SQL)
 	}
-	// ... and a bound NULL under missing=null.
+	// ... and a bound NULL by default (MissingNull is the zero value, item 01.18).
 	st, _ = CompileInsert(stub{}, &ir.Query{
 		Relation: ir.Ref{Name: "t"},
 		Write: &ir.WriteSpec{
 			Columns: []string{"a", "b"},
-			Missing: ir.MissingNull,
 			Rows:    []map[string]ir.Value{{"a": jstr("x")}},
 		},
 	}, nil)
@@ -428,12 +524,13 @@ func TestCompileInsertEmptyPayloadRejected(t *testing.T) {
 	}
 }
 
-// The base SQL compiler does not lower the array and range operators; a backend
-// grades them per dialect. A read using one here reports PGRST127 and names the
-// operator, rather than emitting a quietly different predicate.
+// A range operator on an engine whose dialect declines (no range types) reports
+// PGRST127 and names the PostgREST token, rather than emitting a quietly
+// different predicate. A range-capable dialect lowers it instead; see
+// rangeop_test.go.
 func TestCompileRangeOperatorRejectedNamed(t *testing.T) {
 	where := ir.Cond(ir.Compare{Path: []string{"period"}, Op: ir.OpRangeSL, Value: ir.Value{Text: "[1,2)"}})
-	_, err := CompileRead(stub{}, &ir.Query{Relation: ir.Ref{Name: "t"}, Where: &where})
+	_, err := CompileRead(noRangeDialect{}, &ir.Query{Relation: ir.Ref{Name: "t"}, Where: &where})
 	if err == nil || err.Code != "PGRST127" {
 		t.Fatalf("want PGRST127, got %v", err)
 	}
@@ -442,12 +539,106 @@ func TestCompileRangeOperatorRejectedNamed(t *testing.T) {
 	}
 }
 
-func TestCompileAggregateRejected(t *testing.T) {
-	_, err := CompileRead(stub{}, &ir.Query{
+// TestCompileBareCount renders count() with no grouping column as count(*) over
+// the whole relation, keyed to its default response name (item 01.4).
+func TestCompileBareCount(t *testing.T) {
+	st := compile(t, &ir.Query{
 		Relation: ir.Ref{Name: "t"},
 		Select:   []ir.SelectItem{ir.Aggregate{Func: ir.AggCount}},
 	})
-	if err == nil || err.Code != "PGRST127" {
-		t.Fatalf("want PGRST127 for aggregate, got %v", err)
+	want := `SELECT count(*) AS "count" FROM "t"`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+}
+
+// TestCompileColumnAggregateGroupsBy renders category, amount.sum() as a grouped
+// aggregate: the plain column is the GROUP BY key, the aggregate folds per group.
+func TestCompileColumnAggregateGroupsBy(t *testing.T) {
+	st := compile(t, &ir.Query{
+		Relation: ir.Ref{Schema: "public", Name: "sales"},
+		Select: []ir.SelectItem{
+			col("category"),
+			ir.Aggregate{Func: ir.AggSum, Arg: &ir.Column{Path: []string{"amount"}}},
+		},
+	})
+	want := `SELECT "category", sum("amount") AS "sum" FROM "public"."sales" GROUP BY "category"`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+}
+
+// TestCompileAggregateAliasAndCasts honors a response-key alias, an input cast on
+// the aggregated column, and an output cast on the result.
+func TestCompileAggregateAliasAndCasts(t *testing.T) {
+	st := compile(t, &ir.Query{
+		Relation: ir.Ref{Name: "sales"},
+		Select: []ir.SelectItem{
+			ir.Aggregate{
+				Func:  ir.AggSum,
+				Arg:   &ir.Column{Path: []string{"amount"}, Cast: "numeric"},
+				Cast:  "text",
+				Alias: "total",
+			},
+		},
+	})
+	want := `SELECT CAST(sum(CAST("amount" AS numeric)) AS text) AS "total" FROM "sales"`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+}
+
+// A payload array goes through the dialect on the write path: the stub (like
+// every engine without array columns) binds the JSON text, never a PostgreSQL
+// {a,b} literal. This is what lets a JSON column round-trip ["go","sql"].
+func TestCompileUpdateArrayBindsDialectForm(t *testing.T) {
+	st, err := CompileUpdate(stub{}, &ir.Query{
+		Relation: ir.Ref{Name: "todos"},
+		Write: &ir.WriteSpec{Set: map[string]ir.Value{
+			"tags": {JSON: []any{"go", "sql"}},
+		}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("CompileUpdate: %v", err)
+	}
+	if len(st.Args) != 1 || st.Args[0] != `["go","sql"]` {
+		t.Errorf("Args = %#v, want JSON text", st.Args)
+	}
+}
+
+func TestCompileInsertArrayBindsDialectForm(t *testing.T) {
+	st, err := CompileInsert(stub{}, &ir.Query{
+		Relation: ir.Ref{Name: "todos"},
+		Write: &ir.WriteSpec{
+			Columns: []string{"tags"},
+			Rows:    []map[string]ir.Value{{"tags": {JSON: []any{json.Number("1"), "two words"}}}},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("CompileInsert: %v", err)
+	}
+	if len(st.Args) != 1 || st.Args[0] != `[1,"two words"]` {
+		t.Errorf("Args = %#v, want JSON text", st.Args)
+	}
+}
+
+// PGArrayLiteral is the PostgreSQL form of the same payload: bare elements
+// unquoted, strings with spaces or quotes double-quoted and escaped, NULL for
+// JSON null.
+func TestPGArrayLiteral(t *testing.T) {
+	cases := []struct {
+		in   []any
+		want string
+	}{
+		{[]any{"go", "sql"}, `{go,sql}`},
+		{[]any{json.Number("1"), json.Number("2.5")}, `{1,2.5}`},
+		{[]any{"two words", `qu"ote`, nil}, `{"two words","qu\"ote",NULL}`},
+		{[]any{true, false}, `{t,f}`},
+		{[]any{}, `{}`},
+	}
+	for _, c := range cases {
+		if got := PGArrayLiteral(c.in); got != c.want {
+			t.Errorf("PGArrayLiteral(%v) = %q, want %q", c.in, got, c.want)
+		}
 	}
 }

@@ -16,6 +16,7 @@ package reqctx
 
 import (
 	"encoding/json"
+	"maps"
 	"sort"
 	"strings"
 )
@@ -43,6 +44,27 @@ type Context struct {
 	// Content-Profile choice), or "" for the default. Cross-schema routing is the
 	// introspection subsystem's job (spec 08); this field carries the choice.
 	Schema string
+	// PreRequest names the db-pre-request function the backend must invoke after
+	// the request context is in place and before the main statement, in the same
+	// transaction (spec 13). Empty means none is configured. An error the
+	// function raises aborts the request through normal error mapping, and any
+	// response controls it writes are applied at render time.
+	PreRequest string
+
+	// AppSettings are the app.settings.* options, keys without the prefix. A
+	// backend applies them as transaction settings (GUCs on PostgreSQL) next
+	// to the request context.
+	AppSettings map[string]string
+
+	// LogQuery asks the backend to echo the statements it executes for this
+	// request, the log-query option.
+	LogQuery bool
+
+	// TimeZone is the Prefer: timezone= request timezone, already validated by
+	// ir.ParsePrefer. A backend that supports it applies SET LOCAL timezone for the
+	// request; the emulated render path converts temporals to it. Empty means the
+	// client stated no timezone and the engine default stands.
+	TimeZone string
 
 	controls ResponseControls
 }
@@ -50,12 +72,31 @@ type Context struct {
 // ClaimsJSON marshals the verified claims into the object request.jwt.claims
 // carries. It is "{}" when there are no claims, never null, so a backend that
 // writes the GUC verbatim and a policy that reads it both see a valid object.
+//
+// The resolved request role is folded in under the "role" key, overwriting any
+// role the token carried, exactly as PostgREST does (PreQuery.hs inserts the
+// resolved role into the claims before writing the GUC). So an anonymous request
+// presents {"role":"<anon-role>"} rather than {}, and the common RLS pattern
+// current_setting('request.jwt.claims', true)::json->>'role' reads the role on
+// every request, the case PostgREST guarantees a value.
 func (c *Context) ClaimsJSON() []byte {
-	if len(c.Claims) == 0 {
-		return []byte("{}")
+	if c.Role == "" {
+		// No resolved role to fold in (the fail-closed frontend always sets one, so
+		// this is the degenerate case); marshal the claims as they are.
+		if len(c.Claims) == 0 {
+			return []byte("{}")
+		}
+		b, err := json.Marshal(c.Claims)
+		if err != nil {
+			return []byte("{}")
+		}
+		return b
 	}
+	merged := make(map[string]any, len(c.Claims)+1)
+	maps.Copy(merged, c.Claims)
+	merged["role"] = c.Role
 	// encoding/json sorts map keys, so the output is deterministic.
-	b, err := json.Marshal(c.Claims)
+	b, err := json.Marshal(merged)
 	if err != nil {
 		return []byte("{}")
 	}
@@ -63,13 +104,24 @@ func (c *Context) ClaimsJSON() []byte {
 }
 
 // HeadersJSON marshals the request headers into the object request.headers
-// carries: a JSON object of lower-cased header name to value, with a multi-valued
-// header joined by ", " as HTTP defines. Keys are sorted for a deterministic
-// document.
+// carries: a JSON object of lower-cased header name to value. Keys are sorted
+// for a deterministic document.
+//
+// Two rules match PostgREST exactly (ApiRequest.hs). The Cookie header is
+// excluded, because it is delivered separately as request.cookies; including it
+// would leak raw cookie material into code that only consults headers. A header
+// sent more than once resolves to its last value (later wins), not a comma-join,
+// reproducing how PostgREST's later pair overwrites the earlier in the object.
 func (c *Context) HeadersJSON() []byte {
 	flat := make(map[string]string, len(c.Headers))
 	for k, vs := range c.Headers {
-		flat[strings.ToLower(k)] = strings.Join(vs, ", ")
+		lk := strings.ToLower(k)
+		if lk == "cookie" {
+			continue
+		}
+		if len(vs) > 0 {
+			flat[lk] = vs[len(vs)-1]
+		}
 	}
 	return marshalSortedObject(flat)
 }
@@ -117,13 +169,15 @@ type ResponseControls struct {
 	Status int
 	// Headers are extra response headers to merge in.
 	Headers map[string]string
-	// UpsertInsert is set by the backend when it can determine whether the upsert
-	// resulted in a pure INSERT (all rows were new, true) or hit existing rows
-	// (false). Only backends that support this detection (PostgreSQL via xmax)
-	// set UpsertStatusKnown = true; others leave it false, and the HTTP layer
-	// defaults to 201 for POST upserts.
+	// InsertedRows is the number of payload rows the upsert inserted as new (the
+	// rest replaced existing rows). The HTTP layer reads it to separate a
+	// zero-inserted merge from a mixed batch: a POST merge upsert is 200 only when
+	// it is zero, a PUT is 201 only when it is positive. A backend sets it together
+	// with UpsertStatusKnown = true when it can detect insert-vs-update (sqlite by a
+	// pre-write key probe, PostgreSQL via xmax); others leave the status unknown and
+	// the HTTP layer defaults to 201 for POST upserts.
 	UpsertStatusKnown bool
-	UpsertInsert      bool
+	InsertedRows      int
 }
 
 // Controls returns a pointer to the mutable response controls.

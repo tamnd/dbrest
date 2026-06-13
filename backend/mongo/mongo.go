@@ -128,7 +128,12 @@ func (b *Backend) MapError(err error) *pgerr.APIError {
 		return nil
 	}
 	if driver.IsDuplicateKeyError(err) {
-		return pgerr.ErrUniqueViolation(err.Error())
+		// PostgreSQL's wording, not Mongo's native text: the driver gives no
+		// constraint name or key value in a form that reconstructs PG's message,
+		// so neither is invented and the native text is not leaked into details
+		// (an emulation limitation, documented in the spec).
+		return pgerr.ErrConstraintViolation(pgerr.CodeUniqueViolation,
+			"duplicate key value violates unique constraint", "", "")
 	}
 	if driver.IsTimeout(err) {
 		return pgerr.ErrInternal("mongodb: timeout: " + err.Error())

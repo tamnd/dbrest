@@ -37,6 +37,34 @@ func TestParseSelectAliasAndCast(t *testing.T) {
 	}
 }
 
+// A cast target is spliced into SQL, not bound, so the parser validates it
+// against a safe type grammar: real type spellings pass, anything that could
+// break out of the cast is a PGRST100 parse error. PostgREST itself does not
+// whitelist the type name, so every well-formed spelling must survive.
+func TestParseSelectCastValidation(t *testing.T) {
+	ok := []string{
+		"price::money", "d::interval", "raw::bytea", "ip::inet",
+		"m::mood", "n::numeric(10,2)", "tags::int[]", "c::public.color",
+		"t::double precision",
+	}
+	for _, item := range ok {
+		if _, err := ParseRead("films", "select="+item, nil); err != nil {
+			t.Errorf("select=%s: unexpected error %v", item, err)
+		}
+	}
+	bad := []string{
+		"x::te'xt", "x::text;drop", "x::text--", "x::int*2", "x::1nt", "x::ta\\b",
+	}
+	for _, item := range bad {
+		_, err := ParseRead("films", "select="+item, nil)
+		if err == nil {
+			t.Errorf("select=%s: want parse error, got none", item)
+		} else if err.Code != "PGRST100" {
+			t.Errorf("select=%s: code = %s, want PGRST100", item, err.Code)
+		}
+	}
+}
+
 func TestParseSelectJSONPath(t *testing.T) {
 	q := mustRead(t, "select=data->meta->>id")
 	c := q.Select[0].(Column)
@@ -45,6 +73,34 @@ func TestParseSelectJSONPath(t *testing.T) {
 	}
 	if c.Last != JSONArrow2 {
 		t.Errorf("last = %v, want JSONArrow2", c.Last)
+	}
+}
+
+// 07.1: a JSON-path filter keeps the base column and hops on Compare.Path and
+// records the final ->/->> on Last so the compiler can type the access.
+func TestParseFilterJSONPath(t *testing.T) {
+	q := mustRead(t, "data->phones->0->>number=eq.555")
+	cmp, ok := (*q.Where).(Compare)
+	if !ok {
+		t.Fatalf("where = %T, want Compare", *q.Where)
+	}
+	if !reflect.DeepEqual(cmp.Path, []string{"data", "phones", "0", "number"}) {
+		t.Errorf("path = %v", cmp.Path)
+	}
+	if cmp.Last != JSONArrow2 {
+		t.Errorf("last = %v, want JSONArrow2 (final ->>)", cmp.Last)
+	}
+}
+
+// 07.1: ordering by a JSON path records the path and the final hop kind.
+func TestParseOrderJSONPath(t *testing.T) {
+	q := mustRead(t, "order=data->>created_at.desc")
+	if len(q.Order) != 1 {
+		t.Fatalf("order terms = %d", len(q.Order))
+	}
+	o := q.Order[0]
+	if !reflect.DeepEqual(o.Path, []string{"data", "created_at"}) || o.Last != JSONArrow2 || !o.Desc {
+		t.Errorf("order = %v last=%v desc=%v", o.Path, o.Last, o.Desc)
 	}
 }
 
@@ -65,10 +121,64 @@ func TestParseEmbed(t *testing.T) {
 	}
 }
 
+// 07.8: empty parentheses set EmptySelect so the compiler can join the relation
+// for filtering yet hide its key, distinct from rel(*) which selects every
+// column.
+func TestParseEmbedEmptySelect(t *testing.T) {
+	q := mustRead(t, "select=title,director()")
+	emb := q.Embeds[0]
+	if !emb.EmptySelect {
+		t.Errorf("director() should set EmptySelect")
+	}
+	if len(emb.Query.Select) != 0 {
+		t.Errorf("director() select = %d, want 0", len(emb.Query.Select))
+	}
+
+	q = mustRead(t, "select=title,director(*)")
+	if q.Embeds[0].EmptySelect {
+		t.Errorf("director(*) must not set EmptySelect")
+	}
+}
+
 func TestParseEmbedInnerHint(t *testing.T) {
 	q := mustRead(t, "select=director!inner(name)")
 	if q.Embeds[0].Join != JoinInner {
 		t.Errorf("join = %v, want inner", q.Embeds[0].Join)
+	}
+}
+
+// TestParseEmbedHintWithInner covers a disambiguation hint composed with !inner
+// in either order, plus !hint!left (item 01.13).
+func TestParseEmbedHintWithInner(t *testing.T) {
+	cases := []struct {
+		sel  string
+		hint string
+		join JoinKind
+	}{
+		{"select=addresses!billing!inner(city)", "billing", JoinInner},
+		{"select=addresses!inner!billing(city)", "billing", JoinInner},
+		{"select=addresses!billing!left(city)", "billing", JoinLeft},
+		{"select=addresses!billing(city)", "billing", JoinLeft},
+	}
+	for _, c := range cases {
+		q := mustRead(t, c.sel)
+		emb := q.Embeds[0]
+		if emb.Target.Name != "addresses" {
+			t.Errorf("%s: target = %q, want addresses", c.sel, emb.Target.Name)
+		}
+		if emb.Hint != c.hint {
+			t.Errorf("%s: hint = %q, want %q", c.sel, emb.Hint, c.hint)
+		}
+		if emb.Join != c.join {
+			t.Errorf("%s: join = %v, want %v", c.sel, emb.Join, c.join)
+		}
+	}
+}
+
+func TestParseEmbedTwoHintsRejected(t *testing.T) {
+	_, err := ParseRead("films", "select=addresses!one!two(city)", nil)
+	if err == nil || err.Code != "PGRST100" {
+		t.Fatalf("want PGRST100 for two hints, got %v", err)
 	}
 }
 
@@ -116,6 +226,16 @@ func TestParseIs(t *testing.T) {
 	}
 	if _, err := ParseRead("films", "deleted=is.maybe", nil); err == nil {
 		t.Error("is.maybe should be a parse error")
+	}
+}
+
+// is.unknown is the three-valued boolean test; the parser must accept it
+// alongside null/true/false/not_null (item 07.4).
+func TestParseIsUnknown(t *testing.T) {
+	q := mustRead(t, "done=is.unknown")
+	c := (*q.Where).(Compare)
+	if c.Op != OpIs || c.Value.Text != "unknown" {
+		t.Errorf("op/val = %v/%q, want OpIs/unknown", c.Op, c.Value.Text)
 	}
 }
 
@@ -168,11 +288,19 @@ func TestParseLimitOffset(t *testing.T) {
 	if q.Limit == nil || *q.Limit != 10 || q.Offset == nil || *q.Offset != 20 {
 		t.Errorf("limit/offset = %v/%v", q.Limit, q.Offset)
 	}
+	// A well-formed negative limit is the 416 PGRST103 range error, with the
+	// upstream detail; a non-numeric limit is still a PGRST100 parse error.
 	if _, err := ParseRead("films", "limit=-1", nil); err == nil {
 		t.Error("negative limit should error")
+	} else if err.Code != "PGRST103" {
+		t.Errorf("negative limit code = %s, want PGRST103", err.Code)
+	} else if err.Details == nil || *err.Details != "Limit should be greater than or equal to zero." {
+		t.Errorf("negative limit details = %v", err.Details)
 	}
 	if _, err := ParseRead("films", "limit=abc", nil); err == nil {
 		t.Error("non-numeric limit should error")
+	} else if err.Code != "PGRST100" {
+		t.Errorf("non-numeric limit code = %s, want PGRST100", err.Code)
 	}
 }
 
@@ -267,16 +395,49 @@ func TestParseWriteUpsertViaResolution(t *testing.T) {
 	}
 }
 
-func TestParseWriteOnConflictTarget(t *testing.T) {
+// on_conflict without a resolution preference leaves a POST a plain insert, the
+// way PostgREST does: a duplicate key then fails with 409 rather than silently
+// overwriting the existing row (review item 01.14).
+func TestParseWriteOnConflictAloneStaysInsert(t *testing.T) {
 	q, err := ParseWrite(Insert, "films", "on_conflict=id", nil, "", []byte(`{"id":1}`))
 	if err != nil {
 		t.Fatalf("ParseWrite: %v", err)
 	}
+	if q.Kind != Insert {
+		t.Errorf("on_conflict alone should stay an insert, got %v", q.Kind)
+	}
+	if q.Write.Conflict != nil {
+		t.Errorf("conflict = %#v, want nil for a plain insert", q.Write.Conflict)
+	}
+}
+
+// on_conflict combined with a resolution preference promotes to an upsert and
+// carries the named target.
+func TestParseWriteOnConflictWithResolution(t *testing.T) {
+	q, err := ParseWrite(Insert, "films", "on_conflict=id", []string{"resolution=merge-duplicates"}, "", []byte(`{"id":1}`))
+	if err != nil {
+		t.Fatalf("ParseWrite: %v", err)
+	}
 	if q.Kind != Upsert {
-		t.Errorf("on_conflict should make it an upsert, got %v", q.Kind)
+		t.Errorf("on_conflict with resolution should upsert, got %v", q.Kind)
 	}
 	if got := q.Write.Conflict.Target; len(got) != 1 || got[0] != "id" {
 		t.Errorf("conflict target = %v, want [id]", got)
+	}
+}
+
+// A PATCH carrying a stale resolution preference is not promoted to an upsert;
+// resolution and on_conflict are consulted only for inserts and PUT (01.14).
+func TestParseWriteResolutionIgnoredForUpdate(t *testing.T) {
+	q, err := ParseWrite(Update, "films", "on_conflict=id", []string{"resolution=merge-duplicates"}, "", []byte(`{"title":"X"}`))
+	if err != nil {
+		t.Fatalf("ParseWrite: %v", err)
+	}
+	if q.Kind != Update {
+		t.Errorf("Kind = %v, want Update (resolution ignored for PATCH)", q.Kind)
+	}
+	if q.Write.Conflict != nil {
+		t.Errorf("conflict = %#v, want nil for an update", q.Write.Conflict)
 	}
 }
 

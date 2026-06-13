@@ -24,7 +24,8 @@ func TestFilterCoercionRejectsBadInteger(t *testing.T) {
 	if body.Code != "22P02" {
 		t.Errorf("code = %q, want 22P02", body.Code)
 	}
-	if body.Message != `invalid input syntax for type int4: "abc"` {
+	// The type is spelled the way PostgreSQL's own message spells it.
+	if body.Message != `invalid input syntax for type integer: "abc"` {
 		t.Errorf("message = %q", body.Message)
 	}
 }

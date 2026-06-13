@@ -19,7 +19,7 @@ import (
 // (spec 21); the divergence is documented, not an error. The bound value is the
 // query text translated to FTS5 query syntax for the variant. The col argument is
 // unused: the join goes through the index's rowid, not the base column directly.
-func (dialect) FullText(_ string, idx *sqlgen.FullTextRef, variant ir.FTSVariant, _, value string) (string, string, bool) {
+func (dialect) FullText(_, _ string, idx *sqlgen.FullTextRef, variant ir.FTSVariant, _, value string) (string, string, bool) {
 	if idx == nil {
 		return "", "", false
 	}

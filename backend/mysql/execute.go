@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/tamnd/dbrest/backend"
 	"github.com/tamnd/dbrest/backend/sqlgen"
@@ -13,6 +14,30 @@ import (
 	"github.com/tamnd/dbrest/reqctx"
 	"github.com/tamnd/dbrest/schema"
 )
+
+// normalizeArgs converts ISO 8601 datetime strings (e.g. "2024-01-01T00:00:00Z")
+// to time.Time so the MySQL driver can bind them correctly. MySQL rejects the ISO
+// T-separator format; passing time.Time avoids the string-to-DATETIME cast entirely.
+func normalizeArgs(args []any) []any {
+	if len(args) == 0 {
+		return args
+	}
+	out := make([]any, len(args))
+	for i, a := range args {
+		if s, ok := a.(string); ok {
+			if t, err := time.Parse(time.RFC3339, s); err == nil {
+				out[i] = t
+				continue
+			}
+			if t, err := time.Parse("2006-01-02T15:04:05", s); err == nil {
+				out[i] = t
+				continue
+			}
+		}
+		out[i] = a
+	}
+	return out
+}
 
 // Execute lowers a resolved plan to MySQL operations and returns a streamable
 // result. Reads stream from an open cursor; writes run in a transaction and
@@ -47,7 +72,7 @@ func (b *Backend) executeRead(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 		if apiErr != nil {
 			return nil, apiErr
 		}
-		if err := b.db.QueryRowContext(ctx, cst.SQL, cst.Args...).Scan(&res.count); err != nil {
+		if err := b.db.QueryRowContext(ctx, cst.SQL, normalizeArgs(cst.Args)...).Scan(&res.count); err != nil {
 			return nil, b.MapError(err)
 		}
 		res.hasCount = true
@@ -57,7 +82,7 @@ func (b *Backend) executeRead(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 	if apiErr != nil {
 		return nil, apiErr
 	}
-	rows, err := b.db.QueryContext(ctx, st.SQL, st.Args...)
+	rows, err := b.db.QueryContext(ctx, st.SQL, normalizeArgs(st.Args)...)
 	if err != nil {
 		return nil, b.MapError(err)
 	}
@@ -79,6 +104,19 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 	q := plan.Query
 	returning := returningCols(q, plan.Rel)
 
+	// An empty column set (POST with an empty array, PATCH with an empty object)
+	// is a no-op: nothing is compiled or run, the affected count is zero, and the
+	// representation is the empty array. The HTTP layer turns that into 201/[] for
+	// an insert and 204 or 200/[] for an update.
+	if backend.IsNoOpMutation(q) {
+		return &writeResult{
+			controls: rc.Controls(),
+			cols:     returning,
+			affected: 0,
+			hasAff:   true,
+		}, nil
+	}
+
 	tx, err := b.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, b.MapError(err)
@@ -96,6 +134,11 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 	}
 	if err != nil {
 		return nil, b.MapError(err)
+	}
+
+	// Prefer: max-affected rolls an over-broad write back instead of committing.
+	if apiErr := backend.EnforceMaxAffected(q.Write, res.affected, res.hasAff); apiErr != nil {
+		return nil, apiErr
 	}
 
 	if q.Write != nil && q.Write.Tx == ir.TxRollback {
@@ -222,7 +265,10 @@ func (b *Backend) executeInsertEmulated(
 	return nil
 }
 
-// executeUpdateEmulated runs UPDATE then re-selects with the same filter.
+// executeUpdateEmulated runs UPDATE then re-selects by pre-captured primary keys.
+// The re-select must use PKs, not the original filter, because the UPDATE may
+// change the very column being filtered (e.g. PATCH /todos?task=eq.old sets
+// task=new — after the UPDATE, task=eq.old matches nothing).
 func (b *Backend) executeUpdateEmulated(
 	ctx context.Context, tx *sql.Tx,
 	q *ir.Query, returning []string, rel *schema.Relation,
@@ -232,6 +278,16 @@ func (b *Backend) executeUpdateEmulated(
 	if apiErr != nil {
 		return apiErr
 	}
+
+	// Pre-capture PKs when we need to return representation.
+	var pkValues []any
+	if len(returning) > 0 && len(rel.PrimaryKey) == 1 {
+		pkValues, apiErr = b.selectPKs(ctx, tx, q, rel.PrimaryKey[0])
+		if apiErr != nil {
+			return apiErr
+		}
+	}
+
 	out, err := tx.ExecContext(ctx, st.SQL, st.Args...)
 	if err != nil {
 		return err
@@ -239,35 +295,84 @@ func (b *Backend) executeUpdateEmulated(
 	n, _ := out.RowsAffected()
 	res.affected, res.hasAff = n, true
 
-	if len(returning) == 0 || n == 0 {
+	if len(returning) == 0 || len(pkValues) == 0 {
 		return nil
 	}
 
-	// Re-select: compile the equivalent SELECT with the same filters.
-	readQ := *q
-	readQ.Kind = ir.Read
-	readST, apiErr := sqlgen.CompileRead(Dialect{}, &readQ)
-	if apiErr != nil {
-		return apiErr
-	}
-	rows, err := tx.QueryContext(ctx, readST.SQL, readST.Args...)
-	if err != nil {
-		return err
-	}
-	colNames, err := rows.Columns()
-	if err != nil {
-		rows.Close()
-		return err
-	}
-	boolCols := buildBoolCols(rel)
-	jsonIdx, boolIdx, _ := buildColMaps(rows, boolCols)
-	buf, err := drain(rows, colNames, jsonIdx, boolIdx)
-	rows.Close()
+	// Re-select by PK (post-update values).
+	colNames, buf, err := b.selectByPKs(ctx, tx, rel, rel.PrimaryKey[0], pkValues, returning)
 	if err != nil {
 		return err
 	}
 	res.cols, res.rows = colNames, buf
 	return nil
+}
+
+// selectPKs runs "SELECT pk FROM table WHERE <original filter>" and returns
+// the raw PK values. Used to anchor the post-write re-select.
+func (b *Backend) selectPKs(
+	ctx context.Context, tx *sql.Tx,
+	q *ir.Query, pkCol string,
+) ([]any, *pgerr.APIError) {
+	pkQ := *q
+	pkQ.Kind = ir.Read
+	pkQ.Select = []ir.SelectItem{ir.Column{Path: []string{pkCol}}}
+	pkQ.Embeds = nil
+	pkQ.Order = nil
+	pkQ.Singular = false
+	st, apiErr := sqlgen.CompileRead(Dialect{}, &pkQ)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+	rows, err := tx.QueryContext(ctx, st.SQL, normalizeArgs(st.Args)...)
+	if err != nil {
+		return nil, pgerr.New(500, "XX000", err.Error())
+	}
+	defer rows.Close()
+	var vals []any
+	for rows.Next() {
+		var v any
+		if err := rows.Scan(&v); err != nil {
+			return nil, pgerr.New(500, "XX000", err.Error())
+		}
+		vals = append(vals, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, pgerr.New(500, "XX000", err.Error())
+	}
+	return vals, nil
+}
+
+// selectByPKs runs "SELECT cols FROM table WHERE pk IN (?,...)" using pre-captured
+// PK values and returns the column names and buffered rows.
+func (b *Backend) selectByPKs(
+	ctx context.Context, tx *sql.Tx,
+	rel *schema.Relation, pkCol string, pkValues []any, cols []string,
+) ([]string, [][]any, error) {
+	d := Dialect{}
+	table := d.QuoteIdent(rel.Name)
+	pk := d.QuoteIdent(pkCol)
+	selCols := quotedCols(cols)
+	placeholders := make([]string, len(pkValues))
+	for i := range pkValues {
+		placeholders[i] = "?"
+	}
+	sql := fmt.Sprintf("SELECT %s FROM %s WHERE %s IN (%s)",
+		selCols, table, pk, strings.Join(placeholders, ","))
+	rows, err := tx.QueryContext(ctx, sql, pkValues...)
+	if err != nil {
+		return nil, nil, err
+	}
+	colNames, err := rows.Columns()
+	if err != nil {
+		rows.Close()
+		return nil, nil, err
+	}
+	boolCols := buildBoolCols(rel)
+	jsonIdx, boolIdx, _ := buildColMaps(rows, boolCols)
+	buf, err := drain(rows, colNames, jsonIdx, boolIdx)
+	rows.Close()
+	return colNames, buf, err
 }
 
 // executeDeleteEmulated selects the rows to return, then deletes them.
@@ -284,7 +389,7 @@ func (b *Backend) executeDeleteEmulated(
 		if apiErr != nil {
 			return apiErr
 		}
-		rows, err := tx.QueryContext(ctx, readST.SQL, readST.Args...)
+		rows, err := tx.QueryContext(ctx, readST.SQL, normalizeArgs(readST.Args)...)
 		if err != nil {
 			return err
 		}
@@ -318,15 +423,16 @@ func (b *Backend) executeDeleteEmulated(
 
 // executeCall runs a stored procedure or portable RPC function.
 func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Context) (backend.Result, error) {
-	st, apiErr := sqlgen.CompileCall(Dialect{}, plan.Call, plan.Func)
+	st, apiErr := sqlgen.CompileCall(Dialect{}, plan.Call, plan.Func, sqlgen.ContextArgs(rc))
 	if apiErr != nil {
 		return nil, apiErr
 	}
+	st.Args = normalizeArgs(st.Args)
 
 	if plan.ReadOnly {
 		res := &result{controls: rc.Controls()}
 		if plan.Call.Count != ir.CountNone {
-			cst, apiErr := sqlgen.CompileCallCount(Dialect{}, plan.Call, plan.Func)
+			cst, apiErr := sqlgen.CompileCallCount(Dialect{}, plan.Call, plan.Func, sqlgen.ContextArgs(rc))
 			if apiErr != nil {
 				return nil, apiErr
 			}
@@ -383,17 +489,26 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 
 // compileWrite dispatches to the right compiler for the mutation kind.
 // When returning is empty the compiler omits the RETURNING / OUTPUT clause.
+// Args are normalized for MySQL (ISO 8601 → time.Time) before returning.
 func compileWrite(q *ir.Query, returning []string) (*sqlgen.Statement, *pgerr.APIError) {
+	var (
+		st     *sqlgen.Statement
+		apiErr *pgerr.APIError
+	)
 	switch q.Kind {
 	case ir.Insert, ir.Upsert:
-		return sqlgen.CompileInsert(Dialect{}, q, returning)
+		st, apiErr = sqlgen.CompileInsert(Dialect{}, q, returning)
 	case ir.Update:
-		return sqlgen.CompileUpdate(Dialect{}, q, returning)
+		st, apiErr = sqlgen.CompileUpdate(Dialect{}, q, returning)
 	case ir.Delete:
-		return sqlgen.CompileDelete(Dialect{}, q, returning)
+		st, apiErr = sqlgen.CompileDelete(Dialect{}, q, returning)
 	default:
 		return nil, pgerr.ErrUnsupported("this operation", "mysql")
 	}
+	if st != nil {
+		st.Args = normalizeArgs(st.Args)
+	}
+	return st, apiErr
 }
 
 // returningCols decides which columns to read back after a write.
@@ -401,6 +516,9 @@ func compileWrite(q *ir.Query, returning []string) (*sqlgen.Statement, *pgerr.AP
 // primary key only (for the Location header); for minimal updates/deletes it is nil.
 func returningCols(q *ir.Query, rel *schema.Relation) []string {
 	if q.Write != nil && q.Write.Return == ir.ReturnRepresentation {
+		if cols := q.ProjectedColumns(); cols != nil {
+			return cols
+		}
 		return rel.ColumnNames()
 	}
 	if q.Kind == ir.Insert || q.Kind == ir.Upsert {

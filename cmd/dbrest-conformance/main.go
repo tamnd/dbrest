@@ -4,9 +4,11 @@
 // runs the capability self-consistency check. It is the local reproduction of
 // what the CI matrix does per backend (spec 22 section 10).
 //
-// Only the SQLite backend is wired today, with the films fixture; another
-// backend joins by adding its fixture and capabilities here once its driver
-// lands.
+// The SQLite and PostgreSQL backends are wired, each with a films fixture;
+// another backend joins by adding its fixture and capabilities here once its
+// driver lands. The postgres pass needs a live server, read from DBREST_PG_DSN
+// or the -dsn flag, and it is the reference backend, so its corpus golden is the
+// upstream PostgreSQL output and its allowlist documents no divergence.
 package main
 
 import (
@@ -14,9 +16,11 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"github.com/tamnd/dbrest/backend"
+	"github.com/tamnd/dbrest/backend/postgres"
 	"github.com/tamnd/dbrest/backend/sqlite"
 	"github.com/tamnd/dbrest/conformance"
 	"github.com/tamnd/dbrest/httpapi"
@@ -30,22 +34,57 @@ func main() {
 
 func run() error {
 	var (
-		backendName = flag.String("backend", "sqlite", "backend to run the conformance pass against")
-		corpusPath  = flag.String("corpus", "conformance/testdata/sqlite/corpus.json", "request corpus file")
-		allowPath   = flag.String("allowlist", "conformance/testdata/sqlite/allowlist.json", "allowlist file")
+		backendName = flag.String("backend", "sqlite", "backend to run the conformance pass against (sqlite or postgres)")
+		corpusPath  = flag.String("corpus", "", "request corpus file (defaults to the backend's testdata corpus)")
+		allowPath   = flag.String("allowlist", "", "allowlist file (defaults to the backend's testdata allowlist)")
+		dsn         = flag.String("dsn", "", "postgres DSN; falls back to DBREST_PG_DSN")
 	)
 	flag.Parse()
 
-	if *backendName != "sqlite" {
-		return fmt.Errorf("backend %q is not wired into the harness yet; only sqlite is available", *backendName)
+	if *corpusPath == "" {
+		*corpusPath = fmt.Sprintf("conformance/testdata/%s/corpus.json", *backendName)
+	}
+	if *allowPath == "" {
+		*allowPath = fmt.Sprintf("conformance/testdata/%s/allowlist.json", *backendName)
 	}
 
-	srv, be, err := sqliteFixture()
-	if err != nil {
-		return err
+	var (
+		srv     *httpapi.Server
+		caps    backend.Capabilities
+		closeBE func()
+		tiers   map[string]backend.Tier
+		err     error
+	)
+	switch *backendName {
+	case "sqlite":
+		var be *sqlite.Backend
+		srv, be, err = sqliteFixture()
+		if err != nil {
+			return err
+		}
+		closeBE = func() { _ = be.Close() }
+		caps = be.Capabilities()
+		tiers = featureTiers(caps)
+	case "postgres":
+		conn := *dsn
+		if conn == "" {
+			conn = os.Getenv("DBREST_PG_DSN")
+		}
+		if conn == "" {
+			return fmt.Errorf("postgres backend needs a DSN: pass -dsn or set DBREST_PG_DSN")
+		}
+		var be *postgres.Backend
+		srv, be, err = postgresFixture(conn)
+		if err != nil {
+			return err
+		}
+		closeBE = func() { _ = be.Close() }
+		caps = be.Capabilities()
+		tiers = featureTiers(caps)
+	default:
+		return fmt.Errorf("backend %q is not wired into the harness; available: sqlite, postgres", *backendName)
 	}
-	defer func() { _ = be.Close() }()
-	caps := be.Capabilities()
+	defer closeBE()
 
 	cases, err := conformance.LoadCorpus(*corpusPath)
 	if err != nil {
@@ -55,7 +94,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	if err := allow.CheckMatrix(featureTiers(caps)); err != nil {
+	if err := allow.CheckMatrix(tiers); err != nil {
 		return err
 	}
 
@@ -85,7 +124,9 @@ func sqliteFixture() (*httpapi.Server, *sqlite.Backend, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("introspect: %w", err)
 	}
-	return httpapi.NewServer(be, model, nil), be, nil
+	srv := httpapi.NewServer(be, model, nil)
+	srv.SetDefaultRole("anon")
+	return srv, be, nil
 }
 
 const fixtureDDL = `
@@ -101,6 +142,57 @@ INSERT INTO films (id, title, year, rating) VALUES
 	(3, 'Arrival', 2016, 'PG13');
 CREATE VIRTUAL TABLE films_fts USING fts5(title, content='films', content_rowid='id');
 INSERT INTO films_fts (rowid, title) SELECT id, title FROM films;
+`
+
+// postgresFixture builds the films fixture on a live PostgreSQL server in a
+// dedicated schema and returns a server over it. Postgres is the reference
+// backend: its corpus golden is the upstream output, so the fixture mirrors the
+// sqlite one plus a tags array column, since arrays are Native here where SQLite
+// has none. The anon role is created so the server's SET LOCAL ROLE has an
+// identity to assume, matching the role-emulation path a real deployment uses.
+func postgresFixture(dsn string) (*httpapi.Server, *postgres.Backend, error) {
+	be, err := postgres.Open(dsn)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if _, err := be.Pool().Exec(ctx, pgFixtureDDL); err != nil {
+		_ = be.Close()
+		return nil, nil, fmt.Errorf("load fixture: %w", err)
+	}
+	be.SetSchemas([]string{"_dbrest_conf"})
+	model, err := be.Introspect(ctx)
+	if err != nil {
+		_ = be.Close()
+		return nil, nil, fmt.Errorf("introspect: %w", err)
+	}
+	srv := httpapi.NewServer(be, model, []string{"_dbrest_conf"})
+	srv.SetDefaultRole("anon")
+	return srv, be, nil
+}
+
+const pgFixtureDDL = `
+DROP SCHEMA IF EXISTS _dbrest_conf CASCADE;
+CREATE SCHEMA _dbrest_conf;
+DO $$ BEGIN
+	IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'anon') THEN
+		CREATE ROLE anon NOLOGIN;
+	END IF;
+END $$;
+GRANT USAGE ON SCHEMA _dbrest_conf TO anon;
+CREATE TABLE _dbrest_conf.films (
+	id     integer PRIMARY KEY,
+	title  text NOT NULL,
+	year   integer,
+	rating text,
+	tags   text[]
+);
+INSERT INTO _dbrest_conf.films (id, title, year, rating, tags) VALUES
+	(1, 'Metropolis', 1927, 'NR', '{sci-fi,silent}'),
+	(2, 'Blade Runner', 1982, 'R', '{sci-fi,noir}'),
+	(3, 'Arrival', 2016, 'PG13', '{sci-fi,drama}');
+GRANT SELECT ON _dbrest_conf.films TO anon;
 `
 
 // featureTiers maps the allowlist's feature labels to the tier each resolves to

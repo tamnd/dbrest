@@ -25,6 +25,8 @@ func (b *Backend) Introspect(ctx context.Context) (*schema.Model, error) {
 	ftsByContent, excluded := classifyFTS(rels)
 
 	out := make([]*schema.Relation, 0, len(rels))
+	colsByName := make(map[string][]*schema.Column, len(rels))
+	ddlByName := make(map[string]string, len(rels))
 	for _, r := range rels {
 		if excluded[r.name] {
 			continue
@@ -37,14 +39,43 @@ func (b *Backend) Introspect(ctx context.Context) (*schema.Model, error) {
 		if err != nil {
 			return nil, err
 		}
+		uniq, err := b.uniques(ctx, r.name)
+		if err != nil {
+			return nil, err
+		}
+		colsByName[r.name] = cols
+		ddlByName[r.name] = r.sql
 		out = append(out, &schema.Relation{
 			Name:        r.name,
 			Kind:        r.kind,
 			Columns:     cols,
 			PrimaryKey:  pk,
+			Unique:      uniq,
 			ForeignKeys: fks,
 			FullText:    ftsByContent[r.name],
 		})
+	}
+	// Second pass: parse each view's definition into the base-column mapping the
+	// model projects foreign keys through (spec 09). It runs after the first pass
+	// so a view referencing a base table defined later in the catalog still
+	// resolves. The parser is conservative: it maps only the views it can trace to
+	// plain base columns and leaves the rest empty, so the model inherits nothing
+	// where provenance is uncertain, the same as PostgREST skips a UNION.
+	baseCols := func(name string) ([]string, bool) {
+		cols, ok := colsByName[name]
+		if !ok {
+			return nil, false
+		}
+		names := make([]string, len(cols))
+		for i, c := range cols {
+			names[i] = c.Name
+		}
+		return names, true
+	}
+	for _, r := range out {
+		if r.Kind == schema.KindView {
+			r.ViewColumns = parseViewColumns(ddlByName[r.Name], baseCols)
+		}
 	}
 	return schema.NewModel(out), nil
 }
@@ -375,6 +406,98 @@ func (b *Backend) foreignKeys(ctx context.Context, table string) ([]*schema.Fore
 		})
 	}
 	return out, nil
+}
+
+// uniques reads the relation's unique constraints from PRAGMA index_list and
+// index_info, returning each as a set of column names. Only constraint-backed
+// indexes are returned: origin "u" (a UNIQUE table constraint) and origin "c"
+// (a CREATE UNIQUE INDEX) when the index is unique. The primary key (origin
+// "pk") is omitted because table_info already reports it, and the planner tests
+// the primary key separately when deciding one-to-one cardinality (spec 09).
+func (b *Backend) uniques(ctx context.Context, table string) ([][]string, error) {
+	// The table name comes from sqlite_master, not user input; quote and inline it.
+	rows, err := b.db.QueryContext(ctx, `PRAGMA index_list(`+dialect{}.QuoteIdent(table)+`)`)
+	if err != nil {
+		return nil, err
+	}
+	type idxInfo struct {
+		name   string
+		origin string
+	}
+	var indexes []idxInfo
+	for rows.Next() {
+		var (
+			seq, unique, partial int
+			name, origin         string
+		)
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		// A partial unique index does not constrain the whole column, so it cannot
+		// make a foreign key one-to-one; skip it, as PostgREST does.
+		if unique == 1 && origin != "pk" && partial == 0 {
+			indexes = append(indexes, idxInfo{name: name, origin: origin})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	var out [][]string
+	for _, idx := range indexes {
+		cols, err := b.indexColumns(ctx, idx.name)
+		if err != nil {
+			return nil, err
+		}
+		if len(cols) > 0 {
+			out = append(out, cols)
+		}
+	}
+	return out, nil
+}
+
+// indexColumns reads the column names of one index from PRAGMA index_info, in
+// key order. A NULL column name marks an expression index column, which cannot
+// participate in a foreign-key match, so such an index is dropped by returning
+// no columns for it.
+func (b *Backend) indexColumns(ctx context.Context, index string) ([]string, error) {
+	rows, err := b.db.QueryContext(ctx, `PRAGMA index_info(`+dialect{}.QuoteIdent(index)+`)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	type entry struct {
+		seq  int
+		name string
+	}
+	var entries []entry
+	for rows.Next() {
+		var (
+			seqno, cid int
+			name       any
+		)
+		if err := rows.Scan(&seqno, &cid, &name); err != nil {
+			return nil, err
+		}
+		s, ok := toString(name)
+		if !ok {
+			return nil, nil // expression column: not usable for a key match
+		}
+		entries = append(entries, entry{seq: seqno, name: s})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].seq < entries[j].seq })
+	cols := make([]string, len(entries))
+	for i, e := range entries {
+		cols[i] = e.name
+	}
+	return cols, nil
 }
 
 // toString coerces a scalar from PRAGMA into a string, reporting false for NULL.

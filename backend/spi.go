@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"fmt"
 	"io"
 
 	"github.com/tamnd/dbrest/ir"
@@ -44,6 +45,17 @@ type Backend interface {
 	Close() error
 }
 
+// SchemaFunctioner is an optional capability of a NativeRPC backend that
+// introspects its own functions: it exposes them as a registry per exposed schema,
+// the function half of the schema cache. The frontend uses it to resolve native
+// overloads, raise PGRST202/PGRST203, and partition GET arguments from result
+// filters through the same planner the portable registry uses, instead of building
+// a minimal plan and deferring everything to the engine. A backend that does not
+// implement it keeps the verb-derived minimal plan. PostgreSQL implements it.
+type SchemaFunctioner interface {
+	SchemaFunctions(schema string) rpc.Registry
+}
+
 // Result is the streaming response abstraction. A backend returns either an
 // assembled Body (the engine built the JSON) or a RowStream the renderer shapes
 // in Go. Which one is recorded by the JSONAssembly capability (spec 03).
@@ -60,14 +72,40 @@ type Result interface {
 	ResponseControls() *reqctx.ResponseControls
 }
 
-// Explainer is an optional backend capability for the vnd.pgrst.plan+json
-// Accept type. Backends that support EXPLAIN implement this interface;
-// the frontend type-asserts to it and falls back to 406 when absent.
+// PlanFormat is the output format an Accept: application/vnd.pgrst.plan request
+// asks for. PostgREST defaults to text (bare type and the +text suffix); +json
+// asks for the machine-readable form.
+type PlanFormat uint8
+
+const (
+	PlanText PlanFormat = iota // default: EXPLAIN text output
+	PlanJSON                   // +json suffix: EXPLAIN (FORMAT JSON)
+)
+
+// PlanOptions carries the parsed parameters of a plan Accept header. Format
+// selects text vs json; For is the media type the plan is computed for (the
+// for="<media>" parameter, informational on the wire and echoed back); the
+// booleans are the options= flags PostgREST forwards to EXPLAIN.
+type PlanOptions struct {
+	Format   PlanFormat
+	For      string
+	Analyze  bool
+	Verbose  bool
+	Settings bool
+	Buffers  bool
+	Wal      bool
+}
+
+// Explainer is an optional backend capability for the application/vnd.pgrst.plan
+// Accept type. Backends that support EXPLAIN implement this interface; the
+// frontend type-asserts to it and 406s when it is absent. The three methods
+// mirror the three execution paths so a plan can be requested for a read, a
+// write, or an RPC call. Each returns the engine's EXPLAIN output already
+// formatted per opts.Format (text bytes or a JSON document).
 type Explainer interface {
-	// ExplainRead runs EXPLAIN on the read query and returns raw JSON from the
-	// engine's query planner. If analyze is true the engine also executes and
-	// times the query (EXPLAIN ANALYZE equivalent).
-	ExplainRead(ctx context.Context, p *ir.Plan, rc *reqctx.Context, analyze bool) ([]byte, error)
+	ExplainRead(ctx context.Context, p *ir.Plan, rc *reqctx.Context, opts PlanOptions) ([]byte, error)
+	ExplainWrite(ctx context.Context, p *ir.Plan, rc *reqctx.Context, opts PlanOptions) ([]byte, error)
+	ExplainCall(ctx context.Context, p *ir.Plan, rc *reqctx.Context, opts PlanOptions) ([]byte, error)
 }
 
 // RowStream is a forward-only cursor over result rows. The renderer drives it to
@@ -83,4 +121,42 @@ type RowStream interface {
 	Err() error
 	// Close releases the cursor.
 	Close() error
+}
+
+// EnforceMaxAffected is the Prefer: max-affected contract every write backend
+// shares. WriteSpec.MaxRows is set only under handling=strict (ir.ParsePrefer
+// clears it under lenient), so a non-nil bound always means "enforce". When the
+// mutation affected more rows than the bound, it returns PGRST124; the backend
+// then returns before commit and its deferred rollback discards the over-broad
+// write. It returns nil when no bound is set, the affected count is unknown, or
+// the count is within the bound. Callers must invoke it after the affected count
+// is known and before commit.
+func EnforceMaxAffected(w *ir.WriteSpec, affected int64, hasAffected bool) *pgerr.APIError {
+	if w == nil || w.MaxRows == nil || !hasAffected {
+		return nil
+	}
+	if affected > *w.MaxRows {
+		return pgerr.ErrMaxAffected(affected)
+	}
+	return nil
+}
+
+// EnforceSingularWrite is the single-object guarantee a write makes when the
+// client negotiated application/vnd.pgrst.object+json (q.Singular): the mutation
+// must affect exactly one row. A zero-or-many result is PGRST116. Callers invoke
+// it after the affected count is known and before commit, so the failure rolls
+// the mutation back through the backend's deferred rollback rather than the
+// renderer noticing the wrong count after the write is already durable
+// (PostgREST's condemn discipline). The renderer keeps the same check for reads,
+// where there is no transaction to roll back. It is a no-op for a non-singular
+// request or when the count is unknown.
+func EnforceSingularWrite(singular bool, affected int64, hasAffected bool) *pgerr.APIError {
+	if !singular || !hasAffected {
+		return nil
+	}
+	if affected != 1 {
+		return pgerr.ErrSingularZeroMany().
+			WithDetails(fmt.Sprintf("The result contains %d rows", affected))
+	}
+	return nil
 }

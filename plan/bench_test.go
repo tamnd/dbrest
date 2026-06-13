@@ -58,7 +58,7 @@ func BenchmarkReadPlan(b *testing.B) {
 	for b.Loop() {
 		// A fresh query each iteration: Read binds resolved pointers onto it, so a
 		// reused value would measure planning an already-planned query.
-		if _, err := Read(m, newQuery(), path); err != nil {
+		if _, err := Read(m, newQuery(), path, Options{}); err != nil {
 			b.Fatal(err)
 		}
 	}

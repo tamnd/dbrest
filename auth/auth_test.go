@@ -90,6 +90,89 @@ func TestBearerSchemeCaseInsensitive(t *testing.T) {
 	}
 }
 
+func TestNonBearerSchemeRunsAnon(t *testing.T) {
+	// Credentials of another scheme are not bearer tokens at all; PostgREST
+	// ignores them and the request runs anonymous.
+	v := hmacVerifier(t, Config{})
+	res, err := v.Authenticate("Basic d2ViX3VzZXI6cHc=")
+	if err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+	if res.Role != anonRole || !res.Anonymous {
+		t.Fatalf("non-bearer credentials = %+v, want anon", res)
+	}
+}
+
+func TestEmptyBearerIs301(t *testing.T) {
+	// "Authorization: Bearer" with no token is a malformed credential, not an
+	// anonymous request: PostgREST answers 401 PGRST301 with this exact
+	// message and the invalid_token challenge.
+	v := hmacVerifier(t, Config{})
+	for _, header := range []string{"Bearer", "Bearer ", "Bearer    ", "bearer\t"} {
+		_, err := v.Authenticate(header)
+		if err == nil || err.Code != "PGRST301" || err.HTTPStatus != 401 {
+			t.Fatalf("Authenticate(%q) = %v, want 401 PGRST301", header, err)
+		}
+		if err.Message != "Empty JWT is sent in Authorization header" {
+			t.Errorf("Authenticate(%q) message = %q, want the exact PostgREST text", header, err.Message)
+		}
+		want := `Bearer error="invalid_token", error_description="Empty JWT is sent in Authorization header"`
+		if err.WWWAuthenticate != want {
+			t.Errorf("Authenticate(%q) WWW-Authenticate = %q, want %q", header, err.WWWAuthenticate, want)
+		}
+	}
+}
+
+func TestEmptyBearerBeatsMissingSecret(t *testing.T) {
+	// The empty-credential check answers before the key-material check: an
+	// empty bearer is the client's malformed request either way.
+	v, err := NewVerifier(Config{AnonRole: anonRole}) // no keys
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+	_, aerr := v.Authenticate("Bearer ")
+	if aerr == nil || aerr.Code != "PGRST301" {
+		t.Fatalf("empty bearer with no keys = %v, want PGRST301", aerr)
+	}
+}
+
+func TestNonStringRoleClaimUsedVerbatim(t *testing.T) {
+	// PostgREST renders a non-string role claim to its compact JSON text and
+	// uses it as the role name; the engine (or the authz registry) then denies
+	// a role that does not exist. The client is never silently downgraded to
+	// the anonymous role. Verified against postgrest/14.12: role 123 yields
+	// `role "123" does not exist`, role null yields `role "null" does not
+	// exist`, and so on.
+	cases := []struct {
+		name  string
+		claim any
+		want  string
+	}{
+		{"number", 123, "123"},
+		{"float", 12.5, "12.5"},
+		{"bool", true, "true"},
+		{"null", nil, "null"},
+		{"array", []any{"web_user"}, `["web_user"]`},
+		{"object", map[string]any{"a": 1}, `{"a":1}`},
+	}
+	v := hmacVerifier(t, Config{})
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tok := signHS(t, jwt.MapClaims{"role": c.claim})
+			res, err := v.Authenticate("Bearer " + tok)
+			if err != nil {
+				t.Fatalf("Authenticate: %v", err)
+			}
+			if res.Role != c.want {
+				t.Errorf("role = %q, want %q (no anon downgrade)", res.Role, c.want)
+			}
+			if res.Anonymous {
+				t.Error("a present role claim must not be anonymous")
+			}
+		})
+	}
+}
+
 func TestTokenWithNoRoleFallsBackToAnon(t *testing.T) {
 	v := hmacVerifier(t, Config{})
 	tok := signHS(t, jwt.MapClaims{"sub": "123"})
@@ -105,18 +188,22 @@ func TestTokenWithNoRoleFallsBackToAnon(t *testing.T) {
 	}
 }
 
-func TestExpiredTokenIs301(t *testing.T) {
+func TestExpiredTokenIs303(t *testing.T) {
 	v := hmacVerifier(t, Config{})
 	tok := signHS(t, jwt.MapClaims{
 		"role": "web_user",
 		"exp":  clockNow.Add(-time.Hour).Unix(),
 	})
 	_, err := v.Authenticate("Bearer " + tok)
-	if err == nil || err.Code != "PGRST301" {
-		t.Fatalf("want PGRST301, got %v", err)
+	if err == nil || err.Code != "PGRST303" || err.Message != "JWT expired" {
+		t.Fatalf("want PGRST303 JWT expired, got %v", err)
 	}
 	if err.HTTPStatus != 401 {
 		t.Errorf("status = %d, want 401", err.HTTPStatus)
+	}
+	want := `Bearer error="invalid_token", error_description="JWT expired"`
+	if err.WWWAuthenticate != want {
+		t.Errorf("WWW-Authenticate = %q, want %q", err.WWWAuthenticate, want)
 	}
 }
 
@@ -132,34 +219,55 @@ func TestExpiryWithinSkewStillValid(t *testing.T) {
 	}
 }
 
-func TestNotBeforeIs302(t *testing.T) {
+func TestNotBeforeIs303(t *testing.T) {
 	v := hmacVerifier(t, Config{})
 	tok := signHS(t, jwt.MapClaims{
 		"role": "web_user",
 		"nbf":  clockNow.Add(time.Hour).Unix(),
 	})
 	_, err := v.Authenticate("Bearer " + tok)
-	if err == nil || err.Code != "PGRST302" {
-		t.Fatalf("want PGRST302, got %v", err)
+	if err == nil || err.Code != "PGRST303" || err.Message != "JWT not yet valid" {
+		t.Fatalf("want PGRST303 JWT not yet valid, got %v", err)
 	}
 }
 
-func TestBadSignatureIs302(t *testing.T) {
+func TestBadSignatureIs301(t *testing.T) {
 	v := hmacVerifier(t, Config{})
 	tok := signHS(t, jwt.MapClaims{"role": "web_user"})
 	// flip the last character of the signature.
 	bad := tok[:len(tok)-1] + flip(tok[len(tok)-1])
 	_, err := v.Authenticate("Bearer " + bad)
-	if err == nil || err.Code != "PGRST302" {
-		t.Fatalf("want PGRST302, got %v", err)
+	if err == nil || err.Code != "PGRST301" || err.Message != "No suitable key or wrong key type" {
+		t.Fatalf("want PGRST301 No suitable key or wrong key type, got %v", err)
+	}
+	if err.Details == nil || *err.Details != "None of the keys was able to decode the JWT" {
+		t.Errorf("details = %v, want the none-of-the-keys detail", err.Details)
 	}
 }
 
-func TestMalformedTokenIs302(t *testing.T) {
+func TestMalformedTokenIs301(t *testing.T) {
 	v := hmacVerifier(t, Config{})
 	_, err := v.Authenticate("Bearer not.a.jwt")
-	if err == nil || err.Code != "PGRST302" {
-		t.Fatalf("want PGRST302, got %v", err)
+	if err == nil || err.Code != "PGRST301" || err.Message != "JWT cryptographic operation failed" {
+		t.Fatalf("want PGRST301 JWT cryptographic operation failed, got %v", err)
+	}
+}
+
+func TestWrongPartCountMessage(t *testing.T) {
+	v := hmacVerifier(t, Config{})
+	cases := []struct {
+		token string
+		want  string
+	}{
+		{"justonepart", "Expected 3 parts in JWT; got 1"},
+		{"two.parts", "Expected 3 parts in JWT; got 2"},
+		{"a.b.c.d", "Expected 3 parts in JWT; got 4"},
+	}
+	for _, c := range cases {
+		_, err := v.Authenticate("Bearer " + c.token)
+		if err == nil || err.Code != "PGRST301" || err.Message != c.want {
+			t.Errorf("token %q: want PGRST301 %q, got %v", c.token, c.want, err)
+		}
 	}
 }
 
@@ -171,8 +279,11 @@ func TestNoneAlgorithmRejected(t *testing.T) {
 		t.Fatalf("sign none: %v", err)
 	}
 	_, aerr := v.Authenticate("Bearer " + s)
-	if aerr == nil || aerr.Code != "PGRST302" {
-		t.Fatalf("the none alg must be rejected, got %v", aerr)
+	if aerr == nil || aerr.Code != "PGRST301" || aerr.Message != "Wrong or unsupported encoding algorithm" {
+		t.Fatalf("the none alg must be rejected with PGRST301, got %v", aerr)
+	}
+	if aerr.Details == nil || *aerr.Details != "JWT is unsecured but expected 'alg' was not 'none'" {
+		t.Errorf("details = %v, want the unsecured-token detail", aerr.Details)
 	}
 }
 
@@ -197,8 +308,34 @@ func TestAudienceEnforced(t *testing.T) {
 		t.Fatalf("matching aud must verify: %v", err)
 	}
 	bad := signHS(t, jwt.MapClaims{"role": "web_user", "aud": "other"})
-	if _, err := v.Authenticate("Bearer " + bad); err == nil || err.Code != "PGRST302" {
-		t.Fatalf("wrong aud must be PGRST302, got %v", err)
+	if _, err := v.Authenticate("Bearer " + bad); err == nil || err.Code != "PGRST303" || err.Message != "JWT not in audience" {
+		t.Fatalf("wrong aud must be PGRST303 JWT not in audience, got %v", err)
+	}
+}
+
+func TestTokenWithoutAudAccepted(t *testing.T) {
+	// "If the aud key is not present ... allowed for all audiences": a token
+	// with no aud claim passes even when jwt-aud is configured.
+	v := hmacVerifier(t, Config{Audience: testAud})
+	tok := signHS(t, jwt.MapClaims{"role": "web_user"})
+	res, err := v.Authenticate("Bearer " + tok)
+	if err != nil {
+		t.Fatalf("a token without aud must verify: %v", err)
+	}
+	if res.Role != "web_user" {
+		t.Fatalf("role = %q", res.Role)
+	}
+}
+
+func TestFutureIssuedAtIs303(t *testing.T) {
+	v := hmacVerifier(t, Config{})
+	tok := signHS(t, jwt.MapClaims{
+		"role": "web_user",
+		"iat":  clockNow.Add(time.Hour).Unix(),
+	})
+	_, err := v.Authenticate("Bearer " + tok)
+	if err == nil || err.Code != "PGRST303" || err.Message != "JWT issued at future" {
+		t.Fatalf("want PGRST303 JWT issued at future, got %v", err)
 	}
 }
 
@@ -242,23 +379,48 @@ func TestAnonDisabledWithoutToken(t *testing.T) {
 		t.Fatalf("NewVerifier: %v", err)
 	}
 	_, aerr := v.Authenticate("")
-	if aerr == nil || aerr.HTTPStatus != 401 {
-		t.Fatalf("no anon role + no token must be 401, got %v", aerr)
+	if aerr == nil || aerr.HTTPStatus != 401 || aerr.Code != "PGRST302" {
+		t.Fatalf("no anon role + no token must be 401 PGRST302, got %v", aerr)
+	}
+	if aerr.Message != "Anonymous access is disabled" {
+		t.Errorf("message = %q, want the exact PGRST302 text", aerr.Message)
+	}
+	if aerr.WWWAuthenticate != "Bearer" {
+		t.Errorf("WWW-Authenticate = %q, want Bearer", aerr.WWWAuthenticate)
 	}
 }
 
-func TestNoKeysDisablesVerification(t *testing.T) {
+func TestNoKeysNoTokenRunsAnon(t *testing.T) {
 	v, err := NewVerifier(Config{AnonRole: anonRole})
 	if err != nil {
 		t.Fatalf("NewVerifier: %v", err)
 	}
-	// A token is presented but no key is configured: it runs as anon.
-	res, aerr := v.Authenticate("Bearer anything.at.all")
+	res, aerr := v.Authenticate("")
 	if aerr != nil {
 		t.Fatalf("Authenticate: %v", aerr)
 	}
-	if res.Role != anonRole {
-		t.Fatalf("role = %q, want anon when verification is off", res.Role)
+	if res.Role != anonRole || !res.Anonymous {
+		t.Fatalf("res = %+v, want anon", res)
+	}
+}
+
+func TestNoKeysWithTokenIs500(t *testing.T) {
+	// A token presented to a server without key material is a server
+	// misconfiguration, not an anonymous request: PostgREST fails closed
+	// with 500 PGRST300.
+	v, err := NewVerifier(Config{AnonRole: anonRole})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+	_, aerr := v.Authenticate("Bearer anything.at.all")
+	if aerr == nil || aerr.HTTPStatus != 500 || aerr.Code != "PGRST300" {
+		t.Fatalf("token with no keys must be 500 PGRST300, got %v", aerr)
+	}
+	if aerr.Message != "Server lacks JWT secret" {
+		t.Errorf("message = %q, want Server lacks JWT secret", aerr.Message)
+	}
+	if aerr.WWWAuthenticate != "" {
+		t.Errorf("a PGRST300 must not carry a challenge, got %q", aerr.WWWAuthenticate)
 	}
 }
 
@@ -298,8 +460,12 @@ func TestAlgConfusionRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}
-	if _, aerr := v.Authenticate("Bearer " + signed); aerr == nil {
+	_, aerr := v.Authenticate("Bearer " + signed)
+	if aerr == nil {
 		t.Fatal("an HS256 token must not verify against an RSA-only verifier")
+	}
+	if aerr.Code != "PGRST301" || aerr.Message != "No suitable key or wrong key type" {
+		t.Errorf("want PGRST301 No suitable key or wrong key type, got %v", aerr)
 	}
 }
 

@@ -22,7 +22,7 @@ import (
 //     inflection the way plainto_tsquery's dictionary normalization does.
 //   - the other variants map to CONTAINS, whose AND / OR / AND NOT / NEAR
 //     operators give the explicit set semantics to_tsquery has.
-func (Dialect) FullText(col string, _ *sqlgen.FullTextRef, variant ir.FTSVariant, _, value string) (string, string, bool) {
+func (Dialect) FullText(col, _ string, _ *sqlgen.FullTextRef, variant ir.FTSVariant, _, value string) (string, string, bool) {
 	if variant == ir.FTSPlainText {
 		// FREETEXT takes a natural-language string, no operators; collapse runs of
 		// whitespace so the bound value is clean.

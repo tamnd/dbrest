@@ -3,15 +3,17 @@ package ir
 import "testing"
 
 // A CSV insert body decodes to one row per data line, keyed by the header. The
-// header order fixes the write column order, and an empty field is SQL NULL.
+// header order fixes the write column order. PostgREST's CSV null rule is that
+// only the unquoted literal NULL is SQL null; an empty cell is the empty string
+// (item 01.16).
 func TestParseWriteCSVBody(t *testing.T) {
-	body := []byte("title,year\nDune,2021\nArrival,\n")
+	body := []byte("title,year,note\nDune,2021,good\nArrival,,NULL\n")
 	q, err := ParseWrite(Insert, "films", "", nil, "text/csv", body)
 	if err != nil {
 		t.Fatalf("ParseWrite CSV: %v", err)
 	}
-	if got := q.Write.Columns; len(got) != 2 || got[0] != "title" || got[1] != "year" {
-		t.Fatalf("Columns = %v, want [title year] in header order", got)
+	if got := q.Write.Columns; len(got) != 3 || got[0] != "title" || got[1] != "year" {
+		t.Fatalf("Columns = %v, want [title year note] in header order", got)
 	}
 	if len(q.Write.Rows) != 2 {
 		t.Fatalf("Rows = %d, want 2", len(q.Write.Rows))
@@ -19,9 +21,22 @@ func TestParseWriteCSVBody(t *testing.T) {
 	if v := q.Write.Rows[0]["title"]; v.JSON != "Dune" {
 		t.Errorf("row0 title = %#v, want Dune", v.JSON)
 	}
-	// The empty year field on the second row is NULL, not the empty string.
-	if v := q.Write.Rows[1]["year"]; v.JSON != nil {
-		t.Errorf("row1 year = %#v, want nil (NULL)", v.JSON)
+	// The empty year cell on the second row is the empty string, not NULL.
+	if v := q.Write.Rows[1]["year"]; v.JSON != "" {
+		t.Errorf("row1 year = %#v, want the empty string", v.JSON)
+	}
+	// The literal NULL token is SQL null.
+	if v := q.Write.Rows[1]["note"]; v.JSON != nil {
+		t.Errorf("row1 note = %#v, want nil (NULL)", v.JSON)
+	}
+}
+
+// A CSV body whose data row has a different field count than the header is a
+// PGRST102 "All lines must have same number of fields" (item 01.16).
+func TestParseWriteCSVRaggedRejected(t *testing.T) {
+	_, err := ParseWrite(Insert, "films", "", nil, "text/csv", []byte("title,year\nDune\n"))
+	if err == nil || err.Code != "PGRST102" {
+		t.Fatalf("ragged CSV err = %v, want PGRST102", err)
 	}
 }
 
@@ -50,6 +65,37 @@ func TestParseWriteCSVMalformedRejected(t *testing.T) {
 	// A bare quote opens a field the row never closes: not valid RFC 4180.
 	if _, err := ParseWrite(Insert, "films", "", nil, "text/csv", []byte("a,b\n\"x,y\n")); err == nil {
 		t.Fatal("a malformed CSV body should be rejected")
+	}
+}
+
+// A malformed JSON insert body is v14's PGRST102 at 400 with the canonical
+// "Empty or invalid json" message, not a PGRST100 query-parse error (item 04.1).
+func TestParseWriteMalformedJSONIsPGRST102(t *testing.T) {
+	_, err := ParseWrite(Insert, "films", "", nil, "application/json", []byte("{not json"))
+	if err == nil || err.Code != "PGRST102" {
+		t.Fatalf("malformed JSON err = %v, want PGRST102", err)
+	}
+	if err.HTTPStatus != 400 {
+		t.Errorf("status = %d, want 400", err.HTTPStatus)
+	}
+	if err.Message != "Empty or invalid json" {
+		t.Errorf("message = %q, want 'Empty or invalid json'", err.Message)
+	}
+}
+
+// A request body whose Content-Type no parser handles is PGRST102 at 400 with
+// "Content-Type not acceptable: <mime>", not the stale 415 PGRST107 (item 04.1).
+// PGRST107 stays reserved for Accept negotiation, which is always a 406.
+func TestParseWriteUnsupportedContentTypeIsPGRST102(t *testing.T) {
+	_, err := ParseWrite(Insert, "films", "", nil, "application/x-yaml", []byte("title: Dune"))
+	if err == nil || err.Code != "PGRST102" {
+		t.Fatalf("unsupported content-type err = %v, want PGRST102", err)
+	}
+	if err.HTTPStatus != 400 {
+		t.Errorf("status = %d, want 400", err.HTTPStatus)
+	}
+	if err.Message != "Content-Type not acceptable: application/x-yaml" {
+		t.Errorf("message = %q", err.Message)
 	}
 }
 
@@ -97,17 +143,39 @@ func TestParseWriteUpdateFormBody(t *testing.T) {
 
 func TestParseWriteUnsupportedMediaType(t *testing.T) {
 	_, err := ParseWrite(Insert, "films", "", nil, "text/yaml", []byte("title: X"))
-	if err == nil || err.Code != "PGRST107" {
-		t.Fatalf("insert with unknown media type err = %v, want PGRST107", err)
+	if err == nil || err.Code != "PGRST102" {
+		t.Fatalf("insert with unknown media type err = %v, want PGRST102", err)
 	}
 }
 
-// CSV is not a patch format, so an update body in CSV is rejected as an
-// unsupported media type rather than silently parsed.
-func TestParseWriteUpdateCSVRejected(t *testing.T) {
-	_, err := ParseWrite(Update, "films", "id=eq.1", nil, "text/csv", []byte("rating\nPG\n"))
-	if err == nil || err.Code != "PGRST107" {
-		t.Fatalf("update with CSV err = %v, want PGRST107", err)
+// PostgREST accepts CSV for PATCH as well as POST, so a single-row CSV update
+// body decodes to the column assignments (item 01.16).
+func TestParseWriteUpdateCSVAccepted(t *testing.T) {
+	q, err := ParseWrite(Update, "films", "id=eq.1", nil, "text/csv", []byte("rating\nPG\n"))
+	if err != nil {
+		t.Fatalf("ParseWrite update CSV: %v", err)
+	}
+	if v := q.Write.Set["rating"]; v.JSON != "PG" {
+		t.Errorf("set rating = %#v, want PG", v.JSON)
+	}
+}
+
+// A bulk JSON insert whose objects do not share the first object's keys is
+// PGRST102 "All object keys must match" unless columns= overrides (item 01.15).
+func TestParseWriteRaggedJSONRejected(t *testing.T) {
+	body := []byte(`[{"title":"A","year":2020},{"title":"B"}]`)
+	_, err := ParseWrite(Insert, "films", "", nil, "application/json", body)
+	if err == nil || err.Code != "PGRST102" {
+		t.Fatalf("ragged JSON array err = %v, want PGRST102", err)
+	}
+}
+
+// With columns= present the ragged-array check is skipped (RawJSON semantics):
+// absent keys take the missing= behavior and extra keys are ignored.
+func TestParseWriteRaggedJSONWithColumnsOK(t *testing.T) {
+	body := []byte(`[{"title":"A","year":2020},{"title":"B"}]`)
+	if _, err := ParseWrite(Insert, "films", "columns=title,year", nil, "application/json", body); err != nil {
+		t.Fatalf("ParseWrite with columns= should accept a ragged array: %v", err)
 	}
 }
 
@@ -219,5 +287,40 @@ func TestParseEmbedScopedParam(t *testing.T) {
 	emb := q.Embeds[0].Query
 	if len(emb.Order) != 1 || emb.Order[0].Path[0] != "name" || !emb.Order[0].Desc {
 		t.Errorf("embed Order = %+v, want name desc", emb.Order)
+	}
+}
+
+// TestProjectedColumns covers the write-representation column projection helper
+// (item 01.19): a plain base-column select narrows the returning set, while any
+// shape the bare RETURNING path cannot reshape falls back to all columns (nil).
+func TestProjectedColumns(t *testing.T) {
+	col := func(name string) SelectItem { return Column{Path: []string{name}} }
+	cases := []struct {
+		name string
+		q    Query
+		want []string
+	}{
+		{"plain list", Query{Select: []SelectItem{col("id"), col("title")}}, []string{"id", "title"}},
+		{"dedup", Query{Select: []SelectItem{col("id"), col("id")}}, []string{"id"}},
+		{"empty select", Query{}, nil},
+		{"star", Query{Select: []SelectItem{Column{Path: []string{"*"}}}}, nil},
+		{"alias falls back", Query{Select: []SelectItem{Column{Path: []string{"title"}, Alias: "t"}}}, nil},
+		{"cast falls back", Query{Select: []SelectItem{Column{Path: []string{"id"}, Cast: "text"}}}, nil},
+		{"json path falls back", Query{Select: []SelectItem{Column{Path: []string{"data", "k"}, Last: JSONArrow2}}}, nil},
+		{"aggregate falls back", Query{Select: []SelectItem{Aggregate{Func: AggCount}}}, nil},
+		{"embed present falls back", Query{Select: []SelectItem{col("id")}, Embeds: []Embed{{}}}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.q.ProjectedColumns()
+			if len(got) != len(tc.want) {
+				t.Fatalf("ProjectedColumns() = %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("ProjectedColumns() = %v, want %v", got, tc.want)
+				}
+			}
+		})
 	}
 }

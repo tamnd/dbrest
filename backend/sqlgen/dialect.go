@@ -61,13 +61,16 @@ type Dialect interface {
 	RegexFeatureGap(pattern string) string
 
 	// FullText lowers a full-text predicate. col is the quoted column reference
-	// (PostgreSQL builds to_tsvector over it); idx is the resolved covering index,
-	// or nil when the schema has none (an engine that requires one reports ok=false
-	// and the compiler raises PGRST127). variant is the fts/plfts/phfts/wfts
-	// grammar; config is the language argument (may be empty); value is the raw
-	// query text. The returned fragment carries PatternMark where the bound,
-	// engine-translated query value goes, and bind is that value. See spec 21.
-	FullText(col string, idx *FullTextRef, variant ir.FTSVariant, config, value string) (frag, bind string, ok bool)
+	// (PostgreSQL builds to_tsvector over it); colType is the column's canonical
+	// type, so a dialect can skip the to_tsvector wrap when the column is already
+	// tsvector (it may be empty when the type is unknown); idx is the resolved
+	// covering index, or nil when the schema has none (an engine that requires one
+	// reports ok=false and the compiler raises PGRST127). variant is the
+	// fts/plfts/phfts/wfts grammar; config is the language argument (may be empty);
+	// value is the raw query text. The returned fragment carries PatternMark where
+	// the bound, engine-translated query value goes, and bind is that value. See
+	// spec 21.
+	FullText(col, colType string, idx *FullTextRef, variant ir.FTSVariant, config, value string) (frag, bind string, ok bool)
 
 	// SessionRead reads a request-context value (the GUC analog).
 	SessionRead(key string) string
@@ -86,12 +89,71 @@ type Dialect interface {
 	// BoolValue renders a boolean literal.
 	BoolValue(v bool) string
 
+	// IsBool renders "col IS TRUE" or "col IS FALSE" in the engine's syntax.
+	// Engines that restrict IS to NULL/UNKNOWN (SQL Server) return ok=true with
+	// a = expression; engines that support IS <bool> return ok=false to fall back
+	// to "col IS <BoolValue(v)>".
+	IsBool(col string, v bool) (string, bool)
+
+	// IsUnknown renders the three-valued "col IS UNKNOWN" test in the engine's
+	// syntax. PostgreSQL has the native operator and returns ok=true; engines
+	// without it return ok=false to fall back to "col IS NULL", which selects the
+	// same rows for a boolean column (its UNKNOWN state is its NULL).
+	IsUnknown(col string) (string, bool)
+
 	// ArrayOp renders an array containment/overlap operator expression, or
-	// reports ok=false when the engine does not support array types (SQLite,
-	// MySQL, SQL Server). The compiler emits PGRST127 when ok=false.
-	// op is one of "@>", "<@", "&&"; col is the quoted column; val is the
-	// placeholder returned by bind().
-	ArrayOp(col, op, val string) (string, bool)
+	// reports ok=false when the engine does not support array types (MySQL, SQL
+	// Server) or when the column type does not support array semantics (SQLite
+	// requires a JSON-typed column for json_each). The compiler emits PGRST127
+	// when ok=false. op is one of "@>", "<@", "&&"; col is the quoted column;
+	// val is the placeholder returned by bind(); colType is the canonical
+	// column type resolved by the planner ("json", "text", "integer", …).
+	ArrayOp(col, op, val, colType string) (string, bool)
+
+	// ArrayLiteral converts a PostgREST array literal (PostgreSQL {a,b} syntax)
+	// to the engine's native format for use as a bound parameter. PostgreSQL
+	// accepts {a,b} natively; SQLite needs JSON ["a","b"]. Other engines that
+	// do not support arrays may return the text unchanged (they never reach
+	// ArrayOp either).
+	ArrayLiteral(pgText string) string
+
+	// InList renders an in-list filter as a single-parameter form when the engine
+	// supports it, or reports ok=false to fall back to col IN ($1, $2, ...). col is
+	// the quoted column; the returned fragment carries PatternMark where the bound
+	// array placeholder goes, so the compiler binds the one argument only on this
+	// path (an unused bind would shift every later placeholder). PostgreSQL returns
+	// col = ANY(PatternMark), which PostgREST uses so a list of any length is one
+	// prepared statement instead of a distinct statement per length; the rows are
+	// identical to the expanded IN. Engines without an array-bound ANY return
+	// ok=false.
+	InList(col string) (string, bool)
+
+	// ArrayArg converts a decoded JSON array from a write payload into the
+	// bound driver argument the engine expects. colType is the target column's
+	// canonical type, so PostgreSQL renders the {elem1,elem2} array-literal text
+	// for an array column but keeps JSON text for a json/jsonb column (a JSON
+	// array there is JSON, not an array literal); engines without array columns
+	// (SQLite, MySQL, SQL Server) keep the JSON text regardless so a json/text
+	// column stores the array unchanged and reads it back as a JSON array.
+	ArrayArg(elems []any, colType string) any
+
+	// JSONPath lowers a JSON sub-path access into the engine's spelling. base is
+	// the already-qualified, quoted base column; hops are the path segments after
+	// it (data->phones->0->>number gives base data, hops {phones,0,number}); a
+	// segment that is all digits is an array index. asText reports whether the
+	// final hop was ->> (returns text) rather than -> (returns json). PostgreSQL
+	// emits its native ->/->> chain; SQLite emits the ->/->> operators over a
+	// JSON path. An engine without JSON paths returns ok=false and the compiler
+	// raises PGRST127.
+	JSONPath(base string, hops []string, asText bool) (frag string, ok bool)
+
+	// RangeOp renders a range-type operator expression (PostgREST sl/sr/nxr/nxl/
+	// adj), or reports ok=false when the engine has no range types so the compiler
+	// raises PGRST127. op is the engine-neutral PostgreSQL spelling "<<", ">>",
+	// "&<", "&>", or "-|-"; col is the quoted column; val is the placeholder
+	// returned by bind(). PostgreSQL emits the native operator; engines without
+	// range types decline.
+	RangeOp(col, op, val string) (string, bool)
 }
 
 // PatternMark is the sentinel a Dialect.Regex fragment carries where the bound

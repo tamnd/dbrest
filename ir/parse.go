@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"net/url"
 	"slices"
 	"sort"
@@ -29,6 +30,9 @@ func ParseRead(relation, rawQuery string, preferHeaders []string) (*Query, *pger
 	}
 	q := &Query{Kind: Read, Relation: Ref{Name: relation}}
 	q.Prefer = ParsePrefer(preferHeaders)
+	if perr := q.Prefer.StrictError(); perr != nil {
+		return nil, perr
+	}
 	if q.Prefer.Count != nil {
 		q.Count = *q.Prefer.Count
 	}
@@ -43,8 +47,14 @@ func ParseRead(relation, rawQuery string, preferHeaders []string) (*Query, *pger
 // limit/offset window, and the horizontal-filter tree. A write uses the filter
 // tree as its WHERE and the select list as its returning projection.
 func parseQueryString(q *Query, vals url.Values) *pgerr.APIError {
-	if sel := vals.Get("select"); sel != "" {
-		items, embeds, perr := parseSelect(sel)
+	// An omitted select defaults to all columns; an explicitly empty select= is a
+	// parse error, matching PostgREST (item 01.5).
+	if vals.Has("select") {
+		sel := vals.Get("select")
+		if sel == "" {
+			return pgerr.ErrParse("\"failed to parse select parameter ()\" (line 1, column 1)")
+		}
+		items, embeds, perr := parseSelect(sel, false)
 		if perr != nil {
 			return perr
 		}
@@ -66,15 +76,14 @@ func applyParams(q *Query, vals url.Values) *pgerr.APIError {
 		if key == "select" {
 			continue // consumed by the caller / by the embed parens
 		}
-		if i := strings.IndexByte(key, '.'); i >= 0 {
-			if idx := findEmbed(q.Embeds, key[:i]); idx >= 0 {
-				prefix := key[:i]
-				ev := scoped[prefix]
+		if head, rest, ok := cutIdentAware(key, '.'); ok {
+			if idx := findEmbed(q.Embeds, head); idx >= 0 {
+				ev := scoped[head]
 				if ev == nil {
 					ev = url.Values{}
-					scoped[prefix] = ev
+					scoped[head] = ev
 				}
-				ev[key[i+1:]] = vs
+				ev[rest] = vs
 				continue
 			}
 		}
@@ -90,8 +99,14 @@ func applyParams(q *Query, vals url.Values) *pgerr.APIError {
 	}
 	if lim := self.Get("limit"); lim != "" {
 		n, e := strconv.Atoi(lim)
-		if e != nil || n < 0 {
+		if e != nil {
 			return pgerr.ErrParse("limit must be a non-negative integer")
+		}
+		if n < 0 {
+			// A well-formed but negative limit is PostgREST's 416 PGRST103, not a
+			// parse error: the requested range cannot be satisfied.
+			return pgerr.ErrRangeNotSatisfiable().
+				WithDetails("Limit should be greater than or equal to zero.")
 		}
 		q.Limit = &n
 	}
@@ -139,8 +154,13 @@ func ParseWrite(kind QueryKind, relation, rawQuery string, preferHeaders []strin
 	if err != nil {
 		return nil, pgerr.ErrParse("could not parse query string")
 	}
-	q := &Query{Kind: kind, Relation: Ref{Name: relation}}
+	// PUT is the only method the router maps to Upsert; capture it before the
+	// promotion below can also turn a POST into an upsert.
+	q := &Query{Kind: kind, Relation: Ref{Name: relation}, IsPut: kind == Upsert}
 	q.Prefer = ParsePrefer(preferHeaders)
+	if perr := q.Prefer.StrictError(); perr != nil {
+		return nil, perr
+	}
 	if q.Prefer.Count != nil {
 		q.Count = *q.Prefer.Count
 	}
@@ -158,12 +178,17 @@ func ParseWrite(kind QueryKind, relation, rawQuery string, preferHeaders []strin
 	if q.Prefer.Tx != nil {
 		w.Tx = *q.Prefer.Tx
 	}
+	// max-affected (strict-only; ParsePrefer cleared it under lenient) bounds the
+	// affected-row count the backend will tolerate before rolling back.
+	w.MaxRows = q.Prefer.MaxAffected
 
-	// An on_conflict target or a resolution preference makes this an upsert; PUT
-	// is always an upsert. The conflict target defaults to the primary key,
-	// which the planner fills in.
+	// PostgREST performs an upsert only for PUT or for a POST carrying a
+	// Prefer: resolution= preference. on_conflict alone leaves a POST a plain
+	// insert (a duplicate key then fails with 409), and both on_conflict and
+	// resolution are ignored entirely for PATCH and DELETE. The conflict target
+	// defaults to the primary key, which the planner fills in.
 	onConflict := vals.Get("on_conflict")
-	if kind == Upsert || onConflict != "" || q.Prefer.Resolution != nil {
+	if q.IsPut || (kind == Insert && q.Prefer.Resolution != nil) {
 		q.Kind = Upsert
 		c := &Conflict{}
 		if onConflict != "" {
@@ -180,6 +205,14 @@ func ParseWrite(kind QueryKind, relation, rawQuery string, preferHeaders []strin
 		objs, header, perr := decodeBodyObjects(contentType, body)
 		if perr != nil {
 			return nil, perr
+		}
+		// Without an explicit columns= override, PostgREST requires every object
+		// in a bulk JSON array to carry exactly the first object's keys; columns=
+		// switches to RawJSON semantics and skips the check (item 01.15).
+		if vals.Get("columns") == "" && bodyFormat(contentType) == fmtJSON {
+			if perr := checkUniformKeys(objs); perr != nil {
+				return nil, perr
+			}
 		}
 		w.Rows, w.Columns = buildInsert(objs, vals.Get("columns"), header)
 	case Update:
@@ -212,13 +245,22 @@ var callReserved = map[string]bool{
 // arguments (with their JSON types) and the whole query string post-filters. The
 // planner resolves the function and checks volatility against the method. All
 // errors are PGRST1xx. See spec 12-rpc.
-func ParseCall(fn, rawQuery string, preferHeaders []string, isGet bool, contentType string, body []byte) (*Call, *pgerr.APIError) {
+//
+// rawBodyParam names the single parameter of an unnamed-argument function, when
+// the resolved name is one; for such a function the whole POST body is bound to
+// that parameter by Content-Type (rawBodyType is its declared type) rather than
+// decoded as a JSON object of named arguments. It is "" for the ordinary
+// named-argument form and on GET.
+func ParseCall(fn, rawQuery string, preferHeaders []string, isGet bool, contentType string, body []byte, rawBodyParam, rawBodyType string) (*Call, *pgerr.APIError) {
 	vals, err := url.ParseQuery(rawQuery)
 	if err != nil {
 		return nil, pgerr.ErrParse("could not parse query string")
 	}
 	c := &Call{Function: Ref{Name: fn}}
 	c.Prefer = ParsePrefer(preferHeaders)
+	if perr := c.Prefer.StrictError(); perr != nil {
+		return nil, perr
+	}
 	if c.Prefer.Count != nil {
 		c.Count = *c.Prefer.Count
 	}
@@ -230,14 +272,20 @@ func ParseCall(fn, rawQuery string, preferHeaders []string, isGet bool, contentT
 
 	if isGet {
 		post := url.Values{}
+		raw := url.Values{}
 		for k, vs := range vals {
 			if callReserved[k] {
 				post[k] = vs
 				continue
 			}
-			// A function argument; the last value wins, matching url.Values.Get.
+			// A candidate argument: the last value wins for the argument binding
+			// (matching url.Values.Get), but every value is retained on RawGet so the
+			// planner can re-read a key that turns out to be a filter, or collect a
+			// variadic parameter's repeats, once the signature is known.
+			raw[k] = vs
 			args[k] = Value{Text: vs[len(vs)-1]}
 		}
+		c.RawGet = raw
 		if perr := parseQueryString(pq, post); perr != nil {
 			return nil, perr
 		}
@@ -245,7 +293,15 @@ func ParseCall(fn, rawQuery string, preferHeaders []string, isGet bool, contentT
 		if perr := parseQueryString(pq, vals); perr != nil {
 			return nil, perr
 		}
-		if len(body) > 0 {
+		if rawBodyParam != "" {
+			// Single-unnamed-parameter form: the whole body is the one argument,
+			// decoded by Content-Type rather than read as a named-argument object.
+			v, perr := bindRawBody(contentType, body, rawBodyType)
+			if perr != nil {
+				return nil, perr
+			}
+			args[rawBodyParam] = v
+		} else if len(body) > 0 {
 			obj, perr := decodeBodyObject(contentType, body)
 			if perr != nil {
 				return nil, perr
@@ -257,8 +313,52 @@ func ParseCall(fn, rawQuery string, preferHeaders []string, isGet bool, contentT
 	}
 
 	c.Select, c.Where, c.Order, c.Limit, c.Offset = pq.Select, pq.Where, pq.Order, pq.Limit, pq.Offset
+	c.Embeds = pq.Embeds
 	c.Args = args
 	return c, nil
+}
+
+// PartitionGetArgs splits a GET /rpc call's query parameters into function
+// arguments and post-filters once the resolved function's parameter names are
+// known. A key naming a declared parameter stays an argument; every other key is
+// re-read through the filter grammar and merged into the call's WHERE, matching
+// how PostgREST treats a query key that does not name a parameter as a filter on
+// a table-valued result. It is a no-op on a POST call, where the body carries the
+// arguments and the query string already post-filtered.
+func (c *Call) PartitionGetArgs(isParam func(string) bool, isVariadic func(string) bool) *pgerr.APIError {
+	if c.RawGet == nil {
+		return nil
+	}
+	filters := url.Values{}
+	for k, vs := range c.RawGet {
+		if isParam(k) {
+			// A variadic parameter collects every repeat of its key as a list; a
+			// scalar parameter already took the last value in ParseCall.
+			if isVariadic(k) {
+				c.Args[k] = Value{List: append([]string(nil), vs...)}
+			}
+			continue
+		}
+		delete(c.Args, k)
+		filters[k] = vs
+	}
+	if len(filters) == 0 {
+		return nil
+	}
+	cond, perr := parseFilters(filters)
+	if perr != nil {
+		return perr
+	}
+	if cond == nil {
+		return nil
+	}
+	if c.Where == nil {
+		c.Where = cond
+		return nil
+	}
+	merged := Cond(And{Kids: []Cond{*c.Where, *cond}})
+	c.Where = &merged
+	return nil
 }
 
 // writeFormat is the request body encoding selected by Content-Type (spec 17).
@@ -312,18 +412,75 @@ func decodeBodyObjects(contentType string, body []byte) ([]map[string]any, []str
 	}
 }
 
+// bindRawBody binds the whole request body to a single unnamed parameter,
+// decoded by Content-Type the way PostgREST routes a single-argument function:
+// application/json (or an empty type) carries any JSON value, object or array or
+// scalar; text/plain and text/xml carry the raw text; application/octet-stream
+// carries the raw bytes as text. A content type with no raw-body decoder is the
+// unsupported-media-type error, the same one the named-object path raises.
+func bindRawBody(contentType string, body []byte, declaredType string) (Value, *pgerr.APIError) {
+	ct := strings.ToLower(strings.TrimSpace(contentType))
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = strings.TrimSpace(ct[:i])
+	}
+	switch ct {
+	case "", "application/json":
+		dec := json.NewDecoder(bytes.NewReader(body))
+		dec.UseNumber()
+		var v any
+		if err := dec.Decode(&v); err != nil {
+			return Value{}, pgerr.ErrInvalidBody("")
+		}
+		return Value{JSON: v}, nil
+	case "text/plain", "text/xml", "application/xml":
+		return Value{Text: string(body)}, nil
+	case "application/octet-stream":
+		// A bytea parameter receives the raw bytes; they ride as text here and the
+		// engine binds them, with exact bytea typing left to the types subsystem.
+		return Value{Text: string(body)}, nil
+	default:
+		return Value{}, pgerr.ErrUnsupportedMediaType(contentType)
+	}
+}
+
 // decodeBodyObject decodes an update body into a single object of column
-// assignments. CSV is not a meaningful patch format and is rejected.
+// assignments. PostgREST accepts CSV for PATCH as well as POST, so a single-row
+// CSV body is decoded with the same NULL rule the insert path uses.
 func decodeBodyObject(contentType string, body []byte) (map[string]any, *pgerr.APIError) {
 	switch bodyFormat(contentType) {
 	case fmtJSON:
 		dec := json.NewDecoder(bytes.NewReader(body))
 		dec.UseNumber()
-		var obj map[string]any
-		if err := dec.Decode(&obj); err != nil {
-			return nil, pgerr.ErrParse("update body must be a JSON object")
+		var raw any
+		if err := dec.Decode(&raw); err != nil {
+			return nil, pgerr.ErrInvalidBody("")
 		}
-		return obj, nil
+		switch v := raw.(type) {
+		case map[string]any:
+			return v, nil
+		case []any:
+			// PostgREST accepts the empty-array forms [] and [{}] for PATCH as a
+			// no-op update (an empty column set). An array carrying a non-empty
+			// object is not a shape upstream defines for update, so it stays a 400.
+			for _, e := range v {
+				obj, ok := e.(map[string]any)
+				if !ok || len(obj) > 0 {
+					return nil, pgerr.ErrInvalidBody("All object keys must match")
+				}
+			}
+			return map[string]any{}, nil
+		default:
+			return nil, pgerr.ErrInvalidBody("")
+		}
+	case fmtCSV:
+		objs, _, perr := decodeCSVObjects(body)
+		if perr != nil {
+			return nil, perr
+		}
+		if len(objs) != 1 {
+			return nil, pgerr.ErrInvalidBody("CSV update body must have exactly one data row")
+		}
+		return objs[0], nil
 	case fmtForm:
 		return decodeFormObject(body)
 	default:
@@ -338,7 +495,7 @@ func decodeJSONObjects(body []byte) ([]map[string]any, *pgerr.APIError) {
 	dec.UseNumber()
 	var raw any
 	if err := dec.Decode(&raw); err != nil {
-		return nil, pgerr.ErrParse("request body is not valid JSON")
+		return nil, pgerr.ErrInvalidBody("")
 	}
 	switch v := raw.(type) {
 	case map[string]any:
@@ -348,38 +505,47 @@ func decodeJSONObjects(body []byte) ([]map[string]any, *pgerr.APIError) {
 		for _, e := range v {
 			obj, ok := e.(map[string]any)
 			if !ok {
-				return nil, pgerr.ErrParse("insert array must contain objects")
+				return nil, pgerr.ErrInvalidBody("All object keys must match")
 			}
 			objs = append(objs, obj)
 		}
 		return objs, nil
 	default:
-		return nil, pgerr.ErrParse("insert body must be an object or an array of objects")
+		return nil, pgerr.ErrInvalidBody("")
 	}
 }
 
 // decodeCSVObjects parses an RFC 4180 body into row objects keyed by the header
-// row. An empty field decodes to SQL NULL, matching PostgREST's default CSV null
-// handling (Go's csv reader does not distinguish a quoted empty string from an
-// unquoted empty field, so both map to null).
+// row, with PostgREST's CSV semantics: the unquoted literal string NULL becomes
+// SQL null and every other field, including an empty cell, becomes a string (an
+// empty cell inserts an empty string). Go's csv reader enforces a uniform field
+// count against the header, so a ragged row surfaces as PGRST102 "All lines must
+// have same number of fields".
 func decodeCSVObjects(body []byte) ([]map[string]any, []string, *pgerr.APIError) {
 	r := csv.NewReader(bytes.NewReader(body))
 	recs, err := r.ReadAll()
 	if err != nil {
-		return nil, nil, pgerr.ErrParse("malformed CSV body")
+		var pe *csv.ParseError
+		if errors.As(err, &pe) && pe.Err == csv.ErrFieldCount {
+			return nil, nil, pgerr.ErrInvalidBody("All lines must have same number of fields")
+		}
+		return nil, nil, pgerr.ErrInvalidBody("malformed CSV body")
 	}
 	if len(recs) == 0 {
-		return nil, nil, pgerr.ErrParse("CSV body has no header row")
+		return nil, nil, pgerr.ErrInvalidBody("CSV body has no header row")
 	}
 	header := recs[0]
 	objs := make([]map[string]any, 0, len(recs)-1)
 	for _, rec := range recs[1:] {
 		obj := make(map[string]any, len(header))
 		for i, h := range header {
-			if i < len(rec) && rec[i] != "" {
-				obj[h] = rec[i]
-			} else {
+			switch {
+			case i >= len(rec):
 				obj[h] = nil
+			case rec[i] == "NULL":
+				obj[h] = nil
+			default:
+				obj[h] = rec[i]
 			}
 		}
 		objs = append(objs, obj)
@@ -392,7 +558,7 @@ func decodeCSVObjects(body []byte) ([]map[string]any, []string, *pgerr.APIError)
 func decodeFormObject(body []byte) (map[string]any, *pgerr.APIError) {
 	vals, err := url.ParseQuery(string(body))
 	if err != nil {
-		return nil, pgerr.ErrParse("malformed form body")
+		return nil, pgerr.ErrInvalidBody("malformed form body")
 	}
 	obj := make(map[string]any, len(vals))
 	for k, v := range vals {
@@ -401,6 +567,28 @@ func decodeFormObject(body []byte) (map[string]any, *pgerr.APIError) {
 		}
 	}
 	return obj, nil
+}
+
+// checkUniformKeys enforces PostgREST's rule that every object in a bulk insert
+// shares the first object's exact key set; a mismatch is PGRST102 "All object
+// keys must match". A single object (or none) is trivially uniform. The columns=
+// parameter overrides the rule, so the caller skips this when it is present.
+func checkUniformKeys(objs []map[string]any) *pgerr.APIError {
+	if len(objs) < 2 {
+		return nil
+	}
+	first := objs[0]
+	for _, obj := range objs[1:] {
+		if len(obj) != len(first) {
+			return pgerr.ErrInvalidBody("All object keys must match")
+		}
+		for k := range first {
+			if _, ok := obj[k]; !ok {
+				return pgerr.ErrInvalidBody("All object keys must match")
+			}
+		}
+	}
+	return nil
 }
 
 // buildInsert turns decoded objects into write rows and resolves the column set.
@@ -455,7 +643,7 @@ func splitComma(s string) []string {
 // parseSelect parses the comma-separated select list at the top level. An item
 // containing a parenthesis is an embed (rel(...)); plain items are columns,
 // optionally alias:col::cast. "*" selects all columns.
-func parseSelect(s string) ([]SelectItem, []Embed, *pgerr.APIError) {
+func parseSelect(s string, nested bool) ([]SelectItem, []Embed, *pgerr.APIError) {
 	// PostgREST treats a bare "*" as "all columns" — equivalent to omitting
 	// the select parameter entirely. We normalise it to an empty list here so
 	// the planner and compiler see no explicit projection.
@@ -474,6 +662,15 @@ func parseSelect(s string) ([]SelectItem, []Embed, *pgerr.APIError) {
 			return nil, nil, pgerr.ErrParse("empty item in select list")
 		}
 		if i := strings.IndexByte(raw, '('); i >= 0 {
+			// An item with empty parens is an aggregate (count(), amount.sum());
+			// anything else is an embedded resource. The aggregate functions are a
+			// closed set, so a name(...) that is not one falls through to the embed.
+			if agg, ok, perr := parseAggregate(raw); perr != nil {
+				return nil, nil, perr
+			} else if ok {
+				items = append(items, agg)
+				continue
+			}
 			emb, perr := parseEmbed(raw, i)
 			if perr != nil {
 				return nil, nil, perr
@@ -482,10 +679,12 @@ func parseSelect(s string) ([]SelectItem, []Embed, *pgerr.APIError) {
 			embeds = append(embeds, emb)
 			continue
 		}
-		// PostgREST supports a bare "count" inside an embed select as a virtual
-		// aggregate that maps to count(*) in the JSON output.
-		if raw == "count" {
-			items = append(items, Aggregate{Func: AggCount})
+		// Inside an embed select, a bare "count" is the legacy virtual aggregate that
+		// maps to count(*) in the JSON output; it predates the count() form and is
+		// exempt from the db-aggregates-enabled gate. At the top level "count" is an
+		// ordinary column reference (PostgREST v12+).
+		if nested && raw == "count" {
+			items = append(items, Aggregate{Func: AggCount, Legacy: true})
 			continue
 		}
 		col, perr := parseColumnItem(raw)
@@ -495,6 +694,103 @@ func parseSelect(s string) ([]SelectItem, []Embed, *pgerr.APIError) {
 		items = append(items, col)
 	}
 	return items, embeds, nil
+}
+
+// aggFuncByName maps the PostgREST aggregate spellings to their IR function.
+var aggFuncByName = map[string]AggFunc{
+	"count": AggCount, "sum": AggSum, "avg": AggAvg, "min": AggMin, "max": AggMax,
+}
+
+// parseAggregate recognizes the aggregate forms count() and path.func(), each
+// with an optional response-key alias, an optional input cast on the aggregated
+// column, and an optional output cast on the result. It reports ok=false (no
+// error) when raw is not an aggregate so the caller can treat it as an embed.
+func parseAggregate(raw string) (Aggregate, bool, *pgerr.APIError) {
+	// The function call is always empty parens. Their absence rules out an
+	// aggregate immediately; a non-empty pair means an embedded resource.
+	head, tail, found := strings.Cut(raw, "()")
+	if !found {
+		return Aggregate{}, false, nil
+	}
+
+	var agg Aggregate
+	// Output cast trails the parens as ::type.
+	if tail != "" {
+		if !strings.HasPrefix(tail, "::") {
+			return Aggregate{}, false, nil
+		}
+		agg.Cast = tail[2:]
+		if agg.Cast == "" {
+			return Aggregate{}, false, pgerr.ErrParse("empty cast target")
+		}
+		if !validCastType(agg.Cast) {
+			return Aggregate{}, false, pgerr.ErrParse("invalid cast target " + agg.Cast)
+		}
+	}
+	// Strip a response-key alias: the leading name before a single ':' that is not
+	// part of a '::' cast and not inside quotes.
+	if alias, rest, ok := cutAliasAware(head); ok {
+		agg.Alias = unquoteIdent(alias)
+		head = rest
+	}
+	// The function name is the token after the last dot; no dot means the whole
+	// head is the function, which is only valid for the no-argument count().
+	fn := head
+	argSpec := ""
+	if dot := strings.LastIndexByte(head, '.'); dot >= 0 {
+		fn = head[dot+1:]
+		argSpec = head[:dot]
+	}
+	f, ok := aggFuncByName[fn]
+	if !ok {
+		// An unknown function name with empty parens is not an aggregate; let the
+		// caller try it as an embed.
+		return Aggregate{}, false, nil
+	}
+	agg.Func = f
+	if argSpec == "" {
+		if f != AggCount {
+			return Aggregate{}, false, pgerr.ErrParse(fn + "() requires a column argument")
+		}
+		return agg, true, nil
+	}
+	arg, perr := parseColumnItem(argSpec)
+	if perr != nil {
+		return Aggregate{}, false, perr
+	}
+	agg.Arg = &arg
+	return agg, true, nil
+}
+
+// cutAliasAware splits a select-item head on the alias colon: the first ':' that
+// is a single colon (not part of a '::' cast) and lies outside double quotes. It
+// returns ok=false when there is no such colon.
+func cutAliasAware(s string) (alias, rest string, ok bool) {
+	inQuote := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inQuote {
+			if c == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if c == '"' {
+				inQuote = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inQuote = true
+		case ':':
+			if i+1 < len(s) && s[i+1] == ':' {
+				i++ // skip the cast '::'
+				continue
+			}
+			return s[:i], s[i+1:], true
+		}
+	}
+	return "", s, false
 }
 
 // parseEmbed parses rel(...) including an optional alias and hint. The inner
@@ -513,16 +809,27 @@ func parseEmbed(raw string, lparen int) (Embed, *pgerr.APIError) {
 		emb.Alias = head[:c]
 		head = head[c+1:]
 	}
-	if b := strings.IndexByte(head, '!'); b >= 0 {
-		hint := head[b+1:]
-		head = head[:b]
-		switch hint {
-		case "inner":
-			emb.Join = JoinInner
-		case "left":
-			emb.Join = JoinLeft
-		default:
-			emb.Hint = hint
+	// A head may carry both a disambiguation hint and a join modifier, in either
+	// order (rel!hint!inner or rel!inner!hint). Split on every `!`: the first
+	// segment is the relation, each later one is "inner"/"left" (the join) or a
+	// hint. Two hints are a grammar error.
+	if strings.IndexByte(head, '!') >= 0 {
+		segs := strings.Split(head, "!")
+		head = segs[0]
+		sawHint := false
+		for _, seg := range segs[1:] {
+			switch seg {
+			case "inner":
+				emb.Join = JoinInner
+			case "left":
+				emb.Join = JoinLeft
+			default:
+				if sawHint {
+					return Embed{}, pgerr.ErrParse("embed carries more than one disambiguation hint")
+				}
+				emb.Hint = seg
+				sawHint = true
+			}
 		}
 	}
 	if strings.HasPrefix(head, "...") {
@@ -539,12 +846,17 @@ func parseEmbed(raw string, lparen int) (Embed, *pgerr.APIError) {
 		emb.OutKey = emb.Alias
 	}
 	if inner != "" {
-		items, nested, perr := parseSelect(inner)
+		items, nested, perr := parseSelect(inner, true)
 		if perr != nil {
 			return Embed{}, perr
 		}
 		emb.Query.Select = items
 		emb.Query.Embeds = nested
+	} else {
+		// Empty parentheses, client(). The relation is still joined for filtering
+		// but its key is omitted from the output; this is distinct from an absent
+		// list, which selects every column.
+		emb.EmptySelect = true
 	}
 	return emb, nil
 }
@@ -560,11 +872,16 @@ func parseColumnItem(raw string) (Column, *pgerr.APIError) {
 		if col.Cast == "" {
 			return Column{}, pgerr.ErrParse("empty cast target")
 		}
+		if !validCastType(col.Cast) {
+			return Column{}, pgerr.ErrParse("invalid cast target " + col.Cast)
+		}
 	}
-	// alias: leading name before a single ':' (not '::', already stripped)
-	if i := strings.IndexByte(raw, ':'); i >= 0 {
-		col.Alias = raw[:i]
-		raw = raw[i+1:]
+	// alias: leading name before a single ':' (not '::', already stripped). The
+	// split is quote-aware so an aliased or target name may itself contain a colon
+	// when double-quoted (item 01.2).
+	if alias, rest, ok := cutIdentAware(raw, ':'); ok {
+		col.Alias = unquoteIdent(alias)
+		raw = rest
 	}
 	path, last, perr := parsePath(raw)
 	if perr != nil {
@@ -575,6 +892,32 @@ func parseColumnItem(raw string) (Column, *pgerr.APIError) {
 	return col, nil
 }
 
+// validCastType reports whether a ::cast target is a safe type name. PostgREST
+// does not whitelist cast targets; it lets PostgreSQL resolve the name (money,
+// interval, an enum, a domain, an array type), so the backend passes the type
+// through verbatim. Because the type is spliced into SQL rather than bound, the
+// grammar is restricted to what a real type spelling needs so nothing breaks out
+// of the cast: letters, digits, underscore, spaces (double precision, time
+// without time zone), a dot for schema qualification, parentheses and commas for
+// precision/scale (numeric(10,2)), and brackets for arrays (int[]). The first
+// character must begin an identifier. Anything else (a quote, a semicolon, an
+// operator) is a parse error rather than a silent rewrite.
+func validCastType(s string) bool {
+	for i, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r == '_':
+			// always allowed
+		case r >= '0' && r <= '9', r == ' ', r == '.', r == '(', r == ')', r == ',', r == '[', r == ']':
+			if i == 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // parsePath splits a column reference with optional JSON arrows into hops.
 // e.g. data->a->>b => {"data","a","b"} with Last=JSONArrow2.
 func parsePath(raw string) ([]string, JSONStep, *pgerr.APIError) {
@@ -582,28 +925,46 @@ func parsePath(raw string) ([]string, JSONStep, *pgerr.APIError) {
 		return nil, JSONNone, pgerr.ErrParse("empty column reference")
 	}
 	last := JSONNone
-	// normalize ->> and -> into a delimiter sweep
+	// Sweep ->> and -> into hops, but treat an arrow inside a double-quoted segment
+	// as part of the identifier rather than a delimiter (item 01.2).
 	var hops []string
-	rest := raw
-	for {
-		i2 := strings.Index(rest, "->>")
-		i1 := strings.Index(rest, "->")
-		switch {
-		case i2 >= 0 && (i1 == -1 || i2 <= i1):
-			hops = append(hops, rest[:i2])
-			rest = rest[i2+3:]
-			last = JSONArrow2
-		case i1 >= 0:
-			hops = append(hops, rest[:i1])
-			rest = rest[i1+2:]
-			last = JSONArrow
-		default:
-			hops = append(hops, rest)
-			rest = ""
+	start := 0
+	inQuote := false
+	for i := 0; i < len(raw); {
+		c := raw[i]
+		if inQuote {
+			if c == '\\' && i+1 < len(raw) {
+				i += 2
+				continue
+			}
+			if c == '"' {
+				inQuote = false
+			}
+			i++
+			continue
 		}
-		if rest == "" {
-			break
+		if c == '"' {
+			inQuote = true
+			i++
+			continue
 		}
+		if c == '-' && i+1 < len(raw) && raw[i+1] == '>' {
+			hops = append(hops, raw[start:i])
+			if i+2 < len(raw) && raw[i+2] == '>' {
+				last = JSONArrow2
+				i += 3
+			} else {
+				last = JSONArrow
+				i += 2
+			}
+			start = i
+			continue
+		}
+		i++
+	}
+	hops = append(hops, raw[start:])
+	for j := range hops {
+		hops[j] = unquoteIdent(hops[j])
 	}
 	if slices.Contains(hops, "") {
 		return nil, JSONNone, pgerr.ErrParse("empty hop in column path")
@@ -623,24 +984,46 @@ func parseOrder(s string) ([]OrderTerm, *pgerr.APIError) {
 		if p == "" {
 			return nil, pgerr.ErrParse("empty order term")
 		}
-		segs := strings.Split(p, ".")
+		// Peel the column quote-aware so a double-quoted name may contain a dot
+		// before the modifier list is split (item 01.2).
+		colPart, modPart, hasMods := cutIdentAware(p, '.')
 		var t OrderTerm
-		path, _, perr := parsePath(segs[0])
+		// An order term may name an embedded to-one resource's column:
+		// order=client(name) sorts the parent by the embed's column (item 07.6).
+		// The relation rides on Rel; the inner text is the column path, which may
+		// itself carry a JSON sub-path (trash_details(jsonb_col->key)).
+		if rel, inner, ok := cutRelOrder(colPart); ok {
+			t.Rel = rel
+			colPart = inner
+		}
+		path, last, perr := parsePath(colPart)
 		if perr != nil {
 			return nil, perr
 		}
 		t.Path = path
-		for _, mod := range segs[1:] {
+		t.Last = last
+		var mods []string
+		if hasMods {
+			mods = strings.Split(modPart, ".")
+		}
+		// PostgREST's grammar is column[.asc|.desc][.nullsfirst|.nullslast] in that
+		// fixed order: at most one direction, then at most one nulls modifier, no
+		// repeats and no direction after a nulls modifier (item 01.7).
+		var sawDir, sawNulls bool
+		for _, mod := range mods {
 			switch mod {
-			case "asc":
-				t.Desc = false
-			case "desc":
-				t.Desc = true
-			case "nullsfirst":
-				v := true
-				t.NullsFirst = &v
-			case "nullslast":
-				v := false
+			case "asc", "desc":
+				if sawDir || sawNulls {
+					return nil, pgerr.ErrParse("unexpected order modifier: " + mod)
+				}
+				sawDir = true
+				t.Desc = mod == "desc"
+			case "nullsfirst", "nullslast":
+				if sawNulls {
+					return nil, pgerr.ErrParse("unexpected order modifier: " + mod)
+				}
+				sawNulls = true
+				v := mod == "nullsfirst"
 				t.NullsFirst = &v
 			default:
 				return nil, pgerr.ErrParse("unknown order modifier: " + mod)
@@ -649,6 +1032,24 @@ func parseOrder(s string) ([]OrderTerm, *pgerr.APIError) {
 		terms = append(terms, t)
 	}
 	return terms, nil
+}
+
+// cutRelOrder splits an order column of the form rel(col) into the relation name
+// and the inner column text. It returns ok=false for a plain column (no
+// parenthesis) so the caller treats it as a parent column. The relation name must
+// be non-empty and the parentheses must wrap the rest of the term; a stray or
+// unbalanced parenthesis is left to parsePath, which reports it.
+func cutRelOrder(s string) (rel, inner string, ok bool) {
+	open := strings.IndexByte(s, '(')
+	if open <= 0 || !strings.HasSuffix(s, ")") {
+		return "", "", false
+	}
+	rel = strings.TrimSpace(s[:open])
+	inner = strings.TrimSpace(s[open+1 : len(s)-1])
+	if rel == "" || inner == "" {
+		return "", "", false
+	}
+	return rel, inner, true
 }
 
 // parseFilters builds the top-level filter tree from column filters plus and=/or=.
@@ -685,12 +1086,12 @@ func parseFilters(vals url.Values) (*Cond, *pgerr.APIError) {
 		if reservedKeys[key] {
 			continue
 		}
-		path, _, perr := parsePath(key)
+		path, last, perr := parsePath(key)
 		if perr != nil {
 			return nil, perr
 		}
 		for _, v := range vals[key] {
-			cmp, perr := parseCompare(path, v)
+			cmp, perr := parseCompare(path, last, v)
 			if perr != nil {
 				return nil, perr
 			}
@@ -744,16 +1145,17 @@ func parseLogical(op, raw string) (Cond, *pgerr.APIError) {
 			kids = append(kids, node)
 			continue
 		}
-		// column.op.value
-		col, rest, ok := strings.Cut(p, ".")
+		// column.op.value, the column split quote-aware so a double-quoted name may
+		// contain a dot (item 01.2).
+		col, rest, ok := cutIdentAware(p, '.')
 		if !ok {
 			return nil, pgerr.ErrParse("malformed predicate in logical: " + p)
 		}
-		path, _, perr := parsePath(col)
+		path, last, perr := parsePath(col)
 		if perr != nil {
 			return nil, perr
 		}
-		cmp, perr := parseCompare(path, rest)
+		cmp, perr := parseCompare(path, last, rest)
 		if perr != nil {
 			return nil, perr
 		}
@@ -772,8 +1174,8 @@ func parseLogical(op, raw string) (Cond, *pgerr.APIError) {
 }
 
 // parseCompare parses a "operator.operand" filter value against a column path.
-func parseCompare(path []string, raw string) (Compare, *pgerr.APIError) {
-	c := Compare{Path: path}
+func parseCompare(path []string, last JSONStep, raw string) (Compare, *pgerr.APIError) {
+	c := Compare{Path: path, Last: last}
 	if strings.HasPrefix(raw, "not.") {
 		c.Negate = true
 		raw = strings.TrimPrefix(raw, "not.")
@@ -820,6 +1222,25 @@ func parseCompare(path []string, raw string) (Compare, *pgerr.APIError) {
 		return Compare{}, pgerr.ErrParse("unknown operator: " + base)
 	}
 	c.Op = op
+	// A quantifier applies to a braces list and is valid only for the operators
+	// PostgREST allows it on; every element is parsed from the {…} literal, with
+	// LIKE/ILIKE wildcards translated per element (item 01.1).
+	if c.Quant != QNone {
+		if !isQuantifiable(op) {
+			return Compare{}, pgerr.ErrParse("quantifier any/all is not valid for operator: " + base)
+		}
+		list, perr := parseBraceList(operand)
+		if perr != nil {
+			return Compare{}, perr
+		}
+		if op == OpLike || op == OpILike {
+			for i, p := range list {
+				list[i] = strings.ReplaceAll(p, "*", "%")
+			}
+		}
+		c.Value = Value{List: list}
+		return c, nil
+	}
 	switch op {
 	case OpIn:
 		list, perr := parseInList(operand)
@@ -836,23 +1257,21 @@ func parseCompare(path []string, raw string) (Compare, *pgerr.APIError) {
 		}
 	case OpLike, OpILike:
 		// PostgREST maps * to % in LIKE/ILIKE patterns so URL-friendly wildcards work.
-		if c.Quant != QNone {
-			// like(any)/{*cat*,*laundry*} — expand {…} into a list, * → % in each.
-			list, perr := parseLikeList(operand)
-			if perr != nil {
-				return Compare{}, perr
-			}
-			for i, p := range list {
-				list[i] = strings.ReplaceAll(p, "*", "%")
-			}
-			c.Value = Value{List: list}
-		} else {
-			c.Value = Value{Text: strings.ReplaceAll(operand, "*", "%")}
-		}
+		c.Value = Value{Text: strings.ReplaceAll(operand, "*", "%")}
 	default:
 		c.Value = Value{Text: operand}
 	}
 	return c, nil
+}
+
+// isQuantifiable reports whether an operator accepts an any/all quantifier, the
+// set PostgREST allows: eq, gt, gte, lt, lte, like, ilike, match, imatch.
+func isQuantifiable(op Op) bool {
+	switch op {
+	case OpEq, OpGt, OpGte, OpLt, OpLte, OpLike, OpILike, OpMatch, OpIMatch:
+		return true
+	}
+	return false
 }
 
 // parseInList parses (a,b,"c,d") into a slice, honoring double-quoted elements.
@@ -862,8 +1281,10 @@ func parseInList(raw string) ([]string, *pgerr.APIError) {
 		return nil, pgerr.ErrParse("in. expects a parenthesized list")
 	}
 	inner := raw[1 : len(raw)-1]
+	// PostgREST's grammar requires at least one element; ?id=in.() is a parse
+	// error, not an empty match (item 01.3).
 	if inner == "" {
-		return []string{}, nil
+		return nil, pgerr.ErrParse("in. expects at least one value")
 	}
 	parts, err := splitTopLevel(inner, ',')
 	if err != nil {
@@ -873,29 +1294,58 @@ func parseInList(raw string) ([]string, *pgerr.APIError) {
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
 		if len(p) >= 2 && p[0] == '"' && p[len(p)-1] == '"' {
-			p = p[1 : len(p)-1]
+			// A quoted element may escape an interior quote as \" and a backslash as
+			// \\ (item 01.2); strip the quotes and unescape.
+			p = unescapeQuoted(p[1 : len(p)-1])
 		}
 		out = append(out, p)
 	}
 	return out, nil
 }
 
-// parseLikeList parses a {pat1,pat2,...} literal (PostgREST quantified-LIKE
-// syntax) into a slice of raw pattern strings. No wildcard translation is done
-// here; the caller applies * → % after parsing.
-func parseLikeList(raw string) ([]string, *pgerr.APIError) {
+// unescapeQuoted reverses the in-list quoting escapes: \" -> " and \\ -> \. Any
+// other backslash sequence keeps the following character literally.
+func unescapeQuoted(s string) string {
+	if !strings.ContainsRune(s, '\\') {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			i++
+			b.WriteByte(s[i])
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+// parseBraceList parses a {a,b,"c,d"} array literal (PostgREST's quantified
+// operand) into its elements, honoring double-quoted elements so a comma or
+// reserved character can appear inside one. No wildcard translation is done here;
+// a LIKE/ILIKE caller applies * → % afterward (items 01.1, 01.2).
+func parseBraceList(raw string) ([]string, *pgerr.APIError) {
 	raw = strings.TrimSpace(raw)
 	if len(raw) < 2 || raw[0] != '{' || raw[len(raw)-1] != '}' {
-		return nil, pgerr.ErrParse("like(any/all) expects a {…} list")
+		return nil, pgerr.ErrParse("any/all expects a {…} list")
 	}
 	inner := raw[1 : len(raw)-1]
 	if inner == "" {
-		return []string{}, nil
+		return nil, pgerr.ErrParse("any/all list must have at least one value")
 	}
-	parts := strings.Split(inner, ",")
-	out := make([]string, len(parts))
-	for i, p := range parts {
-		out[i] = strings.TrimSpace(p)
+	parts, err := splitTopLevel(inner, ',')
+	if err != nil {
+		return nil, pgerr.ErrParse("malformed any/all list")
+	}
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if len(p) >= 2 && p[0] == '"' && p[len(p)-1] == '"' {
+			p = unescapeQuoted(p[1 : len(p)-1])
+		}
+		out = append(out, p)
 	}
 	return out, nil
 }
@@ -966,29 +1416,81 @@ func opFromToken(tok string) (Op, bool) {
 	return 0, false
 }
 
-// splitTopLevel splits s on sep, ignoring sep inside () and "".
+// splitTopLevel splits s on sep, ignoring sep inside (), {}, and "". Inside a
+// quoted span a backslash escapes the next byte, so an escaped quote does not end
+// the span and an escaped separator is not a split point (items 01.1, 01.2).
 func splitTopLevel(s string, sep byte) ([]string, error) {
 	var out []string
 	depth := 0
 	inQuote := false
 	start := 0
 	for i := 0; i < len(s); i++ {
-		switch c := s[i]; {
-		case c == '"':
-			inQuote = !inQuote
-		case inQuote:
-			// skip
-		case c == '(':
+		c := s[i]
+		if inQuote {
+			switch {
+			case c == '\\' && i+1 < len(s):
+				i++ // skip the escaped byte
+			case c == '"':
+				inQuote = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inQuote = true
+		case '(', '{':
 			depth++
-		case c == ')':
+		case ')', '}':
 			depth--
-		case c == sep && depth == 0:
-			out = append(out, s[start:i])
-			start = i + 1
+		case sep:
+			if depth == 0 {
+				out = append(out, s[start:i])
+				start = i + 1
+			}
 		}
 	}
 	out = append(out, s[start:])
 	return out, nil
+}
+
+// cutIdentAware splits s at the first sep byte that is not inside a double-quoted
+// identifier segment, returning the text before and after it and whether one was
+// found. A backslash inside quotes escapes the next byte. This lets a reserved
+// character (dot, colon) sit inside a %22-quoted column or relation name without
+// being treated as a delimiter (item 01.2).
+func cutIdentAware(s string, sep byte) (before, after string, found bool) {
+	inQuote := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inQuote {
+			if c == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if c == '"' {
+				inQuote = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inQuote = true
+		case sep:
+			return s[:i], s[i+1:], true
+		}
+	}
+	return s, "", false
+}
+
+// unquoteIdent strips one layer of surrounding double quotes from an identifier
+// segment so a reserved character can appear in a column or relation name; an
+// interior doubled quote ("") unescapes to a single quote, as in SQL. A segment
+// that is not fully quoted is returned unchanged (item 01.2).
+func unquoteIdent(s string) string {
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		return strings.ReplaceAll(s[1:len(s)-1], `""`, `"`)
+	}
+	return s
 }
 
 // sortStrings sorts in place (small slices; avoids importing sort everywhere).

@@ -1,6 +1,8 @@
 package postgres
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/tamnd/dbrest/backend/sqlgen"
@@ -108,11 +110,6 @@ func TestUpsert(t *testing.T) {
 			`ON CONFLICT ("id") DO NOTHING`,
 		},
 		{
-			"merge no target",
-			sqlgen.UpsertSpec{Update: []string{`"title"`}},
-			`ON CONFLICT DO UPDATE SET "title" = excluded."title"`,
-		},
-		{
 			"empty update degrades to nothing",
 			sqlgen.UpsertSpec{Target: []string{`"id"`}},
 			`ON CONFLICT ("id") DO NOTHING`,
@@ -126,6 +123,13 @@ func TestUpsert(t *testing.T) {
 		if got != c.want {
 			t.Errorf("%s: = %q, want %q", c.name, got, c.want)
 		}
+	}
+
+	// A merge with no conflict target is rejected: ON CONFLICT DO UPDATE without an
+	// inference specification is invalid PostgreSQL. The compiler degrades this to a
+	// plain INSERT before reaching here, matching PostgREST, so this is a guard.
+	if _, err := d.Upsert(sqlgen.UpsertSpec{Update: []string{`"title"`}}); err == nil {
+		t.Error("merge with empty target should return an error, got nil")
 	}
 }
 
@@ -170,7 +174,16 @@ func TestCast(t *testing.T) {
 		"uuid":             `("x")::uuid`,
 		"json":             `("x")::json`,
 		"jsonb":            `("x")::jsonb`,
-		"mystery":          `("x")::text`,
+		// Types outside the alias table pass through verbatim rather than
+		// degrading to text, so they resolve the way PostgREST relies on.
+		"money":         `("x")::money`,
+		"interval":      `("x")::interval`,
+		"bytea":         `("x")::bytea`,
+		"inet":          `("x")::inet`,
+		"mood":          `("x")::mood`,
+		"numeric(10,2)": `("x")::numeric(10,2)`,
+		"int[]":         `("x")::int[]`,
+		"public.color":  `("x")::public.color`,
 	}
 	for in, want := range cases {
 		if got := d.Cast(`"x"`, in); got != want {
@@ -205,16 +218,21 @@ func TestFullText(t *testing.T) {
 		name    string
 		variant ir.FTSVariant
 		config  string
+		colType string
 		want    string
 	}{
-		{"plain no config", ir.FTSPlain, "", `to_tsvector("body") @@ to_tsquery(` + sqlgen.PatternMark + `)`},
-		{"plaintext", ir.FTSPlainText, "", `to_tsvector("body") @@ plainto_tsquery(` + sqlgen.PatternMark + `)`},
-		{"phrase", ir.FTSPhrase, "", `to_tsvector("body") @@ phraseto_tsquery(` + sqlgen.PatternMark + `)`},
-		{"web", ir.FTSWeb, "", `to_tsvector("body") @@ websearch_to_tsquery(` + sqlgen.PatternMark + `)`},
-		{"with config", ir.FTSPlain, "english", `to_tsvector('english', "body") @@ to_tsquery('english', ` + sqlgen.PatternMark + `)`},
+		{"plain no config", ir.FTSPlain, "", "text", `to_tsvector("body") @@ to_tsquery(` + sqlgen.PatternMark + `)`},
+		{"plaintext", ir.FTSPlainText, "", "text", `to_tsvector("body") @@ plainto_tsquery(` + sqlgen.PatternMark + `)`},
+		{"phrase", ir.FTSPhrase, "", "text", `to_tsvector("body") @@ phraseto_tsquery(` + sqlgen.PatternMark + `)`},
+		{"web", ir.FTSWeb, "", "text", `to_tsvector("body") @@ websearch_to_tsquery(` + sqlgen.PatternMark + `)`},
+		{"with config", ir.FTSPlain, "english", "text", `to_tsvector('english', "body") @@ to_tsquery('english', ` + sqlgen.PatternMark + `)`},
+		// A tsvector column is matched directly: PostgreSQL has no
+		// to_tsvector(tsvector) overload, so the wrap is skipped (PostgREST's rule).
+		{"tsvector column", ir.FTSPlain, "", "tsvector", `"body" @@ to_tsquery(` + sqlgen.PatternMark + `)`},
+		{"tsvector with config", ir.FTSPlain, "english", "tsvector", `"body" @@ to_tsquery('english', ` + sqlgen.PatternMark + `)`},
 	}
 	for _, c := range cases {
-		frag, bind, ok := d.FullText(`"body"`, nil, c.variant, c.config, "cat")
+		frag, bind, ok := d.FullText(`"body"`, c.colType, nil, c.variant, c.config, "cat")
 		if !ok {
 			t.Fatalf("%s: ok=false", c.name)
 		}
@@ -240,5 +258,56 @@ func TestSession(t *testing.T) {
 func TestBoolValue(t *testing.T) {
 	if d.BoolValue(true) != "TRUE" || d.BoolValue(false) != "FALSE" {
 		t.Error("BoolValue should render the PostgreSQL keywords")
+	}
+}
+
+// A JSON object of more than 50 keys exceeds json_build_object's 100-argument
+// limit, so the dialect chunks it into jsonb_build_object calls concatenated with
+// || and casts the result back to json. A small object stays a single
+// json_build_object call.
+func TestJSONObjectChunking(t *testing.T) {
+	small := []sqlgen.Pair{{Key: "a", Value: `t."a"`}, {Key: "b", Value: `t."b"`}}
+	got := d.JSONObject(small)
+	if got != `json_build_object('a', t."a", 'b', t."b")` {
+		t.Errorf("small object = %q", got)
+	}
+
+	pairs := make([]sqlgen.Pair, 120)
+	for i := range pairs {
+		name := fmt.Sprintf("c%d", i)
+		pairs[i] = sqlgen.Pair{Key: name, Value: "t." + name}
+	}
+	got = d.JSONObject(pairs)
+	if !strings.HasPrefix(got, "to_json(jsonb_build_object(") {
+		t.Fatalf("large object did not chunk: %q", got[:60])
+	}
+	// 120 pairs at 50 per chunk is three chunks, joined by two || operators.
+	if n := strings.Count(got, "jsonb_build_object("); n != 3 {
+		t.Errorf("chunk count = %d, want 3", n)
+	}
+	if n := strings.Count(got, " || "); n != 2 {
+		t.Errorf("concat count = %d, want 2", n)
+	}
+}
+
+// A JSON array in a write payload is bound by target column type: a json/jsonb
+// column takes JSON text (a JSON array there is JSON, not a PG array), an array
+// column takes the {a,b} array literal, and an unknown type keeps the literal.
+func TestArrayArgByColumnType(t *testing.T) {
+	elems := []any{"a", "b"}
+	cases := []struct {
+		colType string
+		want    string
+	}{
+		{"jsonb", `["a","b"]`},
+		{"json", `["a","b"]`},
+		{"text[]", `{a,b}`},
+		{"integer[]", `{a,b}`},
+		{"", `{a,b}`},
+	}
+	for _, c := range cases {
+		if got := d.ArrayArg(elems, c.colType); got != c.want {
+			t.Errorf("ArrayArg(_, %q) = %q, want %q", c.colType, got, c.want)
+		}
 	}
 }

@@ -15,6 +15,15 @@ import (
 
 func newServer(t testing.TB) *httpapi.Server {
 	t.Helper()
+	srv := newServerNoRole(t)
+	srv.SetDefaultRole("anon")
+	return srv
+}
+
+// newServerNoRole builds the test server without a default role, the state a
+// bare NewServer is in before db-anon-role is applied.
+func newServerNoRole(t testing.TB) *httpapi.Server {
+	t.Helper()
 	// A uniquely named shared-cache memory DB isolates each test's data.
 	dsn := "file:" + strings.ReplaceAll(t.Name(), "/", "_") + "?mode=memory&cache=shared"
 	be, err := sqlite.Open(dsn)
@@ -149,6 +158,14 @@ func TestGetSingularZeroRowsIs406(t *testing.T) {
 	if env["code"] != "PGRST116" {
 		t.Errorf("code = %v, want PGRST116", env["code"])
 	}
+	// v14 texts: the message dropped the pre-v12 spelling and the row count
+	// rides in details.
+	if env["message"] != "Cannot coerce the result to a single JSON object" {
+		t.Errorf("message = %v", env["message"])
+	}
+	if env["details"] != "The result contains 0 rows" {
+		t.Errorf("details = %v, want row count", env["details"])
+	}
 }
 
 func TestGetEmptyArray(t *testing.T) {
@@ -171,15 +188,45 @@ func TestUnknownTableIs404Code(t *testing.T) {
 	if env["code"] != "PGRST205" {
 		t.Errorf("code = %v, want PGRST205", env["code"])
 	}
+	// PGRST205 schema-qualifies the relation name (item 04.3): a backend with no
+	// schema namespace still reports the default public schema, as PostgREST does.
+	if msg, _ := env["message"].(string); msg != "Could not find the table 'public.nope' in the schema cache" {
+		t.Errorf("message = %q, want it schema-qualified", msg)
+	}
+}
+
+// A path with more than one segment names no routable resource and is PGRST125
+// at 404, not the PGRST205 a single unknown relation gets (item 04.8).
+func TestNestedTablePathIsInvalidPath(t *testing.T) {
+	srv := newServer(t)
+	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPatch, http.MethodDelete} {
+		resp := do(t, srv, method, "/films/extra", nil)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("%s status = %d, want 404", method, resp.StatusCode)
+		}
+		var env map[string]any
+		json.NewDecoder(resp.Body).Decode(&env)
+		if env["code"] != "PGRST125" {
+			t.Errorf("%s code = %v, want PGRST125", method, env["code"])
+		}
+		if msg, _ := env["message"].(string); msg != "Invalid path specified in request URL" {
+			t.Errorf("%s message = %q", method, msg)
+		}
+	}
 }
 
 func TestUnknownColumnIsError(t *testing.T) {
 	srv := newServer(t)
 	resp := do(t, srv, http.MethodGet, "/films?select=bogus", nil)
+	// An unknown select column reaches PostgreSQL: 42703 at 400 (item 04.5), not
+	// the schema-cache PGRST204 reserved for write payloads.
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
 	var env map[string]any
 	json.NewDecoder(resp.Body).Decode(&env)
-	if env["code"] != "PGRST204" {
-		t.Errorf("code = %v, want PGRST204", env["code"])
+	if env["code"] != "42703" {
+		t.Errorf("code = %v, want 42703", env["code"])
 	}
 }
 
@@ -346,8 +393,9 @@ func TestPostBulkInsertNoLocation(t *testing.T) {
 	if loc := resp.Header.Get("Location"); loc != "" {
 		t.Errorf("bulk insert should not set Location, got %q", loc)
 	}
-	if cr := resp.Header.Get("Content-Range"); cr != "0-1/*" {
-		t.Errorf("Content-Range = %q, want 0-1/*", cr)
+	// A POST reports the total-only range, never a row span (02.8).
+	if cr := resp.Header.Get("Content-Range"); cr != "*/*" {
+		t.Errorf("Content-Range = %q, want */*", cr)
 	}
 	if len(decodeArray(t, resp)) != 2 {
 		t.Error("want 2 inserted rows")
@@ -403,13 +451,15 @@ func TestDeleteRepresentation(t *testing.T) {
 	}
 }
 
-func TestPostUpsertMergeDuplicates(t *testing.T) {
+// A merge-duplicates upsert that hits an existing row updates it; PostgREST v14
+// reports 200, not 201, because nothing new was created.
+func TestPostUpsertMergeDuplicatesUpdateIs200(t *testing.T) {
 	srv := newServer(t)
 	resp := send(t, srv, http.MethodPost, "/films", `{"id":1,"title":"Metropolis (restored)"}`, map[string]string{
 		"Prefer": "return=representation, resolution=merge-duplicates",
 	})
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("status = %d, want 201", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 	rows := decodeArray(t, resp)
 	if len(rows) != 1 || rows[0]["title"] != "Metropolis (restored)" {
@@ -417,9 +467,33 @@ func TestPostUpsertMergeDuplicates(t *testing.T) {
 	}
 }
 
-func TestPutUpsertIs200(t *testing.T) {
+// A merge-duplicates upsert whose key is new inserts a row, so v14 reports 201.
+func TestPostUpsertMergeDuplicatesInsertIs201(t *testing.T) {
+	srv := newServer(t)
+	resp := send(t, srv, http.MethodPost, "/films", `{"id":50,"title":"Brand New"}`, map[string]string{
+		"Prefer": "return=representation, resolution=merge-duplicates",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", resp.StatusCode)
+	}
+}
+
+// PUT replaces or creates the addressed row. When the key did not exist the row
+// is created, so v14 reports 201.
+func TestPutUpsertNewIs201(t *testing.T) {
 	srv := newServer(t)
 	resp := send(t, srv, http.MethodPut, "/films?id=eq.20", `{"id":20,"title":"New"}`, map[string]string{
+		"Prefer": "return=representation",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", resp.StatusCode)
+	}
+}
+
+// PUT to an existing key replaces it; nothing is created, so v14 reports 200.
+func TestPutUpsertExistingIs200(t *testing.T) {
+	srv := newServer(t)
+	resp := send(t, srv, http.MethodPut, "/films?id=eq.1", `{"id":1,"title":"Metropolis (cut)"}`, map[string]string{
 		"Prefer": "return=representation",
 	})
 	if resp.StatusCode != http.StatusOK {
@@ -486,5 +560,143 @@ func BenchmarkGetFilteredRead(b *testing.B) {
 		if rec.Code != http.StatusPartialContent && rec.Code != http.StatusOK {
 			b.Fatalf("status = %d", rec.Code)
 		}
+	}
+}
+
+// TestReloadPublishesNewSchema pins the schema cache reload: DDL applied
+// after startup is invisible (404 PGRST205) until Reload re-runs
+// introspection, after which the new table serves and the OpenAPI document
+// describes it. This is the dbrest side of PostgREST's SIGUSR1 / NOTIFY
+// reload flow; the signal wiring lives in cmd.
+func TestReloadPublishesNewSchema(t *testing.T) {
+	dsn := "file:" + strings.ReplaceAll(t.Name(), "/", "_") + "?mode=memory&cache=shared"
+	be, err := sqlite.Open(dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { be.Close() })
+	if _, err := be.DB().Exec(`CREATE TABLE films (id INTEGER PRIMARY KEY, title TEXT NOT NULL);`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	model, err := be.Introspect(context.Background())
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+	srv := httpapi.NewServer(be, model, nil)
+	srv.SetDefaultRole("anon")
+
+	if _, err := be.DB().Exec(`CREATE TABLE actors (id INTEGER PRIMARY KEY, name TEXT NOT NULL);`); err != nil {
+		t.Fatalf("ddl: %v", err)
+	}
+
+	resp := do(t, srv, http.MethodGet, "/actors", nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("pre-reload status = %d, want 404", resp.StatusCode)
+	}
+	var env map[string]any
+	json.NewDecoder(resp.Body).Decode(&env)
+	if env["code"] != "PGRST205" {
+		t.Errorf("pre-reload code = %v, want PGRST205", env["code"])
+	}
+
+	if err := srv.Reload(context.Background()); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+
+	resp = do(t, srv, http.MethodGet, "/actors", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("post-reload status = %d, want 200", resp.StatusCode)
+	}
+
+	resp = do(t, srv, http.MethodGet, "/", nil)
+	var doc map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		t.Fatalf("decode document: %v", err)
+	}
+	if _, ok := doc["paths"].(map[string]any)["/actors"]; !ok {
+		t.Error("the document should describe the new table after reload")
+	}
+}
+
+// newJSONColumnServer builds a server over a table with a JSON column, the
+// shape the array round-trip tests need (films has none).
+func newJSONColumnServer(t testing.TB) *httpapi.Server {
+	t.Helper()
+	dsn := "file:" + strings.ReplaceAll(t.Name(), "/", "_") + "?mode=memory&cache=shared"
+	be, err := sqlite.Open(dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { be.Close() })
+	_, err = be.DB().Exec(`
+		CREATE TABLE todos (
+			id   INTEGER PRIMARY KEY,
+			task TEXT NOT NULL,
+			tags JSON
+		);
+		INSERT INTO todos (id, task, tags) VALUES (1, 'write spec', '["pets"]');
+	`)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	model, err := be.Introspect(context.Background())
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+	srv := httpapi.NewServer(be, model, nil)
+	srv.SetDefaultRole("anon")
+	return srv
+}
+
+// A JSON array in a write payload must land in a JSON column as JSON text and
+// read back as the same array, not as PostgreSQL {a,b} literal text. This was
+// the bug that corrupted tags columns on every PATCH/POST carrying an array.
+func TestPatchJSONArrayRoundTrips(t *testing.T) {
+	srv := newJSONColumnServer(t)
+	resp := send(t, srv, http.MethodPatch, "/todos?id=eq.1", `{"tags":["go","sql"]}`, map[string]string{
+		"Prefer": "return=representation",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("patch status = %d, want 200", resp.StatusCode)
+	}
+	rows := decodeArray(t, resp)
+	if len(rows) != 1 {
+		t.Fatalf("patch rows = %v", rows)
+	}
+	assertTags := func(stage string, v any) {
+		t.Helper()
+		tags, ok := v.([]any)
+		if !ok || len(tags) != 2 || tags[0] != "go" || tags[1] != "sql" {
+			t.Fatalf("%s tags = %#v, want [go sql]", stage, v)
+		}
+	}
+	assertTags("representation", rows[0]["tags"])
+
+	resp = do(t, srv, http.MethodGet, "/todos?id=eq.1", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("get status = %d", resp.StatusCode)
+	}
+	rows = decodeArray(t, resp)
+	if len(rows) != 1 {
+		t.Fatalf("get rows = %v", rows)
+	}
+	assertTags("stored", rows[0]["tags"])
+}
+
+func TestPostJSONArrayRoundTrips(t *testing.T) {
+	srv := newJSONColumnServer(t)
+	resp := send(t, srv, http.MethodPost, "/todos", `{"id":2,"task":"pack","tags":["home",2]}`, map[string]string{
+		"Prefer": "return=representation",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("post status = %d, want 201", resp.StatusCode)
+	}
+	rows := decodeArray(t, resp)
+	if len(rows) != 1 {
+		t.Fatalf("post rows = %v", rows)
+	}
+	tags, ok := rows[0]["tags"].([]any)
+	if !ok || len(tags) != 2 || tags[0] != "home" || tags[1] != float64(2) {
+		t.Fatalf("tags = %#v, want [home 2]", rows[0]["tags"])
 	}
 }

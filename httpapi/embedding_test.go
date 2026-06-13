@@ -66,7 +66,9 @@ func newEmbedServer(t testing.TB) *httpapi.Server {
 	if err != nil {
 		t.Fatalf("introspect: %v", err)
 	}
-	return httpapi.NewServer(be, model, nil)
+	srv := httpapi.NewServer(be, model, nil)
+	srv.SetDefaultRole("anon")
+	return srv
 }
 
 func TestEmbedToOneObject(t *testing.T) {
@@ -224,6 +226,12 @@ func TestEmbedNoRelationship(t *testing.T) {
 	if env["code"] != "PGRST200" {
 		t.Errorf("code = %v, want PGRST200", env["code"])
 	}
+	// The rendered body carries the searched-pair details, not a null (item 04.4).
+	details, _ := env["details"].(string)
+	want := "Searched for a foreign key relationship between 'films' and 'nonsense' in the schema 'public', but no matches were found."
+	if details != want {
+		t.Errorf("details = %q, want %q", details, want)
+	}
 }
 
 func TestEmbedColumnInCSV(t *testing.T) {
@@ -245,6 +253,161 @@ func TestEmbedColumnInCSV(t *testing.T) {
 	}
 	if recs[1][1] != `{"name":"Lang"}` {
 		t.Errorf("director cell = %q, want the embedded JSON object", recs[1][1])
+	}
+}
+
+// order=rel(col) sorts the parent by a to-one embed's column. Films sort by
+// their director's name; the film with no director (a NULL key) lands last under
+// the requested nullslast (item 07.6).
+func TestRelatedOrderSortsParent(t *testing.T) {
+	srv := newEmbedServer(t)
+	resp := do(t, srv, http.MethodGet,
+		"/films?select=title,director:directors(name)&order=director(name).asc.nullslast", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	rows := decodeArray(t, resp)
+	got := make([]string, len(rows))
+	for i, r := range rows {
+		got[i], _ = r["title"].(string)
+	}
+	// Lang < Scott < Villeneuve by name; Untitled has no director, so NULL last.
+	want := []string{"Metropolis", "Blade Runner", "Arrival", "Untitled"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d rows %v, want %d", len(got), got, len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("row %d title = %q, want %q (order %v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+// The same order, nullsfirst, floats the directorless film to the top.
+func TestRelatedOrderNullsFirst(t *testing.T) {
+	srv := newEmbedServer(t)
+	resp := do(t, srv, http.MethodGet,
+		"/films?select=title,director:directors(name)&order=director(name).asc.nullsfirst", nil)
+	rows := decodeArray(t, resp)
+	if len(rows) == 0 {
+		t.Fatal("no rows")
+	}
+	if title, _ := rows[0]["title"].(string); title != "Untitled" {
+		t.Errorf("first title = %q, want Untitled (NULL director sorts first)", title)
+	}
+}
+
+// Ordering by a relation the select never embedded is PGRST108.
+func TestRelatedOrderNotEmbeddedHTTP(t *testing.T) {
+	srv := newEmbedServer(t)
+	resp := do(t, srv, http.MethodGet, "/films?select=title&order=director(name).asc", nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	env := decodeEnvelope(t, resp)
+	if env["code"] != "PGRST108" {
+		t.Errorf("code = %v, want PGRST108", env["code"])
+	}
+}
+
+// Ordering by a to-many embed is PGRST118: a director has many films, so it has
+// no single film title to sort by.
+func TestRelatedOrderToManyHTTP(t *testing.T) {
+	srv := newEmbedServer(t)
+	resp := do(t, srv, http.MethodGet, "/directors?select=name,films(title)&order=films(title).asc", nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	env := decodeEnvelope(t, resp)
+	if env["code"] != "PGRST118" {
+		t.Errorf("code = %v, want PGRST118", env["code"])
+	}
+}
+
+// An empty-parenthesis embed hides the key from the response while still joining
+// the relation: director() returns films without a director field, the opposite
+// of director(*) (item 07.8).
+func TestRelatedEmptySelectHidesKey(t *testing.T) {
+	srv := newEmbedServer(t)
+	resp := do(t, srv, http.MethodGet, "/films?select=title,director:directors()&id=eq.1", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	rows := decodeArray(t, resp)
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	if _, has := rows[0]["director"]; has {
+		t.Errorf("director() should hide the key, got %#v", rows[0])
+	}
+	if rows[0]["title"] != "Metropolis" {
+		t.Errorf("title = %v, want Metropolis", rows[0]["title"])
+	}
+}
+
+// An !inner empty-parenthesis embed prunes parents with no related row while
+// still projecting nothing: the directorless film drops out, and no director key
+// appears on those that remain.
+func TestRelatedEmptySelectInnerFilters(t *testing.T) {
+	srv := newEmbedServer(t)
+	resp := do(t, srv, http.MethodGet, "/films?select=title,directors!inner()&order=id", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	rows := decodeArray(t, resp)
+	// Four films, but only three have a director; the inner join drops Untitled.
+	if len(rows) != 3 {
+		t.Fatalf("got %d rows, want 3 (directorless film dropped)", len(rows))
+	}
+	for _, r := range rows {
+		if _, has := r["directors"]; has {
+			t.Errorf("empty-paren embed should hide its key, got %#v", r)
+		}
+		if r["title"] == "Untitled" {
+			t.Errorf("Untitled has no director and should have been filtered out")
+		}
+	}
+}
+
+// A to-one spread lifts the director's name straight onto the film row, with no
+// nested director object (item 07.9).
+func TestSpreadToOneLiftsColumn(t *testing.T) {
+	srv := newEmbedServer(t)
+	resp := do(t, srv, http.MethodGet,
+		"/films?select=title,...directors(director:name)&id=eq.1", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	rows := decodeArray(t, resp)
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	if _, nested := rows[0]["directors"]; nested {
+		t.Errorf("a spread must not nest a directors object, got %#v", rows[0])
+	}
+	if rows[0]["director"] != "Lang" {
+		t.Errorf("lifted director = %v, want Lang", rows[0]["director"])
+	}
+}
+
+// A to-many spread lifts the related column as an array onto the parent row.
+func TestSpreadToManyLiftsArray(t *testing.T) {
+	srv := newEmbedServer(t)
+	resp := do(t, srv, http.MethodGet,
+		"/directors?select=name,...films(title)&id=eq.1", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	rows := decodeArray(t, resp)
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	titles, ok := rows[0]["title"].([]any)
+	if !ok {
+		t.Fatalf("title = %#v, want an array", rows[0]["title"])
+	}
+	if len(titles) != 1 || titles[0] != "Metropolis" {
+		t.Errorf("lifted titles = %v, want [Metropolis]", titles)
 	}
 }
 

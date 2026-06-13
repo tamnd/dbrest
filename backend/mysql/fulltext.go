@@ -24,7 +24,7 @@ import (
 // goes). The translation is Best-effort: MySQL boolean mode has no general
 // AND/OR/grouping the way to_tsquery does, so disjunction and grouping are
 // approximated and documented in the conformance allowlist (spec 22).
-func (Dialect) FullText(col string, _ *sqlgen.FullTextRef, variant ir.FTSVariant, _, value string) (string, string, bool) {
+func (Dialect) FullText(col, _ string, _ *sqlgen.FullTextRef, variant ir.FTSVariant, _, value string) (string, string, bool) {
 	frag := "MATCH(" + col + ") AGAINST(" + sqlgen.PatternMark + " IN BOOLEAN MODE)"
 	return frag, booleanModeQuery(variant, value), true
 }

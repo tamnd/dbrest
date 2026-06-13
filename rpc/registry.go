@@ -9,7 +9,12 @@
 // *Function without a cycle.
 package rpc
 
-import "sort"
+import (
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
+)
 
 // Volatility classifies a function's effect, which fixes the methods it allows
 // and the transaction mode it runs in (spec 12). A registry entry that omits it
@@ -41,9 +46,11 @@ const (
 type ReturnKind uint8
 
 const (
-	ReturnScalar ReturnKind = iota // returns <type>      -> a single value
-	ReturnSetOf                    // returns setof <type> -> an array of values
-	ReturnTable                    // returns table(...)   -> an array of objects
+	ReturnScalar ReturnKind = iota // returns <type>        -> a single value
+	ReturnSetOf                    // returns setof <type>  -> an array of values
+	ReturnTable                    // returns table(...)    -> an array of objects
+	ReturnVoid                     // returns void          -> 200 with a null body
+	ReturnObject                   // returns <composite>   -> one object, not an array
 )
 
 // ReturnShape is a function's declared result. Type is the canonical type of a
@@ -68,15 +75,36 @@ type Param struct {
 	Type     string // canonical type (spec 16)
 	Optional bool   // may be omitted; Default is bound in its place
 	Default  any    // value bound when an optional param is omitted (nil = NULL)
-	Variadic bool   // collects the trailing values (not yet lowered; see notes)
+	Variadic bool   // collects the trailing values into a list, expanded at lowering
+	// RawBody marks the single-unnamed-parameter form: PostgREST binds the whole
+	// raw request body to this parameter, decoded by Content-Type (a JSON value of
+	// any kind for application/json, raw text for text/plain and text/xml, raw
+	// bytes for application/octet-stream), rather than treating the body as a JSON
+	// object of named arguments. The parameter keeps a name so the SQL body can
+	// reference its placeholder.
+	RawBody bool
+}
+
+// SingleRawBody reports whether the function takes exactly one parameter bound
+// from the raw request body, the unnamed-argument form. Such a function receives
+// the whole body as that one argument regardless of the body's JSON shape.
+func (f *Function) SingleRawBody() (Param, bool) {
+	if len(f.Params) == 1 && f.Params[0].RawBody {
+		return f.Params[0], true
+	}
+	return Param{}, false
 }
 
 // Function is one callable function descriptor. Exactly one realization is set;
 // this slice implements the portable Query (native discovery from an engine
 // catalog is a later slice).
 type Function struct {
-	Name       string
-	Params     []Param
+	Name   string
+	Params []Param
+	// Comment is the database comment on the function (COMMENT ON FUNCTION,
+	// or the registry declaration's comment field). The OpenAPI generator
+	// splits it into the rpc operation's summary and description, as v14 does.
+	Comment    string
 	Returns    ReturnShape
 	Volatility Volatility
 	Security   SecurityMode
@@ -90,11 +118,13 @@ type PortableQuery struct {
 	SQL string
 }
 
-// Required reports the names of the function's non-optional parameters.
+// Required reports the names of the function's non-optional parameters. A
+// variadic parameter is never required: PostgreSQL accepts a variadic call with
+// zero trailing arguments, so an omitted variadic still satisfies an overload.
 func (f *Function) Required() []string {
 	var req []string
 	for _, p := range f.Params {
-		if !p.Optional {
+		if !p.Optional && !p.Variadic {
 			req = append(req, p.Name)
 		}
 	}
@@ -123,8 +153,28 @@ type Registry interface {
 	// set present in the request. The bool is false when no overload matches; the
 	// caller raises PGRST202.
 	Lookup(name string, args ArgSet) (*Function, bool)
+	// Resolve is Lookup that also reports ambiguity: it returns the chosen overload
+	// (ok true), or ok false with the competing signatures when two overloads are
+	// equally good (the caller raises PGRST203), or ok false with no signatures
+	// when none match (PGRST202). Lookup is Resolve collapsed to (fn, ok).
+	Resolve(name string, args ArgSet) (fn *Function, ambiguous []string, ok bool)
 	// List enumerates the exposed functions in a stable order, for OpenAPI.
 	List() []*Function
+}
+
+// Signature renders the function as PostgREST spells it in a PGRST202/PGRST203
+// message: name(param => type, ...), or name() when it takes no parameters. The
+// schema, when given, qualifies the name (api.add(...)).
+func (f *Function) Signature(schemaName string) string {
+	name := f.Name
+	if schemaName != "" {
+		name = schemaName + "." + name
+	}
+	parts := make([]string, len(f.Params))
+	for i, p := range f.Params {
+		parts[i] = p.Name + " => " + p.Type
+	}
+	return name + "(" + strings.Join(parts, ", ") + ")"
 }
 
 // StaticRegistry is a portable registry built in memory: one or more overloads
@@ -156,12 +206,23 @@ func NewStaticRegistry(fns []*Function) *StaticRegistry {
 // declare. Among satisfiable overloads it prefers an exact parameter-set match,
 // then the most specific (largest required set), deterministically.
 func (r *StaticRegistry) Lookup(name string, args ArgSet) (*Function, bool) {
+	fn, _, ok := r.Resolve(name, args)
+	return fn, ok
+}
+
+// Resolve selects the overload for an argument set and reports ambiguity. It
+// scores every satisfiable overload (an exact parameter-set match wins outright,
+// then the largest required set), and when two overloads tie at the top score it
+// returns them as competing signatures instead of silently picking one, so the
+// caller raises PGRST203 the way PostgREST does for unresolvable overloads.
+func (r *StaticRegistry) Resolve(name string, args ArgSet) (*Function, []string, bool) {
 	cands := r.byName[name]
 	if len(cands) == 0 {
-		return nil, false
+		return nil, nil, false
 	}
 	var best *Function
 	bestScore := -1
+	var tied []*Function
 	for _, f := range cands {
 		if !satisfiable(f, args) {
 			continue
@@ -170,14 +231,25 @@ func (r *StaticRegistry) Lookup(name string, args ArgSet) (*Function, bool) {
 		if exactMatch(f, args) {
 			score += 1000 // an exact parameter-set match wins outright
 		}
-		if score > bestScore {
-			best, bestScore = f, score
+		switch {
+		case score > bestScore:
+			best, bestScore, tied = f, score, []*Function{f}
+		case score == bestScore:
+			tied = append(tied, f)
 		}
 	}
 	if best == nil {
-		return nil, false
+		return nil, nil, false
 	}
-	return best, true
+	if len(tied) > 1 {
+		sigs := make([]string, len(tied))
+		for i, f := range tied {
+			sigs[i] = f.Signature("")
+		}
+		sort.Strings(sigs)
+		return nil, sigs, false
+	}
+	return best, nil, true
 }
 
 // List returns the functions in stable name order (overloads in declared order).
@@ -218,6 +290,140 @@ func exactMatch(f *Function, args ArgSet) bool {
 	return true
 }
 
+// ParseRegistry decodes a JSON function-registry declaration into a
+// StaticRegistry ready to Register on a backend. The JSON is an array of
+// function objects; each carries:
+//
+//	name        string           required; bare function name
+//	sql         string           required; parameterized SQL with :name placeholders
+//	comment     string           optional; surfaces in the OpenAPI document
+//	params      []{name, type, optional?, default?}
+//	returns     {kind: "scalar"|"setof"|"table", type?, columns?}
+//	volatility  "volatile"|"stable"|"immutable"   (default: volatile)
+//
+// Returns an error when the JSON is malformed; an empty array yields an empty
+// registry. Schemas are stripped from names; a name of "api.add" resolves as "add".
+func ParseRegistry(rawJSON string) (*StaticRegistry, error) {
+	rawJSON = strings.TrimSpace(rawJSON)
+	if rawJSON == "" {
+		return NewStaticRegistry(nil), nil
+	}
+	type paramDecl struct {
+		Name     string `json:"name"`
+		Type     string `json:"type"`
+		Optional bool   `json:"optional"`
+		Default  any    `json:"default"`
+		Variadic bool   `json:"variadic"`
+		RawBody  bool   `json:"rawBody"`
+	}
+	type returnDecl struct {
+		Kind    string `json:"kind"`
+		Type    string `json:"type"`
+		Columns []struct {
+			Name string `json:"name"`
+			Type string `json:"type"`
+		} `json:"columns"`
+	}
+	type fnDecl struct {
+		Name       string      `json:"name"`
+		SQL        string      `json:"sql"`
+		Comment    string      `json:"comment"`
+		Params     []paramDecl `json:"params"`
+		Returns    returnDecl  `json:"returns"`
+		Volatility string      `json:"volatility"`
+	}
+	var decls []fnDecl
+	if err := json.Unmarshal([]byte(rawJSON), &decls); err != nil {
+		return nil, fmt.Errorf("function-registry: %w", err)
+	}
+	fns := make([]*Function, 0, len(decls))
+	for _, d := range decls {
+		// Strip schema prefix (e.g. "api.add" → "add").
+		name := d.Name
+		if dot := strings.LastIndex(name, "."); dot >= 0 {
+			name = name[dot+1:]
+		}
+		var vol Volatility
+		switch strings.ToLower(d.Volatility) {
+		case "stable":
+			vol = Stable
+		case "immutable":
+			vol = Immutable
+		default:
+			vol = Volatile
+		}
+		params := make([]Param, len(d.Params))
+		for i, p := range d.Params {
+			params[i] = Param(p)
+		}
+		var ret ReturnShape
+		switch strings.ToLower(d.Returns.Kind) {
+		case "void":
+			ret.Kind = ReturnVoid
+		case "object":
+			ret.Kind = ReturnObject
+		case "setof":
+			ret.Kind = ReturnSetOf
+		case "table":
+			ret.Kind = ReturnTable
+			ret.Columns = make([]Column, len(d.Returns.Columns))
+			for i, c := range d.Returns.Columns {
+				ret.Columns[i] = Column{Name: c.Name, Type: c.Type}
+			}
+		default:
+			ret.Kind = ReturnScalar
+		}
+		ret.Type = d.Returns.Type
+		fns = append(fns, &Function{
+			Name:       name,
+			Params:     params,
+			Comment:    d.Comment,
+			Returns:    ret,
+			Volatility: vol,
+			Query:      &PortableQuery{SQL: d.SQL},
+		})
+	}
+	return NewStaticRegistry(fns), nil
+}
+
+// Merge composes two registries into one, with primary taking precedence on an
+// exact-signature collision. It is how a NativeRPC backend exposes both a declared
+// portable registry and its introspected native functions through the single
+// Registry the frontend resolves against: a function declared via Register shadows
+// a native function of the same signature (the explicit declaration wins), while
+// every other native function and every distinct portable overload stays reachable.
+// Overload resolution then runs across the union in one place, so a wrong argument
+// set is PGRST202 and an ambiguous one PGRST203 regardless of which source an
+// overload came from. The signature key is the function's printed signature
+// (name plus parameter names and types), so two overloads that differ in any
+// parameter are kept as distinct candidates rather than one shadowing the other.
+//
+// When either side is empty the other is returned unchanged, so the common
+// case (no declared registry) costs nothing.
+func Merge(primary, secondary Registry) Registry {
+	pl := primary.List()
+	sl := secondary.List()
+	if len(pl) == 0 {
+		return secondary
+	}
+	if len(sl) == 0 {
+		return primary
+	}
+	seen := make(map[string]bool, len(pl))
+	merged := make([]*Function, 0, len(pl)+len(sl))
+	for _, f := range pl {
+		seen[f.Signature("")] = true
+		merged = append(merged, f)
+	}
+	for _, f := range sl {
+		if seen[f.Signature("")] {
+			continue // shadowed by a same-signature primary function
+		}
+		merged = append(merged, f)
+	}
+	return NewStaticRegistry(merged)
+}
+
 // EmptyRegistry is a registry with no functions; every Lookup misses. A backend
 // that has not been given any functions returns this so the frontend raises a
 // clean PGRST202 rather than dereferencing nil.
@@ -225,6 +431,11 @@ type EmptyRegistry struct{}
 
 // Lookup always misses: an empty registry has no functions.
 func (EmptyRegistry) Lookup(string, ArgSet) (*Function, bool) { return nil, false }
+
+// Resolve always misses with no ambiguity: an empty registry has no functions.
+func (EmptyRegistry) Resolve(string, ArgSet) (*Function, []string, bool) {
+	return nil, nil, false
+}
 
 // List returns no functions.
 func (EmptyRegistry) List() []*Function { return nil }
