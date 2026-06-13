@@ -157,7 +157,15 @@ func (b *builder) argValue(fn *rpc.Function, name string, args map[string]ir.Val
 		return "", pgerr.ErrInternal("rpc body references undeclared parameter :" + name)
 	}
 	if v, ok := args[name]; ok {
+		if p.Variadic {
+			return b.bindVariadic(v), nil
+		}
 		return b.bind(callArg(b.d, v)), nil
+	}
+	if p.Variadic {
+		// A variadic call with no trailing arguments expands to nothing, so a body
+		// spelling the placeholder inside a call list (f(:nums)) becomes f().
+		return "", nil
 	}
 	if p.Optional {
 		return b.bind(p.Default), nil
@@ -198,6 +206,48 @@ func callArg(d Dialect, v ir.Value) any {
 		return writeArg(d, v)
 	}
 	return v.Text
+}
+
+// bindVariadic expands a variadic argument into a comma-separated list of bound
+// placeholders, one per collected element, so a body spelling the placeholder
+// inside a call list or an IN (:name) clause receives every value. A GET call
+// arrives as a text list; a POST call arrives as a decoded JSON array (a lone
+// scalar is treated as a one-element list). An empty list binds nothing.
+func (b *builder) bindVariadic(v ir.Value) string {
+	elems := variadicElems(b.d, v)
+	parts := make([]string, len(elems))
+	for i, e := range elems {
+		parts[i] = b.bind(e)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// variadicElems flattens a variadic argument value into its driver elements. A
+// GET text list maps each item verbatim; a POST JSON array maps each element
+// through the write-value path (numbers preserved, nested documents re-encoded);
+// any other single value is a one-element list.
+func variadicElems(d Dialect, v ir.Value) []any {
+	if v.List != nil {
+		out := make([]any, len(v.List))
+		for i, s := range v.List {
+			out[i] = s
+		}
+		return out
+	}
+	if arr, ok := v.JSON.([]any); ok {
+		out := make([]any, len(arr))
+		for i, e := range arr {
+			out[i] = writeArg(d, ir.Value{JSON: e})
+		}
+		return out
+	}
+	if v.JSON != nil {
+		return []any{writeArg(d, v)}
+	}
+	if v.Text != "" {
+		return []any{v.Text}
+	}
+	return nil
 }
 
 // isJSONType reports whether a canonical type name is a JSON family type.

@@ -303,7 +303,11 @@ func Call(reg rpc.Registry, c *ir.Call, isGet bool, searchPath []string) (*ir.Pl
 	// mis-parsed as a filter on a result that does not exist.
 	if isGet {
 		if params, known := paramNameSet(reg, c.Function.Name); known {
-			if perr := c.PartitionGetArgs(func(k string) bool { return params[k] }); perr != nil {
+			variadic := variadicNameSet(reg, c.Function.Name)
+			if perr := c.PartitionGetArgs(
+				func(k string) bool { return params[k] },
+				func(k string) bool { return variadic[k] },
+			); perr != nil {
 				return nil, perr
 			}
 		}
@@ -414,11 +418,28 @@ func paramNameSet(reg rpc.Registry, name string) (set map[string]bool, found boo
 	return set, found
 }
 
+// variadicNameSet is the set of variadic parameter names across every overload of
+// a function name, so a GET call can collect that key's repeats into a list.
+func variadicNameSet(reg rpc.Registry, name string) map[string]bool {
+	set := map[string]bool{}
+	for _, f := range reg.List() {
+		if f.Name != name {
+			continue
+		}
+		for _, p := range f.Params {
+			if p.Variadic {
+				set[p.Name] = true
+			}
+		}
+	}
+	return set
+}
+
 // coerceCallArgs validates each GET text argument against its declared parameter
 // type, turning a bad value into the 22P02 the read path raises. A POST argument
 // is typed by the JSON body and skipped; an undeclared argument cannot reach here
 // because resolution already rejected it. A parameter with no declared type is
-// carried through unchanged.
+// carried through unchanged. A variadic argument validates each collected element.
 func coerceCallArgs(fn *rpc.Function, c *ir.Call) *pgerr.APIError {
 	for name, v := range c.Args {
 		if v.JSON != nil {
@@ -426,6 +447,14 @@ func coerceCallArgs(fn *rpc.Function, c *ir.Call) *pgerr.APIError {
 		}
 		p, ok := fn.Param(name)
 		if !ok || p.Type == "" {
+			continue
+		}
+		if p.Variadic {
+			for _, e := range v.List {
+				if err := coerce(p.Type, e); err != nil {
+					return err
+				}
+			}
 			continue
 		}
 		if err := coerce(p.Type, v.Text); err != nil {

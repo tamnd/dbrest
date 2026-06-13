@@ -56,6 +56,13 @@ func rpcFunctions() []*rpc.Function {
 			Volatility: rpc.Stable,
 			Query:      &rpc.PortableQuery{SQL: "SELECT id, title FROM films WHERE year > :y ORDER BY id"},
 		},
+		{
+			Name:       "pick_titles",
+			Params:     []rpc.Param{{Name: "ids", Type: "integer", Variadic: true}},
+			Returns:    rpc.ReturnShape{Kind: rpc.ReturnSetOf, Type: "text"},
+			Volatility: rpc.Stable,
+			Query:      &rpc.PortableQuery{SQL: "SELECT title FROM films WHERE id IN (:ids) ORDER BY id"},
+		},
 	}
 }
 
@@ -257,6 +264,40 @@ func TestRPCGetArgAndColumnFilter(t *testing.T) {
 	}
 	if rows[0]["title"] != "Arrival" {
 		t.Errorf("title = %v, want Arrival", rows[0]["title"])
+	}
+}
+
+// TestRPCVariadicGet checks a variadic parameter collects repeated query keys on
+// GET and expands into the IN list, so pick_titles?ids=1&ids=3 binds both ids.
+func TestRPCVariadicGet(t *testing.T) {
+	srv := newRPCServer(t)
+	resp := do(t, srv, http.MethodGet, "/rpc/pick_titles?ids=1&ids=3", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var titles []string
+	if err := json.NewDecoder(resp.Body).Decode(&titles); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(titles) != 2 || titles[0] != "Metropolis" || titles[1] != "Arrival" {
+		t.Errorf("titles = %v, want [Metropolis Arrival]", titles)
+	}
+}
+
+// TestRPCVariadicPost checks a variadic parameter takes a JSON array on POST and
+// expands into the same IN list.
+func TestRPCVariadicPost(t *testing.T) {
+	srv := newRPCServer(t)
+	resp := send(t, srv, http.MethodPost, "/rpc/pick_titles", `{"ids":[1,3]}`, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var titles []string
+	if err := json.NewDecoder(resp.Body).Decode(&titles); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(titles) != 2 || titles[0] != "Metropolis" || titles[1] != "Arrival" {
+		t.Errorf("titles = %v, want [Metropolis Arrival]", titles)
 	}
 }
 

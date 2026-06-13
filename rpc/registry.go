@@ -100,11 +100,13 @@ type PortableQuery struct {
 	SQL string
 }
 
-// Required reports the names of the function's non-optional parameters.
+// Required reports the names of the function's non-optional parameters. A
+// variadic parameter is never required: PostgreSQL accepts a variadic call with
+// zero trailing arguments, so an omitted variadic still satisfies an overload.
 func (f *Function) Required() []string {
 	var req []string
 	for _, p := range f.Params {
-		if !p.Optional {
+		if !p.Optional && !p.Variadic {
 			req = append(req, p.Name)
 		}
 	}
@@ -293,6 +295,7 @@ func ParseRegistry(rawJSON string) (*StaticRegistry, error) {
 		Type     string `json:"type"`
 		Optional bool   `json:"optional"`
 		Default  any    `json:"default"`
+		Variadic bool   `json:"variadic"`
 	}
 	type returnDecl struct {
 		Kind    string `json:"kind"`
@@ -337,6 +340,7 @@ func ParseRegistry(rawJSON string) (*StaticRegistry, error) {
 				Type:     p.Type,
 				Optional: p.Optional,
 				Default:  p.Default,
+				Variadic: p.Variadic,
 			}
 		}
 		var ret ReturnShape

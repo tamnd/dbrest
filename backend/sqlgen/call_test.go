@@ -62,6 +62,44 @@ func TestCompileCallOptionalDefault(t *testing.T) {
 	}
 }
 
+// A variadic parameter expands its placeholder into one bound value per element,
+// so an IN (:ids) clause binds every collected id. The GET list form is exercised
+// here; the POST array form lands the same elements through the JSON path.
+func TestCompileCallVariadicExpandsList(t *testing.T) {
+	fn := &rpc.Function{
+		Name:    "pick",
+		Params:  []rpc.Param{{Name: "ids", Variadic: true}},
+		Returns: rpc.ReturnShape{Kind: rpc.ReturnSetOf},
+		Query:   &rpc.PortableQuery{SQL: "SELECT title FROM films WHERE id IN (:ids)"},
+	}
+	c := &ir.Call{Args: map[string]ir.Value{"ids": {List: []string{"1", "3"}}}}
+	st := compileCall(t, c, fn)
+	if st.SQL != "SELECT title FROM films WHERE id IN ($1, $2)" {
+		t.Errorf("SQL = %q", st.SQL)
+	}
+	if len(st.Args) != 2 || st.Args[0] != "1" || st.Args[1] != "3" {
+		t.Errorf("Args = %v, want [1 3]", st.Args)
+	}
+}
+
+// A variadic call with no trailing arguments expands to nothing, so f(:ids)
+// becomes f() and binds no values.
+func TestCompileCallVariadicEmpty(t *testing.T) {
+	fn := &rpc.Function{
+		Name:    "pick",
+		Params:  []rpc.Param{{Name: "ids", Variadic: true}},
+		Returns: rpc.ReturnShape{Kind: rpc.ReturnSetOf},
+		Query:   &rpc.PortableQuery{SQL: "SELECT count_ids(:ids)"},
+	}
+	st := compileCall(t, &ir.Call{Args: map[string]ir.Value{}}, fn)
+	if st.SQL != "SELECT count_ids()" {
+		t.Errorf("SQL = %q, want SELECT count_ids()", st.SQL)
+	}
+	if len(st.Args) != 0 {
+		t.Errorf("Args = %v, want none", st.Args)
+	}
+}
+
 func TestCompileCallTableWithPostFilter(t *testing.T) {
 	fn := &rpc.Function{
 		Name:    "films_after",

@@ -292,14 +292,19 @@ func ParseCall(fn, rawQuery string, preferHeaders []string, isGet bool, contentT
 // how PostgREST treats a query key that does not name a parameter as a filter on
 // a table-valued result. It is a no-op on a POST call, where the body carries the
 // arguments and the query string already post-filtered.
-func (c *Call) PartitionGetArgs(isParam func(string) bool) *pgerr.APIError {
+func (c *Call) PartitionGetArgs(isParam func(string) bool, isVariadic func(string) bool) *pgerr.APIError {
 	if c.RawGet == nil {
 		return nil
 	}
 	filters := url.Values{}
 	for k, vs := range c.RawGet {
 		if isParam(k) {
-			continue // a declared parameter stays an argument
+			// A variadic parameter collects every repeat of its key as a list; a
+			// scalar parameter already took the last value in ParseCall.
+			if isVariadic(k) {
+				c.Args[k] = Value{List: append([]string(nil), vs...)}
+			}
+			continue
 		}
 		delete(c.Args, k)
 		filters[k] = vs

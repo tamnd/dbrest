@@ -199,6 +199,30 @@ func TestParseRegistryVoidKind(t *testing.T) {
 	}
 }
 
+// TestParseRegistryVariadic checks a "variadic": true parameter decodes to a
+// Variadic param, which Required omits so a zero-argument call still resolves.
+func TestParseRegistryVariadic(t *testing.T) {
+	reg, err := ParseRegistry(`[{
+		"name": "pick",
+		"sql": "select title from films where id in (:ids)",
+		"params": [{"name": "ids", "type": "integer", "variadic": true}],
+		"returns": {"kind": "setof", "type": "text"}
+	}]`)
+	if err != nil {
+		t.Fatalf("ParseRegistry: %v", err)
+	}
+	f, ok := reg.Lookup("pick", ArgSet{})
+	if !ok {
+		t.Fatal("a variadic-only function must resolve with no arguments")
+	}
+	if len(f.Params) != 1 || !f.Params[0].Variadic {
+		t.Errorf("params = %+v, want one variadic", f.Params)
+	}
+	if len(f.Required()) != 0 {
+		t.Errorf("Required = %v, want none for a variadic", f.Required())
+	}
+}
+
 // TestParseRegistryComment checks a declaration's comment field rides into the
 // Function, where the OpenAPI generator reads it.
 func TestParseRegistryComment(t *testing.T) {
