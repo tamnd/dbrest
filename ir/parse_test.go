@@ -203,11 +203,19 @@ func TestParseLimitOffset(t *testing.T) {
 	if q.Limit == nil || *q.Limit != 10 || q.Offset == nil || *q.Offset != 20 {
 		t.Errorf("limit/offset = %v/%v", q.Limit, q.Offset)
 	}
+	// A well-formed negative limit is the 416 PGRST103 range error, with the
+	// upstream detail; a non-numeric limit is still a PGRST100 parse error.
 	if _, err := ParseRead("films", "limit=-1", nil); err == nil {
 		t.Error("negative limit should error")
+	} else if err.Code != "PGRST103" {
+		t.Errorf("negative limit code = %s, want PGRST103", err.Code)
+	} else if err.Details == nil || *err.Details != "Limit should be greater than or equal to zero." {
+		t.Errorf("negative limit details = %v", err.Details)
 	}
 	if _, err := ParseRead("films", "limit=abc", nil); err == nil {
 		t.Error("non-numeric limit should error")
+	} else if err.Code != "PGRST100" {
+		t.Errorf("non-numeric limit code = %s, want PGRST100", err.Code)
 	}
 }
 

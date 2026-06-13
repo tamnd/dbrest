@@ -641,7 +641,13 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity,
 	// Only treat Range as item pagination when it has no unit prefix (i.e.
 	// not "bytes=0-9" form), matching PostgREST's parsing behaviour.
 	if rangeHdr := r.Header.Get("Range"); rangeHdr != "" && !strings.Contains(rangeHdr, "=") {
-		if off, lim, ok := parseRangeHeader(rangeHdr); ok {
+		off, lim, ok, inverted := parseRangeHeader(rangeHdr)
+		if inverted {
+			writeError(w, pgerr.ErrRangeNotSatisfiable().
+				WithDetails("The lower boundary must be lower than or equal to the upper boundary in the Range header."))
+			return
+		}
+		if ok {
 			q.Offset = &off
 			if lim >= 0 {
 				l := lim
@@ -918,7 +924,8 @@ func (s *Server) writeRead(w http.ResponseWriter, r *http.Request, q *ir.Query, 
 	// total is an exact multiple of the page size lands on the last request. The
 	// boundary is only knowable with a count, so it applies when one was requested.
 	if offset > 0 && out.hasTotl && int64(offset) > out.total {
-		rng := pgerr.ErrRangeNotSatisfiable()
+		rng := pgerr.ErrRangeNotSatisfiable().
+			WithDetails(fmt.Sprintf("An offset of %d was requested, but there are only %d rows.", offset, out.total))
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.WriteHeader(rng.HTTPStatus)
 		if r.Method != http.MethodHead {
@@ -948,25 +955,31 @@ func readStatus(q *ir.Query, out *rendered, _ int) int {
 
 // parseRangeHeader parses an HTTP Range header value of the form "start-end"
 // (as used with Range-Unit: items). Returns (offset, limit, true) where limit
-// is -1 for an open-ended range ("0-"). Returns (0, 0, false) on parse error.
-func parseRangeHeader(s string) (offset, limit int, ok bool) {
+// is -1 for an open-ended range ("0-"). A malformed header returns ok=false with
+// inverted=false so the caller serves the full result. A well-formed header whose
+// upper bound is below its lower bound returns ok=false with inverted=true, which
+// PostgREST answers with 416 rather than ignoring.
+func parseRangeHeader(s string) (offset, limit int, ok, inverted bool) {
 	dash := strings.LastIndex(s, "-")
 	if dash < 0 {
-		return 0, 0, false
+		return 0, 0, false, false
 	}
 	startStr, endStr := s[:dash], s[dash+1:]
 	start, err := strconv.Atoi(startStr)
 	if err != nil || start < 0 {
-		return 0, 0, false
+		return 0, 0, false, false
 	}
 	if endStr == "" {
-		return start, -1, true // open-ended: "0-"
+		return start, -1, true, false // open-ended: "0-"
 	}
 	end, err := strconv.Atoi(endStr)
-	if err != nil || end < start {
-		return 0, 0, false
+	if err != nil {
+		return 0, 0, false, false
 	}
-	return start, end - start + 1, true
+	if end < start {
+		return 0, 0, false, true
+	}
+	return start, end - start + 1, true, false
 }
 
 // asAPIError normalizes a backend execution error to the API envelope, asking

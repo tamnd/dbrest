@@ -1,6 +1,7 @@
 package httpapi_test
 
 import (
+	"encoding/json"
 	"net/http"
 	"testing"
 )
@@ -47,5 +48,50 @@ func TestReadOffsetBeyondTotalIs416(t *testing.T) {
 	})
 	if resp.StatusCode != http.StatusRequestedRangeNotSatisfiable {
 		t.Fatalf("status = %d, want 416", resp.StatusCode)
+	}
+	var env struct{ Code, Details string }
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if env.Code != "PGRST103" {
+		t.Errorf("code = %q, want PGRST103", env.Code)
+	}
+	if want := "An offset of 5 was requested, but there are only 4 rows."; env.Details != want {
+		t.Errorf("details = %q, want %q", env.Details, want)
+	}
+}
+
+// TestInvertedRangeHeaderIs416 checks a well-formed Range header whose upper
+// bound is below its lower bound is the 416 range error, not silently ignored.
+// A malformed header (TestMalformedRangeHeaderIgnored) still serves the full set.
+func TestInvertedRangeHeaderIs416(t *testing.T) {
+	srv := newServer(t)
+	resp := do(t, srv, http.MethodGet, "/films?order=id", map[string]string{
+		"Range": "5-2",
+	})
+	if resp.StatusCode != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("status = %d, want 416", resp.StatusCode)
+	}
+	var env struct{ Code, Details string }
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if env.Code != "PGRST103" {
+		t.Errorf("code = %q, want PGRST103", env.Code)
+	}
+	if want := "The lower boundary must be lower than or equal to the upper boundary in the Range header."; env.Details != want {
+		t.Errorf("details = %q, want %q", env.Details, want)
+	}
+}
+
+// TestMalformedRangeHeaderIgnored checks a non-numeric Range header is dropped
+// rather than answered with 416: PostgREST serves the full result.
+func TestMalformedRangeHeaderIgnored(t *testing.T) {
+	srv := newServer(t)
+	resp := do(t, srv, http.MethodGet, "/films?order=id", map[string]string{
+		"Range": "abc-def",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 }

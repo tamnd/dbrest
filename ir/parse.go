@@ -99,8 +99,14 @@ func applyParams(q *Query, vals url.Values) *pgerr.APIError {
 	}
 	if lim := self.Get("limit"); lim != "" {
 		n, e := strconv.Atoi(lim)
-		if e != nil || n < 0 {
+		if e != nil {
 			return pgerr.ErrParse("limit must be a non-negative integer")
+		}
+		if n < 0 {
+			// A well-formed but negative limit is PostgREST's 416 PGRST103, not a
+			// parse error: the requested range cannot be satisfied.
+			return pgerr.ErrRangeNotSatisfiable().
+				WithDetails("Limit should be greater than or equal to zero.")
 		}
 		q.Limit = &n
 	}
