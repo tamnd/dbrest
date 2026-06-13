@@ -172,6 +172,32 @@ func compileReadPlain(d Dialect, q *ir.Query, withCount bool) (*Statement, *pger
 func CompileCount(d Dialect, q *ir.Query) (*Statement, *pgerr.APIError) {
 	b := newBuilder(d)
 	b.sb.WriteString("SELECT count(*) FROM ")
+	if err := b.writeCountFromAndPredicates(q); err != nil {
+		return nil, err
+	}
+	return &Statement{SQL: b.sb.String(), Args: b.args}, nil
+}
+
+// CompileRowEstimateSource lowers a read query to a row-producing SELECT over the
+// same relation and predicates the count covers, with no aggregate. A backend
+// that estimates a count (count=planned / count=estimated) EXPLAINs this query
+// and reads the planner's row estimate off the root node; the count(*) wrapper
+// would instead estimate the aggregate's single output row. The empty target
+// list (SELECT FROM) keeps it estimate-only: it is never fetched (item 07.7).
+func CompileRowEstimateSource(d Dialect, q *ir.Query) (*Statement, *pgerr.APIError) {
+	b := newBuilder(d)
+	b.sb.WriteString("SELECT FROM ")
+	if err := b.writeCountFromAndPredicates(q); err != nil {
+		return nil, err
+	}
+	return &Statement{SQL: b.sb.String(), Args: b.args}, nil
+}
+
+// writeCountFromAndPredicates emits the parent relation and the predicates a
+// count ranges over: the horizontal WHERE and an EXISTS per !inner embed, the
+// same set the windowed read applies so an exact count matches its body. The
+// caller has already written the SELECT list up to FROM.
+func (b *builder) writeCountFromAndPredicates(q *ir.Query) *pgerr.APIError {
 	parent := b.qualify(q.Relation)
 	b.sb.WriteString(parent)
 
@@ -184,7 +210,7 @@ func CompileCount(d Dialect, q *ir.Query) (*Statement, *pgerr.APIError) {
 	if q.Where != nil {
 		b.sb.WriteString(" WHERE ")
 		if err := b.writeCond(*q.Where); err != nil {
-			return nil, err
+			return err
 		}
 		wrote = true
 	}
@@ -203,10 +229,10 @@ func CompileCount(d Dialect, q *ir.Query) (*Statement, *pgerr.APIError) {
 			wrote = true
 		}
 		if err := b.writeEmbedExists(emb, parent); err != nil {
-			return nil, err
+			return err
 		}
 	}
-	return &Statement{SQL: b.sb.String(), Args: b.args}, nil
+	return nil
 }
 
 // CompileInsert lowers an insert (or upsert) to a parameterized INSERT. Every

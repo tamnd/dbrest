@@ -63,15 +63,12 @@ func (b *Backend) executeRead(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 	res := &streamResult{ctx: ctx, tx: tx, controls: rc.Controls()}
 
 	if plan.Query.Count != ir.CountNone {
-		cst, apiErr := sqlgen.CompileCount(Dialect{}, plan.Query)
-		if apiErr != nil {
+		total, err := b.computeCount(ctx, tx, plan.Query)
+		if err != nil {
 			rollback()
-			return nil, apiErr
+			return nil, err
 		}
-		if err := tx.QueryRow(ctx, cst.SQL, cst.Args...).Scan(&res.count); err != nil {
-			rollback()
-			return nil, b.MapError(err)
-		}
+		res.count = total
 		res.hasCount = true
 	}
 

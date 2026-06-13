@@ -62,6 +62,11 @@ type Query struct {
 	Write     *WriteSpec // non-nil for Insert/Update/Upsert/Delete
 	Singular  bool
 	Count     CountKind
+	// CountMax is the db-max-rows threshold an estimated count crosses over at: a
+	// backend that supports estimation runs the exact count while the result stays
+	// at or below it and falls back to the planner estimate above it. Zero means no
+	// threshold was configured. It is only meaningful with Count == CountEstimated.
+	CountMax  int64
 	Prefer    PreferSet
 	FromRange bool // limit/offset came from the Range request header, not ?limit=
 	IsPut     bool // the request method was PUT, so PUT upsert validations apply

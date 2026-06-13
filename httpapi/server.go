@@ -763,6 +763,12 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity,
 	// write path.
 	q.Limit = s.capLimit(q.Limit)
 
+	// An estimated count crosses from exact to the planner estimate at db-max-rows;
+	// hand the backend that threshold so it can decide which side a result lands on.
+	if q.Count == ir.CountEstimated && s.maxRows > 0 {
+		q.CountMax = int64(s.maxRows)
+	}
+
 	planStart := time.Now()
 	planned, apiErr := plan.Read(s.Model(), q, []string{activeSchema}, plan.Options{AggregatesEnabled: s.aggregatesOn})
 	if apiErr != nil {
