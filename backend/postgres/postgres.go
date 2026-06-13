@@ -37,11 +37,14 @@ type Backend struct {
 	version         Version
 	funcs           rpc.Registry
 	searchPath      []string
-	extraSearchPath []string       // db-extra-search-path, appended after the active schema
-	loc             *time.Location // server TimeZone, for rendering timestamptz like PostgREST
+	extraSearchPath []string                  // db-extra-search-path, appended after the active schema
+	loc             *time.Location            // server TimeZone, for rendering timestamptz like PostgREST
 	funcVol         map[string]rpc.Volatility // "schema.name" -> volatility, for native RPC access mode
 	roleSettings    map[string][]roleSetting  // impersonated-role ALTER ROLE ... SET replays
 	roleIsolation   map[string]pgx.TxIsoLevel // impersonated-role default_transaction_isolation
+
+	hoistedTxSettings []string                 // db-hoisted-tx-settings: which function SET options hoist to the tx
+	funcProconfig     map[string][]roleSetting // "schema.name" -> function SET clause (pg_proc.proconfig)
 }
 
 // Open connects to PostgreSQL by connection string (a libpq URI or keyword/value
@@ -129,6 +132,16 @@ func (b *Backend) SetSchemas(schemas []string) {
 // "public", "public"; dbrest reproduces that verbatim.
 func (b *Backend) SetExtraSearchPath(schemas []string) {
 	b.extraSearchPath = schemas
+}
+
+// SetHoistedTxSettings records db-hoisted-tx-settings: the function SET options
+// (statement_timeout, plan_filter.statement_cost_limit,
+// default_transaction_isolation by default) that an RPC call hoists to the
+// transaction so they override the role and connection settings for the whole
+// statement, matching PostgREST. The named settings are applied per call from the
+// function's introspected proconfig (see hoistFor).
+func (b *Backend) SetHoistedTxSettings(names []string) {
+	b.hoistedTxSettings = names
 }
 
 // Register installs the portable function registry exposed at /rpc/<fn>. On

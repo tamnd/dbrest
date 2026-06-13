@@ -48,6 +48,15 @@ func (b *Backend) Introspect(ctx context.Context) (*schema.Model, error) {
 	b.roleSettings = rs
 	b.roleIsolation = iso
 
+	// Function SET clauses (pg_proc.proconfig) drive db-hoisted-tx-settings: an RPC
+	// call hoists the named settings to the transaction. Loaded with the catalog so
+	// it refreshes on every rebuild, like role settings and volatility.
+	pc, err := b.loadFunctionProconfig(ctx, schemas)
+	if err != nil {
+		return nil, err
+	}
+	b.funcProconfig = pc
+
 	var out []*schema.Relation
 	for _, r := range rels {
 		cols, pk, err := b.columns(ctx, r.oid)

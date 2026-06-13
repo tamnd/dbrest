@@ -1249,6 +1249,67 @@ func TestIntegrationReadTablePreRequestControls(t *testing.T) {
 	}
 }
 
+// TestIntegrationHoistedTxSettings proves db-hoisted-tx-settings: a function's SET
+// clause for a hoisted setting is applied to the transaction, not only the
+// function body. default_transaction_isolation is the cleanest probe because it
+// can never take effect without hoisting (the transaction has already started by
+// the time the function runs), so a function that returns the current isolation
+// level reads the database default unless its SET clause was hoisted to BeginTx.
+// Finding 02-P03.
+func TestIntegrationHoistedTxSettings(t *testing.T) {
+	be := openBE(t)
+	ctx := context.Background()
+
+	if _, err := be.Pool().Exec(ctx, `
+		CREATE OR REPLACE FUNCTION public._dbrest_hoist_iso() RETURNS text
+			LANGUAGE sql STABLE SET default_transaction_isolation = 'serializable'
+			AS $$ SELECT current_setting('transaction_isolation') $$`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, `DROP FUNCTION IF EXISTS public._dbrest_hoist_iso()`)
+	})
+
+	if _, err := be.Introspect(ctx); err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+
+	callIso := func() string {
+		t.Helper()
+		plan := &ir.Plan{ReadOnly: true, Call: &ir.Call{
+			Function: ir.Ref{Name: "_dbrest_hoist_iso"},
+			Args:     map[string]ir.Value{},
+		}}
+		res, err := be.Execute(ctx, plan, &reqctx.Context{Method: "GET", Path: "/rpc/_dbrest_hoist_iso"})
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		rs := res.Rows()
+		defer rs.Close()
+		if !rs.Next() {
+			t.Fatal("no rows")
+		}
+		vals, err := rs.Values()
+		if err != nil {
+			t.Fatalf("Values: %v", err)
+		}
+		return vals[0].(string)
+	}
+
+	// With no hoisted settings configured, the function's SET clause stays inside
+	// the body and the transaction runs at the database default.
+	if got := callIso(); got == "serializable" {
+		t.Errorf("isolation without hoisting = %q, want the default (not serializable)", got)
+	}
+
+	// With the v14 default hoist list, default_transaction_isolation is applied at
+	// BeginTx, so the transaction itself runs serializable.
+	be.SetHoistedTxSettings([]string{"statement_timeout", "plan_filter.statement_cost_limit", "default_transaction_isolation"})
+	if got := callIso(); got != "serializable" {
+		t.Errorf("isolation with hoisting = %q, want serializable", got)
+	}
+}
+
 func condPtr(c ir.Cond) *ir.Cond { return &c }
 func intPtr(n int) *int          { return &n }
 

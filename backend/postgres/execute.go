@@ -289,13 +289,19 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 		return b.executeCallRead(ctx, plan, rc, st)
 	}
 
-	tx, err := b.pool.BeginTx(ctx, b.txOptions(rc, pgx.ReadWrite))
+	txOpts, hoisted := b.callTxOptions(plan, rc, pgx.ReadWrite)
+	tx, err := b.pool.BeginTx(ctx, txOpts)
 	if err != nil {
 		return nil, b.MapError(err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	if err := applySession(ctx, tx, b, rc); err != nil {
+		return nil, b.MapError(err)
+	}
+	// Hoist the function's db-hoisted-tx-settings (statement_timeout and friends)
+	// after the session is set and before the call, so they bound the call itself.
+	if err := applyHoisted(ctx, tx, hoisted); err != nil {
 		return nil, b.MapError(err)
 	}
 
@@ -350,13 +356,19 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 // rows are drained and before the transaction commits, the same shape the write
 // and volatile-call paths use; RPC results are small, so this costs little.
 func (b *Backend) executeCallRead(ctx context.Context, plan *ir.Plan, rc *reqctx.Context, st *sqlgen.Statement) (backend.Result, error) {
-	tx, err := b.pool.BeginTx(ctx, b.txOptions(rc, pgx.ReadOnly))
+	txOpts, hoisted := b.callTxOptions(plan, rc, pgx.ReadOnly)
+	tx, err := b.pool.BeginTx(ctx, txOpts)
 	if err != nil {
 		return nil, b.MapError(err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	if err := applySession(ctx, tx, b, rc); err != nil {
+		return nil, b.MapError(err)
+	}
+	// Hoist db-hoisted-tx-settings before the count and the call so a function's
+	// statement_timeout bounds both, matching PostgREST.
+	if err := applyHoisted(ctx, tx, hoisted); err != nil {
 		return nil, b.MapError(err)
 	}
 

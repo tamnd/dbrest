@@ -307,6 +307,9 @@ func applySchemaConfig(be any, cfg *config.Config) {
 	if sp, ok := be.(interface{ SetExtraSearchPath([]string) }); ok {
 		sp.SetExtraSearchPath(cfg.ExtraSearchPath)
 	}
+	if h, ok := be.(interface{ SetHoistedTxSettings([]string) }); ok {
+		h.SetHoistedTxSettings(cfg.HoistedTxSettings)
+	}
 }
 
 // applyPoolConfig sizes the connection pool on the engines built over
