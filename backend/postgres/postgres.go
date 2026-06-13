@@ -189,6 +189,25 @@ func (b *Backend) MapError(err error) *pgerr.APIError {
 	if pg, ok := errors.AsType[*pgconn.PgError](err); ok {
 		return mapPgError(pg)
 	}
+	return mapTransportError(err)
+}
+
+// mapTransportError classifies a driver-level failure that never reached a
+// SQLSTATE into PostgREST's connection-error family (group 0). A failed or
+// refused dial surfaces from pgx as *pgconn.ConnectError and becomes PGRST000
+// (503, retryable); a pool-acquisition timeout surfaces as a context deadline
+// and becomes PGRST003 (504, the "Timed out acquiring connection" case);
+// anything else stays an internal 500. PostgREST also has PGRST002 for a schema
+// cache that cannot be built, but dbrest builds the cache at startup and refuses
+// to start on failure, so that code has no runtime analog here.
+func mapTransportError(err error) *pgerr.APIError {
+	var ce *pgconn.ConnectError
+	if errors.As(err, &ce) {
+		return pgerr.ErrDBConnection(err.Error())
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return pgerr.ErrAcquireTimeout()
+	}
 	return pgerr.ErrInternal(err.Error())
 }
 
@@ -212,7 +231,7 @@ func mapPgError(pg *pgconn.PgError) *pgerr.APIError {
 		e, headers := pgerr.FromRaise(pg.Message, pg.Detail)
 		return e.WithHeaders(headers)
 	}
-	e := pgerr.New(statusForSQLState(pg.Code), pg.Code, pg.Message)
+	e := pgerr.New(statusForSQLState(pg.Code, pg.Message), pg.Code, pg.Message)
 	if pg.Detail != "" {
 		e = e.WithDetails(pg.Detail)
 	}
@@ -223,36 +242,61 @@ func mapPgError(pg *pgconn.PgError) *pgerr.APIError {
 }
 
 // statusForSQLState maps a PostgreSQL SQLSTATE to the HTTP status PostgREST
-// returns for it. The table mirrors PostgREST's pgErrorStatus: most classes fold
-// to 500, a few auth and resource classes have their own status, the constraint
-// codes are 4xx, and a function can drive a custom status by raising a SQLSTATE
-// in the PTxxx form (the three digits after PT are the status). The default for
-// an unrecognized code is 400, as in PostgREST.
-func statusForSQLState(code string) int {
+// returns for it. The table mirrors PostgREST v14's pgErrorStatus (Error.hs)
+// row for row: most classes fold to 500, a few auth and resource classes have
+// their own status, the constraint codes are 4xx, two codes (21000, 22023)
+// disambiguate on the server message, a function can drive a custom status with
+// the PTxxx convention, and the default for an unrecognized code is 400. msg is
+// the server message, needed only for the two message-sniffing rows.
+//
+// PostgREST reads the status off the raw integer for PTxxx and would emit even a
+// nonsensical value; Go's response writer rejects a status below 100, so a PT
+// status under 100 falls back to 500 here rather than panicking. Every PTxxx in
+// the realistic 100-599 range (and up to 999) passes through unchanged.
+func statusForSQLState(code, msg string) int {
 	if len(code) != 5 {
 		return 400
 	}
 	// PTxxx lets a function set the response status directly (PostgREST's
 	// "RAISE sqlstate 'PT403'" convention); the digits after PT are the status.
+	// PostgREST falls back to 500 when the suffix does not parse.
 	if code[:2] == "PT" {
-		if n, err := strconv.Atoi(code[2:]); err == nil && n >= 100 && n <= 599 {
+		if n, err := strconv.Atoi(code[2:]); err == nil && n >= 100 && n <= 999 {
 			return n
 		}
+		return 500
 	}
 	switch code {
 	case "23503", "23505": // foreign_key / unique violation
 		return 409
 	case "25006": // read_only_sql_transaction
 		return 405
-	case "42883": // undefined_function
-		return 404
+	case "21000": // cardinality_violation: pg-safeupdate's missing-WHERE guard is
+		// a client error (400); the generic "more than one row" form is a server
+		// error (500), matching PostgREST's suffix test.
+		if strings.HasSuffix(msg, "requires a WHERE clause") {
+			return 400
+		}
+		return 500
+	case "22023": // invalid_parameter_value: a JWT naming a role that does not
+		// exist is an auth failure (401); everything else is a client error (400).
+		if strings.HasPrefix(msg, "role") && strings.HasSuffix(msg, "does not exist") {
+			return 401
+		}
+		return 400
+	case "53400": // configuration_limit_exceeded: 500, not the 503 of its class
+		return 500
+	case "57P01": // admin_shutdown: 503-with-retry, not the 500 of its class
+		return 503
 	case "42P01": // undefined_table
 		return 404
+	case "42P17": // infinite_recursion
+		return 500
 	case "42501": // insufficient_privilege: 403 base, lifted to 401 for an
 		// anonymous request by mapExecError, mirroring PostgREST's pgErrorStatus.
 		return 403
-	case "42P17": // infinite_recursion
-		return 500
+	case "P0001": // raise_exception default code: client error
+		return 400
 	}
 	switch code[:2] {
 	case "08": // connection exception
@@ -274,7 +318,7 @@ func statusForSQLState(code string) int {
 	case "53": // insufficient resources
 		return 503
 	case "54": // program limit exceeded (statement too complex)
-		return 413
+		return 500
 	case "55": // object not in prerequisite state
 		return 500
 	case "57": // operator intervention
@@ -285,11 +329,17 @@ func statusForSQLState(code string) int {
 		return 500
 	case "HV": // foreign data wrapper error
 		return 500
-	case "P0": // PL/pgSQL raise_exception and friends
-		return 400
+	case "P0": // PL/pgSQL raise_exception and friends (P0001 handled above)
+		return 500
 	case "XX": // internal error
 		return 500
-	case "42": // syntax error / access rule violation (undefined column, ...)
+	case "42": // syntax / access rule violation; 42883 splits on the message
+		if code == "42883" { // undefined_function: xmlagg ambiguity is a 406
+			if strings.HasPrefix(msg, "function xmlagg(") {
+				return 406
+			}
+			return 404
+		}
 		return 400
 	}
 	return 400

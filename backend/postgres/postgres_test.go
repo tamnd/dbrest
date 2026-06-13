@@ -2,6 +2,8 @@ package postgres
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -154,46 +156,91 @@ func TestMapErrorNil(t *testing.T) {
 
 func TestMapErrorNonPg(t *testing.T) {
 	b := &Backend{}
-	got := b.MapError(context.DeadlineExceeded)
+	got := b.MapError(errors.New("boom"))
 	if got == nil {
 		t.Fatal("MapError(non-PG) = nil, want internal error")
 	}
 	if got.HTTPStatus != 500 {
 		t.Errorf("HTTPStatus = %d, want 500", got.HTTPStatus)
 	}
+	if got.Code != pgerr.CodeInternal {
+		t.Errorf("Code = %q, want %q", got.Code, pgerr.CodeInternal)
+	}
+}
+
+// TestMapTransportError covers finding 03-P19(e): a driver failure that never
+// reached a SQLSTATE is classified into PostgREST's connection-error family
+// instead of collapsing to 500. A refused dial (pgx *pgconn.ConnectError) is
+// PGRST000/503; a pool-acquisition timeout (context deadline) is PGRST003/504.
+func TestMapTransportError(t *testing.T) {
+	b := &Backend{}
+
+	// A real *pgconn.ConnectError from a refused dial (the wrapped error is
+	// unexported, so a refused localhost port is the way to get a valid one).
+	_, dialErr := pgconn.Connect(context.Background(), "postgres://nobody@127.0.0.1:1/none")
+	var ce *pgconn.ConnectError
+	if !errors.As(dialErr, &ce) {
+		t.Fatalf("expected a *pgconn.ConnectError from a refused dial, got %T (%v)", dialErr, dialErr)
+	}
+	conn := b.MapError(dialErr)
+	if conn.HTTPStatus != 503 || conn.Code != pgerr.CodeDBConnection {
+		t.Errorf("connect error => %d %q, want 503 %q", conn.HTTPStatus, conn.Code, pgerr.CodeDBConnection)
+	}
+
+	to := b.MapError(fmt.Errorf("acquire: %w", context.DeadlineExceeded))
+	if to.HTTPStatus != 504 || to.Code != pgerr.CodeAcquireTimeout {
+		t.Errorf("acquire timeout => %d %q, want 504 %q", to.HTTPStatus, to.Code, pgerr.CodeAcquireTimeout)
+	}
+	if to.Message != "Timed out acquiring connection from connection pool." {
+		t.Errorf("acquire timeout message = %q", to.Message)
+	}
 }
 
 func TestStatusForSQLState(t *testing.T) {
 	cases := []struct {
 		code string
+		msg  string
 		want int
 	}{
 		// well-known individual codes
-		{"23503", 409},
-		{"23505", 409},
-		{"25006", 405},
-		{"42883", 404},
-		{"42P01", 404},
-		{"42501", 403}, // insufficient_privilege: 403 base, anon lifted to 401 by mapExecError
+		{"23503", "", 409},
+		{"23505", "", 409},
+		{"25006", "", 405},
+		{"42883", "function foo() does not exist", 404},
+		{"42883", "function xmlagg() does not exist", 406}, // xmlagg ambiguity
+		{"42P01", "", 404},
+		{"42501", "", 403}, // insufficient_privilege: 403 base, anon lifted to 401 by mapExecError
+		// message-sniffing rows
+		{"21000", "UPDATE requires a WHERE clause", 400},
+		{"21000", "more than one row returned by a subquery", 500},
+		{"22023", `role "ghost" does not exist`, 401},
+		{"22023", "time zone displacement out of range", 400},
 		// PTxxx convention
-		{"PT403", 403},
-		{"PT201", 201},
-		// class rules
-		{"08000", 503},
-		{"28000", 403},
-		{"53100", 503},
-		{"54001", 413},
-		{"XX000", 500},
-		{"P0001", 400},
+		{"PT403", "", 403},
+		{"PT201", "", 201},
+		{"PT999", "", 999}, // out of the 100-599 band but still a parsed status
+		{"PTabc", "", 500}, // unparseable suffix falls back to 500
+		{"PT042", "", 500}, // below 100, not emittable, falls back to 500
+		// class rules and corrected edge rows
+		{"08000", "", 503},
+		{"28000", "", 403},
+		{"53100", "", 503},
+		{"53400", "", 500}, // config limit exceeded: 500, not its class 503
+		{"54001", "", 500}, // program limit exceeded: 500, not 413
+		{"57000", "", 500},
+		{"57P01", "", 503}, // admin shutdown: 503, not its class 500
+		{"XX000", "", 500},
+		{"P0001", "", 400}, // raise default: client error
+		{"P0002", "", 500}, // other PL/pgSQL: server error
 		// default
-		{"00000", 400},
-		{"ZZZZZ", 400},
-		{"short", 400},
+		{"00000", "", 400},
+		{"ZZZZZ", "", 400},
+		{"short", "", 400},
 	}
 	for _, c := range cases {
-		got := statusForSQLState(c.code)
+		got := statusForSQLState(c.code, c.msg)
 		if got != c.want {
-			t.Errorf("statusForSQLState(%q) = %d, want %d", c.code, got, c.want)
+			t.Errorf("statusForSQLState(%q, %q) = %d, want %d", c.code, c.msg, got, c.want)
 		}
 	}
 }

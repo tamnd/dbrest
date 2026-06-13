@@ -46,6 +46,9 @@ const (
 	CodeAggregatesOff      = "PGRST123" // 400 aggregate functions used while db-aggregates-enabled is off
 	CodeMaxAffected        = "PGRST124" // 400 mutation/RPC affected more rows than Prefer: max-affected
 	CodeUnsupported        = "PGRST127" // 400 feature not implemented on this backend
+	CodeDBConnection       = "PGRST000" // 503 cannot connect to the database (bad URI or service down)
+	CodeDBClient           = "PGRST001" // 503 database client error, retrying the connection
+	CodeAcquireTimeout     = "PGRST003" // 504 timed out acquiring a connection from the pool
 	CodeInternal           = "PGRSTX00" // 500 internal error (upstream group X has only X00)
 	CodeBodyTooLarge       = "PGRSTX13" // 413 request body exceeds the configured max-request-body
 )
@@ -558,4 +561,36 @@ func ErrRLSViolation(relation string) *APIError {
 // upstream covers internal errors; dbrest renders them as 500.
 func ErrInternal(msg string) *APIError {
 	return New(http.StatusInternalServerError, CodeInternal, msg)
+}
+
+// ErrDBConnection is a failed or refused database connection (a bad URI or a
+// service that is down), mapped to 503 with PostgREST's group-0 message and the
+// driver's own text carried in details. A load balancer treats the 503 as
+// retryable, matching PostgREST's ConnectionUsageError.
+func ErrDBConnection(detail string) *APIError {
+	e := New(http.StatusServiceUnavailable, CodeDBConnection,
+		"Database connection error. Retrying the connection.")
+	if detail != "" {
+		e = e.WithDetails(detail)
+	}
+	return e
+}
+
+// ErrDBClient is a database client error during a session (a dropped or reset
+// connection mid-request), mapped to 503 with PostgREST's group-0 message and
+// the driver's text in details, matching PostgREST's ClientError.
+func ErrDBClient(detail string) *APIError {
+	e := New(http.StatusServiceUnavailable, CodeDBClient,
+		"Database client error. Retrying the connection.")
+	if detail != "" {
+		e = e.WithDetails(detail)
+	}
+	return e
+}
+
+// ErrAcquireTimeout is a pool-acquisition timeout, mapped to 504 with
+// PostgREST's exact group-0 message, matching AcquisitionTimeoutUsageError.
+func ErrAcquireTimeout() *APIError {
+	return New(http.StatusGatewayTimeout, CodeAcquireTimeout,
+		"Timed out acquiring connection from connection pool.")
 }
