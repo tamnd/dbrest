@@ -234,6 +234,22 @@ type Not struct{ Kid Cond }
 
 func (Not) isCond() {}
 
+// EmbedPredicate filters the parent on the existence of an embedded resource's
+// rows. It is what an `embed=is.null` / `embed=not.is.null` filter lowers to:
+// the planner reclassifies a Compare whose single-segment path names an embed's
+// OutKey and whose operator is `is null` into this node, so the compiler can
+// emit a semi/anti join instead of rejecting an unknown parent column.
+//
+// Index points into the owning Query's Embeds. Exists is true for not.is.null
+// (the parent must have a matching embedded row, a semi-join / EXISTS) and false
+// for is.null (it must have none, an anti-join / NOT EXISTS). See spec 09.
+type EmbedPredicate struct {
+	Index  int
+	Exists bool
+}
+
+func (EmbedPredicate) isCond() {}
+
 // FTSVariant selects the full-text query grammar of an fts predicate, one per
 // PostgREST operator. Parsing records the variant; each backend maps it onto its
 // own full-text query language (spec 21).

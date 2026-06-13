@@ -36,6 +36,12 @@ type builder struct {
 	args   []any
 	qual   string
 	aliasN int
+	// parentRef is how an EmbedPredicate's EXISTS/NOT EXISTS correlates back to the
+	// outer row: the parent alias (t0) in an embedded read, or the qualified table
+	// name in a count where the parent has no alias. embeds is the parent query's
+	// embed list an EmbedPredicate indexes into.
+	parentRef string
+	embeds    []ir.Embed
 	// ctxArgs are the reserved :request_* values an RPC body may bind when a
 	// placeholder is not a declared parameter; see ContextArgs.
 	ctxArgs map[string]any
@@ -151,8 +157,13 @@ func compileReadPlain(d Dialect, q *ir.Query, withCount bool) (*Statement, *pger
 func CompileCount(d Dialect, q *ir.Query) (*Statement, *pgerr.APIError) {
 	b := newBuilder(d)
 	b.sb.WriteString("SELECT count(*) FROM ")
-	b.sb.WriteString(b.qualify(q.Relation))
+	parent := b.qualify(q.Relation)
+	b.sb.WriteString(parent)
 	if q.Where != nil {
+		// An embed-existence filter correlates to the parent by its bare table name
+		// here, since a count gives the parent no alias.
+		b.parentRef = parent
+		b.embeds = q.Embeds
 		b.sb.WriteString(" WHERE ")
 		if err := b.writeCond(*q.Where); err != nil {
 			return nil, err
@@ -524,9 +535,26 @@ func (b *builder) writeCond(c ir.Cond) *pgerr.APIError {
 		return nil
 	case ir.Compare:
 		return b.writeCompare(n)
+	case ir.EmbedPredicate:
+		return b.writeEmbedPredicate(n)
 	default:
 		return pgerr.ErrInternal(fmt.Sprintf("unknown filter node %T", c))
 	}
+}
+
+// writeEmbedPredicate lowers an embed-existence filter (films?actors=is.null /
+// not.is.null). not.is.null is a semi-join, the same EXISTS an !inner embed
+// adds; is.null is its anti-join complement (NOT EXISTS). The correlation hangs
+// off parentRef so the predicate works both in an embedded read (alias t0) and
+// in a plain count (the bare table name). See item 01.12.
+func (b *builder) writeEmbedPredicate(p ir.EmbedPredicate) *pgerr.APIError {
+	if p.Index < 0 || p.Index >= len(b.embeds) {
+		return pgerr.ErrInternal("embed predicate index out of range")
+	}
+	if !p.Exists {
+		b.sb.WriteString("NOT ")
+	}
+	return b.writeEmbedExists(&b.embeds[p.Index], b.parentRef)
 }
 
 func (b *builder) writeLogical(kids []ir.Cond, sep string) *pgerr.APIError {

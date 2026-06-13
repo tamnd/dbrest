@@ -46,6 +46,8 @@ func compileReadEmbedded(d Dialect, q *ir.Query) (*Statement, *pgerr.APIError) {
 	if q.Where != nil {
 		b.sb.WriteString(" WHERE ")
 		b.qual = parentAlias
+		b.parentRef = parentAlias
+		b.embeds = q.Embeds
 		if err := b.writeCond(*q.Where); err != nil {
 			return nil, err
 		}

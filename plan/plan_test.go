@@ -232,6 +232,76 @@ func TestWritePutMultiRowIs400(t *testing.T) {
 	}
 }
 
+// embedModel wires directors (one) <- films (many) through a forward FK so an
+// embed of films on directors resolves to a single relationship.
+func nullEmbedModel() *schema.Model {
+	directors := &schema.Relation{Schema: "public", Name: "directors", Kind: schema.KindTable, Columns: []*schema.Column{
+		{Name: "id", Type: "integer", Position: 1},
+		{Name: "name", Type: "text", Position: 2},
+	}}
+	films := &schema.Relation{Schema: "public", Name: "films", Kind: schema.KindTable, Columns: []*schema.Column{
+		{Name: "id", Type: "integer", Position: 1},
+		{Name: "title", Type: "text", Position: 2},
+		{Name: "director_id", Type: "integer", Position: 3},
+	}, ForeignKeys: []*schema.ForeignKey{{
+		Name: "films_director_id_fkey", Columns: []string{"director_id"},
+		RefSchema: "public", RefRelation: "directors", RefColumns: []string{"id"},
+	}}}
+	return schema.NewModel([]*schema.Relation{directors, films})
+}
+
+// A filter naming an embed (directors?films=not.is.null) is reclassified into an
+// EmbedPredicate before column validation, rather than being rejected as an
+// unknown parent column (item 01.12). not.is.null sets Exists.
+func TestReadReclassifiesEmbedNullFilter(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		negate bool
+		exists bool
+	}{
+		{"not.is.null is a semi-join", true, true},
+		{"is.null is an anti-join", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			where := ir.Cond(ir.Compare{Path: []string{"films"}, Op: ir.OpIs, Value: ir.Value{Text: "null"}, Negate: tc.negate})
+			q := &ir.Query{
+				Relation: ir.Ref{Name: "directors"},
+				Select:   []ir.SelectItem{ir.EmbedRef{Index: 0}},
+				Where:    &where,
+				Embeds:   []ir.Embed{{Target: ir.Ref{Name: "films"}, OutKey: "films"}},
+			}
+			if _, err := Read(nullEmbedModel(), q, []string{"public"}); err != nil {
+				t.Fatalf("Read: %v", err)
+			}
+			pred, ok := (*q.Where).(ir.EmbedPredicate)
+			if !ok {
+				t.Fatalf("Where = %T, want ir.EmbedPredicate", *q.Where)
+			}
+			if pred.Index != 0 || pred.Exists != tc.exists {
+				t.Errorf("predicate = %+v, want Index 0 Exists %v", pred, tc.exists)
+			}
+		})
+	}
+}
+
+// A null filter naming a real parent column (not an embed) stays an ordinary
+// Compare and is column-validated as usual.
+func TestReadEmbedNullReclassifyLeavesColumns(t *testing.T) {
+	where := ir.Cond(ir.Compare{Path: []string{"title"}, Op: ir.OpIs, Value: ir.Value{Text: "null"}, Negate: true})
+	q := &ir.Query{
+		Relation: ir.Ref{Name: "directors"},
+		Select:   []ir.SelectItem{ir.EmbedRef{Index: 0}},
+		Where:    &where,
+		Embeds:   []ir.Embed{{Target: ir.Ref{Name: "films"}, OutKey: "films"}},
+	}
+	// title is not a directors column; the filter is a Compare, so column
+	// validation rejects it rather than mistaking it for an embed predicate.
+	_, err := Read(nullEmbedModel(), q, []string{"public"})
+	if err == nil || err.Code != "PGRST204" {
+		t.Fatalf("want PGRST204 for unknown column, got %v", err)
+	}
+}
+
 // A write whose select embeds a resource with no relationship is the read
 // path's PGRST200 rather than silently dropping the embed (item 01.19).
 func TestWriteResolvesEmbedsRejectsUnknown(t *testing.T) {

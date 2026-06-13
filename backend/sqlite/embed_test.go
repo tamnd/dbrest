@@ -153,6 +153,92 @@ func TestExecuteEmbedToManyValue(t *testing.T) {
 	}
 }
 
+// openEmbedNull seeds directors where one (Welles) has no films, so an
+// embed-existence filter has something to include and exclude.
+func openEmbedNull(t *testing.T) *Backend {
+	t.Helper()
+	dsn := "file:" + strings.ReplaceAll(t.Name(), "/", "_") + "?mode=memory&cache=shared"
+	b, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { b.Close() })
+	_, err = b.DB().Exec(`
+		CREATE TABLE directors (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+		CREATE TABLE films (
+			id INTEGER PRIMARY KEY,
+			title TEXT NOT NULL,
+			director_id INTEGER REFERENCES directors(id)
+		);
+		INSERT INTO directors (id, name) VALUES (1, 'Lang'), (2, 'Scott'), (3, 'Welles');
+		INSERT INTO films (id, title, director_id) VALUES
+			(1, 'Metropolis', 1), (2, 'Blade Runner', 2);
+	`)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	return b
+}
+
+// names pulls the name column out of a result set in row order.
+func names(rows []map[string]any) []string {
+	out := make([]string, len(rows))
+	for i, r := range rows {
+		out[i], _ = asString(r["name"])
+	}
+	return out
+}
+
+// directors?select=name,films(title)&films=not.is.null keeps only directors with
+// at least one film: a semi-join over the relationship (item 01.12).
+func TestExecuteEmbedNotIsNull(t *testing.T) {
+	b := openEmbedNull(t)
+	q := planEmbed(t, b, "directors", "select=name,films(title)&films=not.is.null&order=id")
+	got := names(execReadResolved(t, b, q))
+	if len(got) != 2 || got[0] != "Lang" || got[1] != "Scott" {
+		t.Errorf("not.is.null directors = %v, want [Lang Scott]", got)
+	}
+}
+
+// directors?...&films=is.null is the anti-join: only the director with no films.
+func TestExecuteEmbedIsNull(t *testing.T) {
+	b := openEmbedNull(t)
+	q := planEmbed(t, b, "directors", "select=name,films(title)&films=is.null&order=id")
+	got := names(execReadResolved(t, b, q))
+	if len(got) != 1 || got[0] != "Welles" {
+		t.Errorf("is.null directors = %v, want [Welles]", got)
+	}
+}
+
+// The predicate composes under or=(...): directors with a film OR named Welles is
+// everyone here, exercising the EXISTS as one disjunct alongside a column compare.
+func TestExecuteEmbedNullInsideOr(t *testing.T) {
+	b := openEmbedNull(t)
+	q := planEmbed(t, b, "directors", "select=name,films(title)&or=(films.not.is.null,name.eq.Welles)&order=id")
+	got := names(execReadResolved(t, b, q))
+	if len(got) != 3 {
+		t.Errorf("or= directors = %v, want all three", got)
+	}
+}
+
+// A count alongside the windowed read must apply the same semi-join, so the
+// total reflects only the directors that have films.
+func TestExecuteEmbedNullCount(t *testing.T) {
+	b := openEmbedNull(t)
+	q := planEmbed(t, b, "directors", "select=name,films(title)&films=not.is.null")
+	st, perr := sqlgen.CompileCount(dialect{}, q)
+	if perr != nil {
+		t.Fatalf("CompileCount: %v", perr)
+	}
+	var n int
+	if err := b.DB().QueryRow(st.SQL, st.Args...).Scan(&n); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("count = %d, want 2", n)
+	}
+}
+
 // execReadResolved executes an already-planned read and returns the rows. The
 // query's relation reference is bound by the planner, so it runs as-is.
 func execReadResolved(t *testing.T, b *Backend, q *ir.Query) []map[string]any {

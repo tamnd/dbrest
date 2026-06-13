@@ -37,6 +37,11 @@ func Read(model *schema.Model, q *ir.Query, searchPath []string) (*ir.Plan, *pge
 	if err := validateSelect(rel, q.Select); err != nil {
 		return nil, err
 	}
+	// A filter naming an embed (films?actors=not.is.null) is an existence test on
+	// the relationship, not a parent column. Reclassify those before column
+	// validation so they are not rejected as unknown columns, then validate the
+	// rest of the tree. See item 01.12.
+	reclassifyEmbedFilters(q)
 	if err := validateCond(rel, q.Where); err != nil {
 		return nil, err
 	}
@@ -410,6 +415,53 @@ func validateSelect(rel *schema.Relation, items []ir.SelectItem) *pgerr.APIError
 		}
 	}
 	return nil
+}
+
+// reclassifyEmbedFilters rewrites, in place, every Compare in the query's filter
+// tree whose single-segment path names an embed's OutKey and whose operator is
+// `is null` into an ir.EmbedPredicate. PostgREST reads films?actors=not.is.null
+// as a semi-join on the actors relationship and films?actors=is.null as an
+// anti-join, both usable inside or=(...); without this rewrite the embed name
+// would be validated as a parent column and rejected. not.is.null carries the
+// Compare's Negate, which becomes Exists (the parent must have a matching row).
+// See item 01.12.
+func reclassifyEmbedFilters(q *ir.Query) {
+	if q.Where == nil || len(q.Embeds) == 0 {
+		return
+	}
+	idx := make(map[string]int, len(q.Embeds))
+	for i := range q.Embeds {
+		idx[q.Embeds[i].OutKey] = i
+	}
+	var rw func(c ir.Cond) ir.Cond
+	rw = func(c ir.Cond) ir.Cond {
+		switch n := c.(type) {
+		case ir.And:
+			for i := range n.Kids {
+				n.Kids[i] = rw(n.Kids[i])
+			}
+			return n
+		case ir.Or:
+			for i := range n.Kids {
+				n.Kids[i] = rw(n.Kids[i])
+			}
+			return n
+		case ir.Not:
+			n.Kid = rw(n.Kid)
+			return n
+		case ir.Compare:
+			if n.Op == ir.OpIs && n.Value.Text == "null" && len(n.Path) == 1 {
+				if i, ok := idx[n.Path[0]]; ok {
+					return ir.EmbedPredicate{Index: i, Exists: n.Negate}
+				}
+			}
+			return n
+		default:
+			return c
+		}
+	}
+	nc := rw(*q.Where)
+	q.Where = &nc
 }
 
 func validateCond(rel *schema.Relation, c *ir.Cond) *pgerr.APIError {
