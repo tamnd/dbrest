@@ -832,6 +832,11 @@ func parseEmbed(raw string, lparen int) (Embed, *pgerr.APIError) {
 		}
 		emb.Query.Select = items
 		emb.Query.Embeds = nested
+	} else {
+		// Empty parentheses, client(). The relation is still joined for filtering
+		// but its key is omitted from the output; this is distinct from an absent
+		// list, which selects every column.
+		emb.EmptySelect = true
 	}
 	return emb, nil
 }

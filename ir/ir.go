@@ -254,6 +254,12 @@ type Embed struct {
 	Target      Ref // the embedded relation as written; resolved at plan time
 	Query       Query
 	Rel         *schema.Relationship
+
+	// EmptySelect records that the embed was written with empty parentheses,
+	// e.g. client(). PostgREST joins such a relation for filtering but omits its
+	// key from the output entirely, which an absent or rel(*) select does not.
+	// This distinguishes "no column list" from "select every column".
+	EmptySelect bool
 }
 
 // Cond is a node in the filter tree.

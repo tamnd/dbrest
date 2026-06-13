@@ -115,6 +115,11 @@ func (b *builder) writeEmbeddedSelect(q *ir.Query, parentAlias string) *pgerr.AP
 			}
 		case ir.EmbedRef:
 			emb := &q.Embeds[v.Index]
+			// An empty-parenthesis embed, client(), joins for filtering but is
+			// not projected; the parent WHERE still carries its !inner EXISTS.
+			if emb.EmptySelect {
+				continue
+			}
 			sub, err := b.embedExpr(emb, parentAlias)
 			if err != nil {
 				return err
@@ -126,6 +131,11 @@ func (b *builder) writeEmbeddedSelect(q *ir.Query, parentAlias string) *pgerr.AP
 		default:
 			return pgerr.ErrUnsupported("aggregates in select", "sql")
 		}
+	}
+	// A select list that named only hidden embeds projects nothing; fall back to
+	// the parent's columns so the statement stays valid.
+	if first {
+		b.sb.WriteString(parentAlias + ".*")
 	}
 	return nil
 }
@@ -292,6 +302,11 @@ func (b *builder) embedObject(emb *ir.Embed, alias string) (string, *pgerr.APIEr
 			pairs = append(pairs, Pair{Key: v.Name(), Value: expr})
 		case ir.EmbedRef:
 			nested := &emb.Query.Embeds[v.Index]
+			// A nested empty-parenthesis embed joins for filtering but is not
+			// projected into the parent object, mirroring the top-level rule.
+			if nested.EmptySelect {
+				continue
+			}
 			sub, err := b.embedExpr(nested, alias)
 			if err != nil {
 				return "", err

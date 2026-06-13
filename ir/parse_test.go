@@ -65,6 +65,25 @@ func TestParseEmbed(t *testing.T) {
 	}
 }
 
+// 07.8: empty parentheses set EmptySelect so the compiler can join the relation
+// for filtering yet hide its key, distinct from rel(*) which selects every
+// column.
+func TestParseEmbedEmptySelect(t *testing.T) {
+	q := mustRead(t, "select=title,director()")
+	emb := q.Embeds[0]
+	if !emb.EmptySelect {
+		t.Errorf("director() should set EmptySelect")
+	}
+	if len(emb.Query.Select) != 0 {
+		t.Errorf("director() select = %d, want 0", len(emb.Query.Select))
+	}
+
+	q = mustRead(t, "select=title,director(*)")
+	if q.Embeds[0].EmptySelect {
+		t.Errorf("director(*) must not set EmptySelect")
+	}
+}
+
 func TestParseEmbedInnerHint(t *testing.T) {
 	q := mustRead(t, "select=director!inner(name)")
 	if q.Embeds[0].Join != JoinInner {
