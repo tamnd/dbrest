@@ -415,6 +415,73 @@ func TestMapErrorUniqueViolation(t *testing.T) {
 	if api == nil || api.Code != pgerr.CodeUniqueViolation || api.HTTPStatus != 409 {
 		t.Fatalf("err = %#v, want 23505/409", api)
 	}
+	// The message is PostgreSQL's wording, not SQLite's native text, and the
+	// native "UNIQUE constraint failed" string never leaks into details.
+	if api.Message != "duplicate key value violates unique constraint" {
+		t.Errorf("message = %q, want PG unique wording", api.Message)
+	}
+	if api.Details != nil {
+		t.Errorf("details = %q, want no leaked native text", *api.Details)
+	}
+}
+
+// A NOT NULL violation reconstructs PostgreSQL's exact wording from the
+// relation and column SQLite names in its error text.
+func TestMapErrorNotNullViolation(t *testing.T) {
+	b := openSeeded(t)
+	pl := &ir.Plan{Query: &ir.Query{
+		Kind:     ir.Insert,
+		Relation: ir.Ref{Name: "films"},
+		Write: &ir.WriteSpec{
+			Return:  ir.ReturnMinimal,
+			Columns: []string{"id", "title"},
+			Rows:    []map[string]ir.Value{{"id": ir.Value{JSON: json.Number("9")}, "title": ir.Value{JSON: nil}}},
+		},
+	}}
+	rel, _ := mustModel(t, b).Lookup("films", nil)
+	pl.Rel = rel
+	_, err := b.Execute(context.Background(), pl, &reqctx.Context{Role: "anon"})
+	if err == nil {
+		t.Fatal("want a constraint error")
+	}
+	api := pgerr.As(err)
+	if api == nil || api.Code != pgerr.CodeNotNullViolation || api.HTTPStatus != 400 {
+		t.Fatalf("err = %#v, want 23502/400", api)
+	}
+	want := `null value in column "title" of relation "films" violates not-null constraint`
+	if api.Message != want {
+		t.Errorf("message = %q, want %q", api.Message, want)
+	}
+	if api.Details != nil {
+		t.Errorf("details = %q, want no leaked native text", *api.Details)
+	}
+}
+
+// The synthesis helpers reconstruct PG wording from SQLite's text directly,
+// including the constraint name for a CHECK and a graceful fallback when the
+// text does not parse.
+func TestConstraintMessageSynthesis(t *testing.T) {
+	cases := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{"notnull", notNullMessage("NOT NULL constraint failed: films.title"),
+			`null value in column "title" of relation "films" violates not-null constraint`},
+		{"notnull-unparsed", notNullMessage("garbage"),
+			"null value violates not-null constraint"},
+		{"check-named", checkMessage("CHECK constraint failed: rating_valid"),
+			`new row violates check constraint "rating_valid"`},
+		{"check-bare", checkMessage("CHECK constraint failed: "),
+			"new row violates check constraint"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if c.got != c.want {
+				t.Errorf("got %q, want %q", c.got, c.want)
+			}
+		})
+	}
 }
 
 func TestExecuteNullsOrdering(t *testing.T) {

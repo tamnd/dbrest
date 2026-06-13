@@ -131,8 +131,13 @@ func (b *Backend) Close() error { return b.db.Close() }
 
 // MapError turns a driver error into the unified envelope. A SQLite constraint
 // violation maps to the PostgreSQL SQLSTATE PostgREST would report (so clients
-// see the same code on every backend) with the matching HTTP status; anything
-// else is surfaced as internal.
+// see the same code on every backend) with the matching HTTP status, and to a
+// PG-shaped message synthesized from what SQLite reports. SQLite names the
+// relation and column in its NOT NULL and UNIQUE text, so those reconstruct
+// PostgreSQL's own wording; it gives no constraint name for a unique key and no
+// offending value, so neither is invented (an emulation limitation, not a
+// fabricated wire contract). The native text is never leaked into details.
+// Anything else is surfaced as internal.
 func (b *Backend) MapError(err error) *pgerr.APIError {
 	if err == nil {
 		return nil
@@ -141,19 +146,55 @@ func (b *Backend) MapError(err error) *pgerr.APIError {
 		// The primary result code is the low byte; the rest is the extended code.
 		switch se.Code() {
 		case sqlite3.SQLITE_CONSTRAINT_UNIQUE, sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY:
-			return pgerr.ErrUniqueViolation(se.Error())
+			return pgerr.ErrConstraintViolation(pgerr.CodeUniqueViolation,
+				"duplicate key value violates unique constraint", "", "")
 		case sqlite3.SQLITE_CONSTRAINT_NOTNULL:
-			return pgerr.ErrNotNullViolation(se.Error())
+			return pgerr.ErrConstraintViolation(pgerr.CodeNotNullViolation,
+				notNullMessage(se.Error()), "", "")
 		case sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY:
-			return pgerr.ErrForeignKeyViolation(se.Error())
+			return pgerr.ErrConstraintViolation(pgerr.CodeForeignKeyViolation,
+				"insert or update on table violates foreign key constraint", "", "")
 		case sqlite3.SQLITE_CONSTRAINT_CHECK:
-			return pgerr.ErrCheckViolation(se.Error())
+			return pgerr.ErrConstraintViolation(pgerr.CodeCheckViolation,
+				checkMessage(se.Error()), "", "")
 		}
 		if se.Code()&0xff == sqlite3.SQLITE_CONSTRAINT {
-			return pgerr.ErrCheckViolation(se.Error())
+			return pgerr.ErrConstraintViolation(pgerr.CodeCheckViolation,
+				"new row violates check constraint", "", "")
 		}
 	}
 	return pgerr.ErrInternal(err.Error())
+}
+
+// constraintTarget matches the "table.column" SQLite names after the colon in a
+// constraint failure ("NOT NULL constraint failed: films.title").
+var constraintTarget = regexp.MustCompile(`([^\s,.]+)\.([^\s,.]+)`)
+
+// notNullMessage reconstructs PostgreSQL's not-null wording from SQLite's "NOT
+// NULL constraint failed: relation.column" text. PostgreSQL reports `null value
+// in column "c" of relation "t" violates not-null constraint`; SQLite supplies
+// both names, so the message matches verbatim. When the text does not parse the
+// generic message stands.
+func notNullMessage(text string) string {
+	if m := constraintTarget.FindStringSubmatch(text); m != nil {
+		return fmt.Sprintf(
+			"null value in column %q of relation %q violates not-null constraint",
+			m[2], m[1])
+	}
+	return "null value violates not-null constraint"
+}
+
+// checkMessage reconstructs PostgreSQL's check wording from SQLite's "CHECK
+// constraint failed: name" text. PostgreSQL names the constraint (`new row for
+// relation "t" violates check constraint "c"`); SQLite gives only the
+// constraint name (or the expression for an anonymous check), so the name rides
+// through when present and the generic message stands otherwise.
+func checkMessage(text string) string {
+	const prefix = "CHECK constraint failed: "
+	if name := strings.TrimPrefix(text, prefix); name != text && name != "" {
+		return fmt.Sprintf("new row violates check constraint %q", name)
+	}
+	return "new row violates check constraint"
 }
 
 // Execute lowers a resolved plan to SQLite operations and returns a streamable

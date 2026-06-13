@@ -142,36 +142,19 @@ func (b *Backend) MapError(err error) *pgerr.APIError {
 }
 
 // mapPgError builds the API envelope from a PostgreSQL error, passing the
-// SQLSTATE through as the code and grading the HTTP status by the same rules
-// PostgREST applies (its Error module's pgErrorStatus). The well-known
-// constraint violations reuse dbrest's named constructors so their message and
-// status match the other backends; everything else carries the server's own
-// message with the status the SQLSTATE class implies.
+// SQLSTATE through as the code, the server's own message and detail and hint
+// verbatim, and the HTTP status graded by the same rules PostgREST applies (its
+// Error module's pgErrorStatus). PostgREST forwards PostgreSQL errors unchanged,
+// constraint name and "Key (col)=(val)" detail included, so the postgres backend
+// does too rather than rewriting them to a canonical text; the SQLSTATE class
+// alone fixes the status (a unique or foreign-key violation is 409, the rest of
+// class 23 is 400). The named constructors stay for the backends whose driver
+// reports a constraint without PostgreSQL's wording.
 func mapPgError(pg *pgconn.PgError) *pgerr.APIError {
-	switch pg.Code {
-	case "23505": // unique_violation
-		return withServerText(pgerr.ErrUniqueViolation(pg.Detail), pg)
-	case "23502": // not_null_violation
-		return withServerText(pgerr.ErrNotNullViolation(pg.Detail), pg)
-	case "23503": // foreign_key_violation
-		return withServerText(pgerr.ErrForeignKeyViolation(pg.Detail), pg)
-	case "23514": // check_violation
-		return withServerText(pgerr.ErrCheckViolation(pg.Detail), pg)
-	}
 	e := pgerr.New(statusForSQLState(pg.Code), pg.Code, pg.Message)
 	if pg.Detail != "" {
 		e = e.WithDetails(pg.Detail)
 	}
-	if pg.Hint != "" {
-		e = e.WithHint(pg.Hint)
-	}
-	return e
-}
-
-// withServerText keeps a named constructor's code and status but lets the
-// server's hint ride through when it carries one, so a constraint error still
-// reads like PostgREST's.
-func withServerText(e *pgerr.APIError, pg *pgconn.PgError) *pgerr.APIError {
 	if pg.Hint != "" {
 		e = e.WithHint(pg.Hint)
 	}

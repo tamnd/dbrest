@@ -38,6 +38,29 @@ func TestMapErrorConstraintViolations(t *testing.T) {
 	}
 }
 
+// PostgREST forwards a PostgreSQL constraint error's message and detail
+// verbatim, so an application reading the constraint name out of the message or
+// the offending key out of the detail still finds them. The postgres backend
+// passes both through unchanged rather than rewriting them to a canonical text.
+func TestMapErrorConstraintMessageVerbatim(t *testing.T) {
+	pg := &pgconn.PgError{
+		Code:    "23505",
+		Message: `duplicate key value violates unique constraint "films_pkey"`,
+		Detail:  "Key (id)=(1) already exists.",
+		Hint:    "use a different id",
+	}
+	got := mapPgError(pg)
+	if got.Message != pg.Message {
+		t.Errorf("Message = %q, want verbatim %q", got.Message, pg.Message)
+	}
+	if got.Details == nil || *got.Details != pg.Detail {
+		t.Errorf("Details = %v, want verbatim %q", got.Details, pg.Detail)
+	}
+	if got.Hint == nil || *got.Hint != pg.Hint {
+		t.Errorf("Hint = %v, want verbatim %q", got.Hint, pg.Hint)
+	}
+}
+
 func TestMapErrorPassthrough(t *testing.T) {
 	pg := &pgconn.PgError{Code: "42P01", Message: "relation does not exist", Hint: "check your schema"}
 	got := mapPgError(pg)

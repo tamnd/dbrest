@@ -168,14 +168,20 @@ func TestMapErrorNilAndNonDriver(t *testing.T) {
 func TestMapErrorConstraintCodes(t *testing.T) {
 	b := openConstraintDB(t)
 	cases := []struct {
-		name   string
-		exec   string
-		code   string
-		status int
+		name    string
+		exec    string
+		code    string
+		status  int
+		message string
 	}{
-		{"not-null", `INSERT INTO widgets (id, name) VALUES (1, NULL)`, pgerr.CodeNotNullViolation, 400},
-		{"check", `INSERT INTO widgets (id, name, qty) VALUES (2, 'a', -1)`, pgerr.CodeCheckViolation, 400},
-		{"foreign-key", `INSERT INTO parts (id, widget_id) VALUES (1, 999)`, pgerr.CodeForeignKeyViolation, 409},
+		{"not-null", `INSERT INTO widgets (id, name) VALUES (1, NULL)`,
+			pgerr.CodeNotNullViolation, 400,
+			`null value in column "name" of relation "widgets" violates not-null constraint`},
+		{"check", `INSERT INTO widgets (id, name, qty) VALUES (2, 'a', -1)`,
+			pgerr.CodeCheckViolation, 400, ""},
+		{"foreign-key", `INSERT INTO parts (id, widget_id) VALUES (1, 999)`,
+			pgerr.CodeForeignKeyViolation, 409,
+			"insert or update on table violates foreign key constraint"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -186,6 +192,14 @@ func TestMapErrorConstraintCodes(t *testing.T) {
 			api := b.MapError(err)
 			if api == nil || api.Code != c.code || api.HTTPStatus != c.status {
 				t.Fatalf("MapError = %#v, want %s/%d", api, c.code, c.status)
+			}
+			// The synthesized message is PostgreSQL's wording; the native SQLite
+			// text never leaks into details on any arm.
+			if c.message != "" && api.Message != c.message {
+				t.Errorf("message = %q, want %q", api.Message, c.message)
+			}
+			if api.Details != nil {
+				t.Errorf("details = %q, want no leaked native text", *api.Details)
 			}
 		})
 	}

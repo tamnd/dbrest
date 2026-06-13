@@ -121,13 +121,20 @@ func (b *Backend) MapError(err error) *pgerr.APIError {
 
 // mapSQLServerError builds the unified API error from a SQL Server error.
 func mapSQLServerError(me mssql.Error) *pgerr.APIError {
+	// Class-23 violations carry PostgreSQL's wording, not the native SQL Server
+	// text: the driver gives no constraint name or offending value in a form that
+	// reconstructs PG's message, so neither is invented and the native text is not
+	// leaked into details (an emulation limitation, documented in the spec).
 	switch me.Number {
 	case 2627, 2601: // unique constraint / unique index violation
-		return pgerr.ErrUniqueViolation(me.Message)
+		return pgerr.ErrConstraintViolation(pgerr.CodeUniqueViolation,
+			"duplicate key value violates unique constraint", "", "")
 	case 515: // cannot insert NULL
-		return pgerr.ErrNotNullViolation(me.Message)
+		return pgerr.ErrConstraintViolation(pgerr.CodeNotNullViolation,
+			"null value violates not-null constraint", "", "")
 	case 547: // FK constraint violation
-		return pgerr.ErrForeignKeyViolation(me.Message)
+		return pgerr.ErrConstraintViolation(pgerr.CodeForeignKeyViolation,
+			"insert or update on table violates foreign key constraint", "", "")
 	case 207: // invalid column name
 		return pgerr.New(400, "42703", me.Message)
 	case 208: // invalid object name (table not found)

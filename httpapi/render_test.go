@@ -137,7 +137,7 @@ func TestAsAPIError(t *testing.T) {
 
 	// Branch two: a raw engine error the backend recognizes becomes its mapping.
 	t.Run("backend-maps-it", func(t *testing.T) {
-		mapped := pgerr.ErrUniqueViolation("films_pkey")
+		mapped := pgerr.ErrConstraintViolation("23505", "duplicate key", "", "")
 		b := fakeBackend{mapErr: func(error) *pgerr.APIError { return mapped }}
 		if got := asAPIError(b, errors.New("duplicate key")); got != mapped {
 			t.Errorf("asAPIError = %#v, want the backend mapping %#v", got, mapped)

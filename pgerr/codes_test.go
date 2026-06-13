@@ -40,14 +40,10 @@ func TestConstructorStatusAndCode(t *testing.T) {
 		{"read-only-txn", ErrReadOnlyTransaction("UPDATE"), http.StatusMethodNotAllowed, CodeReadOnlyTransaction},
 		{"unsupported", ErrUnsupported("the sl operator", "mysql"), http.StatusBadRequest, CodeUnsupported},
 		{"fts-unavailable", ErrFullTextUnavailable("body", "sqlite"), http.StatusBadRequest, CodeUnsupported},
-		{"unique", ErrUniqueViolation("Key (id)=(1) already exists"), http.StatusConflict, CodeUniqueViolation},
 		{"constraint-unique", ErrConstraintViolation("23505", "m", "", ""), http.StatusConflict, CodeUniqueViolation},
 		{"constraint-fk", ErrConstraintViolation("23503", "m", "", ""), http.StatusConflict, CodeForeignKeyViolation},
 		{"constraint-not-null", ErrConstraintViolation("23502", "m", "", ""), http.StatusBadRequest, CodeNotNullViolation},
 		{"constraint-check", ErrConstraintViolation("23514", "m", "", ""), http.StatusBadRequest, CodeCheckViolation},
-		{"not-null", ErrNotNullViolation("column title"), http.StatusBadRequest, CodeNotNullViolation},
-		{"foreign-key", ErrForeignKeyViolation("Key (dir)=(9) is not present"), http.StatusConflict, CodeForeignKeyViolation},
-		{"check", ErrCheckViolation("rating must be positive"), http.StatusBadRequest, CodeCheckViolation},
 		{"invalid-input", ErrInvalidInput("integer", "abc"), http.StatusBadRequest, CodeInvalidText},
 		{"jwt-secret-missing", ErrJWTSecretMissing(), http.StatusInternalServerError, CodeJWTSecretMissing},
 		{"jwt-decode", ErrJWTDecode("JWT couldn't be decoded"), http.StatusUnauthorized, CodeJWTDecode},
@@ -109,7 +105,7 @@ func TestGradePrivilegeStatus(t *testing.T) {
 	if native.HTTPStatus != http.StatusUnauthorized {
 		t.Error("GradePrivilegeStatus mutated its argument")
 	}
-	other := ErrUniqueViolation("films_pkey")
+	other := ErrConstraintViolation("23505", "duplicate key", "", "")
 	if got := GradePrivilegeStatus(other, true); got != other {
 		t.Error("non-42501 errors must pass through unchanged")
 	}

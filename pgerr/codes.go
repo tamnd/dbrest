@@ -371,8 +371,9 @@ const (
 // already exists."). Clients parse both, so pgerr contributes only the status:
 // a key that conflicts with an existing row (23505, 23503) is a 409, the rest
 // of class 23 is a 400. Drivers whose engine reports structure instead of
-// PG-shaped text synthesize the message before calling this; the fixed-message
-// constructors below predate it and are being migrated.
+// PG-shaped text synthesize the message before calling this; an engine that
+// supplies neither a constraint name nor the offending value passes the bare
+// PostgreSQL wording with empty detail rather than leaking native text.
 func ErrConstraintViolation(sqlstate, message, detail, hint string) *APIError {
 	status := http.StatusBadRequest
 	if sqlstate == CodeUniqueViolation || sqlstate == CodeForeignKeyViolation {
@@ -386,33 +387,6 @@ func ErrConstraintViolation(sqlstate, message, detail, hint string) *APIError {
 		e = e.WithHint(hint)
 	}
 	return e
-}
-
-// ErrUniqueViolation is a duplicate-key conflict (PostgreSQL 23505). It
-// rewrites the message to a fixed canonical one, dropping the constraint name
-// clients parse; driver call sites are migrating to ErrConstraintViolation.
-func ErrUniqueViolation(detail string) *APIError {
-	return New(http.StatusConflict, CodeUniqueViolation,
-		"duplicate key value violates unique constraint").WithDetails(detail)
-}
-
-// ErrNotNullViolation is a NULL written to a NOT NULL column (23502).
-func ErrNotNullViolation(detail string) *APIError {
-	return New(http.StatusBadRequest, CodeNotNullViolation,
-		"null value violates not-null constraint").WithDetails(detail)
-}
-
-// ErrForeignKeyViolation is a reference to a row that does not exist (23503).
-func ErrForeignKeyViolation(detail string) *APIError {
-	return New(http.StatusConflict, CodeForeignKeyViolation,
-		"insert or update violates foreign key constraint").WithDetails(detail)
-}
-
-// ErrCheckViolation is a row that fails a CHECK constraint (23514). It is also
-// the fallback for any other integrity violation the backend cannot classify.
-func ErrCheckViolation(detail string) *APIError {
-	return New(http.StatusBadRequest, CodeCheckViolation,
-		"new row violates check constraint").WithDetails(detail)
 }
 
 // CodeInvalidText is PostgreSQL's invalid_text_representation: an operand or
