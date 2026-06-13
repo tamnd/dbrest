@@ -309,7 +309,15 @@ func (b *Backend) executeCallRead(ctx context.Context, plan *ir.Plan, rc *reqctx
 	res := &streamResult{ctx: ctx, tx: tx, controls: rc.Controls()}
 
 	if plan.Call.Count != ir.CountNone {
-		cst, apiErr := sqlgen.CompileCallCount(Dialect{}, plan.Call, plan.Func, sqlgen.ContextArgs(rc))
+		var (
+			cst    *sqlgen.Statement
+			apiErr *pgerr.APIError
+		)
+		if plan.Func != nil {
+			cst, apiErr = sqlgen.CompileCallCount(Dialect{}, plan.Call, plan.Func, sqlgen.ContextArgs(rc))
+		} else {
+			cst, apiErr = b.compileNativeCallCount(plan.Call)
+		}
 		if apiErr != nil {
 			rollback()
 			return nil, apiErr
@@ -364,6 +372,22 @@ func (b *Backend) compileNativeCall(c *ir.Call) (*sqlgen.Statement, *pgerr.APIEr
 	}
 	sb.WriteString(")")
 	return &sqlgen.Statement{SQL: sb.String()}, nil
+}
+
+// compileNativeCallCount wraps the native function call in a count, the exact-count
+// statement for a native RPC. There is no registry function to drive
+// sqlgen.CompileCallCount (plan.Func is nil), so the count is built here over the
+// same SELECT * FROM schema.fn(...) the row query runs; a scalar-returning function
+// yields its single row and counts as one, a setof yields its rows.
+func (b *Backend) compileNativeCallCount(c *ir.Call) (*sqlgen.Statement, *pgerr.APIError) {
+	inner, apiErr := b.compileNativeCall(c)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+	return &sqlgen.Statement{
+		SQL:  "SELECT count(*) FROM (" + inner.SQL + ") _rpc",
+		Args: inner.Args,
+	}, nil
 }
 
 // appendNativeArg writes one function argument as a safe SQL literal. Numbers

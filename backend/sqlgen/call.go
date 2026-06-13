@@ -23,6 +23,9 @@ import (
 // ContextArgs); a table return additionally wraps the result so post-filters
 // compile around it.
 func CompileCall(d Dialect, c *ir.Call, fn *rpc.Function, ctxArgs map[string]any) (*Statement, *pgerr.APIError) {
+	if fn == nil {
+		return nil, pgerr.ErrInternal("CompileCall requires a registry function; native calls compile in the backend")
+	}
 	if fn.Query == nil || strings.TrimSpace(fn.Query.SQL) == "" {
 		return nil, pgerr.ErrUnsupported("this function realization", "sql")
 	}
@@ -105,6 +108,12 @@ func CompileCall(d Dialect, c *ir.Call, fn *rpc.Function, ctxArgs map[string]any
 // does. It is only valid for a read-only function; a volatile function must not
 // run twice.
 func CompileCallCount(d Dialect, c *ir.Call, fn *rpc.Function, ctxArgs map[string]any) (*Statement, *pgerr.APIError) {
+	if fn == nil {
+		// A native (non-registry) call has no portable body to count; the backend
+		// must build its own count wrapper. Returning an error rather than
+		// dereferencing a nil function keeps a misrouted native call from panicking.
+		return nil, pgerr.ErrInternal("CompileCallCount requires a registry function; native calls count in the backend")
+	}
 	if fn.Query == nil || strings.TrimSpace(fn.Query.SQL) == "" {
 		return nil, pgerr.ErrUnsupported("this function realization", "sql")
 	}

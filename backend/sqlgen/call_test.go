@@ -196,6 +196,22 @@ func TestCompileCallCountNoRealizationUnsupported(t *testing.T) {
 	}
 }
 
+// A nil function (a misrouted native call) reports an error instead of
+// dereferencing the nil pointer, the regression behind the count=exact crash.
+func TestCompileCallCountNilFunctionErrors(t *testing.T) {
+	_, err := CompileCallCount(stub{}, &ir.Call{}, nil, nil)
+	if err == nil {
+		t.Fatal("want an error for a nil function, got nil")
+	}
+}
+
+func TestCompileCallNilFunctionErrors(t *testing.T) {
+	_, err := CompileCall(stub{}, &ir.Call{}, nil, nil)
+	if err == nil {
+		t.Fatal("want an error for a nil function, got nil")
+	}
+}
+
 // A placeholder that is not a declared parameter binds the reserved request-
 // context value, the emulated analog of current_setting('request.method').
 func TestCompileCallContextPlaceholder(t *testing.T) {
