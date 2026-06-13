@@ -230,7 +230,13 @@ var callReserved = map[string]bool{
 // arguments (with their JSON types) and the whole query string post-filters. The
 // planner resolves the function and checks volatility against the method. All
 // errors are PGRST1xx. See spec 12-rpc.
-func ParseCall(fn, rawQuery string, preferHeaders []string, isGet bool, contentType string, body []byte) (*Call, *pgerr.APIError) {
+//
+// rawBodyParam names the single parameter of an unnamed-argument function, when
+// the resolved name is one; for such a function the whole POST body is bound to
+// that parameter by Content-Type (rawBodyType is its declared type) rather than
+// decoded as a JSON object of named arguments. It is "" for the ordinary
+// named-argument form and on GET.
+func ParseCall(fn, rawQuery string, preferHeaders []string, isGet bool, contentType string, body []byte, rawBodyParam, rawBodyType string) (*Call, *pgerr.APIError) {
 	vals, err := url.ParseQuery(rawQuery)
 	if err != nil {
 		return nil, pgerr.ErrParse("could not parse query string")
@@ -269,7 +275,15 @@ func ParseCall(fn, rawQuery string, preferHeaders []string, isGet bool, contentT
 		if perr := parseQueryString(pq, vals); perr != nil {
 			return nil, perr
 		}
-		if len(body) > 0 {
+		if rawBodyParam != "" {
+			// Single-unnamed-parameter form: the whole body is the one argument,
+			// decoded by Content-Type rather than read as a named-argument object.
+			v, perr := bindRawBody(contentType, body, rawBodyType)
+			if perr != nil {
+				return nil, perr
+			}
+			args[rawBodyParam] = v
+		} else if len(body) > 0 {
 			obj, perr := decodeBodyObject(contentType, body)
 			if perr != nil {
 				return nil, perr
@@ -376,6 +390,37 @@ func decodeBodyObjects(contentType string, body []byte) ([]map[string]any, []str
 		return []map[string]any{obj}, nil, nil
 	default:
 		return nil, nil, pgerr.ErrUnsupportedMediaType(contentType)
+	}
+}
+
+// bindRawBody binds the whole request body to a single unnamed parameter,
+// decoded by Content-Type the way PostgREST routes a single-argument function:
+// application/json (or an empty type) carries any JSON value, object or array or
+// scalar; text/plain and text/xml carry the raw text; application/octet-stream
+// carries the raw bytes as text. A content type with no raw-body decoder is the
+// unsupported-media-type error, the same one the named-object path raises.
+func bindRawBody(contentType string, body []byte, declaredType string) (Value, *pgerr.APIError) {
+	ct := strings.ToLower(strings.TrimSpace(contentType))
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = strings.TrimSpace(ct[:i])
+	}
+	switch ct {
+	case "", "application/json":
+		dec := json.NewDecoder(bytes.NewReader(body))
+		dec.UseNumber()
+		var v any
+		if err := dec.Decode(&v); err != nil {
+			return Value{}, pgerr.ErrParse("request body must be valid JSON")
+		}
+		return Value{JSON: v}, nil
+	case "text/plain", "text/xml", "application/xml":
+		return Value{Text: string(body)}, nil
+	case "application/octet-stream":
+		// A bytea parameter receives the raw bytes; they ride as text here and the
+		// engine binds them, with exact bytea typing left to the types subsystem.
+		return Value{Text: string(body)}, nil
+	default:
+		return Value{}, pgerr.ErrUnsupportedMediaType(contentType)
 	}
 }
 

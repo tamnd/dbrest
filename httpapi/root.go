@@ -100,7 +100,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request, id identity,
 // switching and error mapping behave identically; only the response media
 // type differs, staying the root's openapi+json.
 func (s *Server) serveRootSpec(w http.ResponseWriter, r *http.Request, id identity, activeSchema string) {
-	call, apiErr := ir.ParseCall(s.rootSpec, "", nil, true, "", nil)
+	call, apiErr := ir.ParseCall(s.rootSpec, "", nil, true, "", nil, "", "")
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return

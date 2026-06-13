@@ -443,6 +443,85 @@ func TestRPCVoidReturns200Null(t *testing.T) {
 	}
 }
 
+// TestRPCSingleRawBodyTakesWholeBody pins the single-unnamed-parameter form: a
+// function with one raw-body parameter receives the entire POST body as that one
+// argument, decoded by Content-Type, rather than read as an object of named
+// arguments. A JSON array body would fail the named-object decode, so its
+// round-trip proves the raw-body path bound it whole.
+func TestRPCSingleRawBodyTakesWholeBody(t *testing.T) {
+	dsn := "file:" + strings.ReplaceAll(t.Name(), "/", "_") + "?mode=memory&cache=shared"
+	be, err := sqlite.Open(dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { be.Close() })
+	be.Register(rpc.NewStaticRegistry([]*rpc.Function{{
+		Name:       "echo_payload",
+		Params:     []rpc.Param{{Name: "payload", Type: "json", RawBody: true}},
+		Returns:    rpc.ReturnShape{Kind: rpc.ReturnScalar, Type: "json"},
+		Volatility: rpc.Immutable,
+		Query:      &rpc.PortableQuery{SQL: `SELECT :payload`},
+	}}))
+	model, err := be.Introspect(context.Background())
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+	srv := httpapi.NewServer(be, model, nil)
+	srv.SetDefaultRole("anon")
+
+	resp := send(t, srv, http.MethodPost, "/rpc/echo_payload", `[1,2,3]`, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var arr []json.Number
+	dec := json.NewDecoder(resp.Body)
+	dec.UseNumber()
+	if err := dec.Decode(&arr); err != nil {
+		t.Fatalf("the array body should round-trip whole: %v", err)
+	}
+	if len(arr) != 3 || arr[0].String() != "1" || arr[2].String() != "3" {
+		t.Errorf("body = %v, want [1 2 3]", arr)
+	}
+}
+
+// TestRPCSingleRawBodyText pins the text content type on the raw-body form: a
+// text/plain body binds to the lone parameter as text and echoes back.
+func TestRPCSingleRawBodyText(t *testing.T) {
+	dsn := "file:" + strings.ReplaceAll(t.Name(), "/", "_") + "?mode=memory&cache=shared"
+	be, err := sqlite.Open(dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { be.Close() })
+	be.Register(rpc.NewStaticRegistry([]*rpc.Function{{
+		Name:       "shout",
+		Params:     []rpc.Param{{Name: "line", Type: "text", RawBody: true}},
+		Returns:    rpc.ReturnShape{Kind: rpc.ReturnScalar, Type: "text"},
+		Volatility: rpc.Immutable,
+		Query:      &rpc.PortableQuery{SQL: `SELECT upper(:line)`},
+	}}))
+	model, err := be.Introspect(context.Background())
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+	srv := httpapi.NewServer(be, model, nil)
+	srv.SetDefaultRole("anon")
+
+	resp := send(t, srv, http.MethodPost, "/rpc/shout", `hello`, map[string]string{
+		"Content-Type": "text/plain",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var s string
+	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if s != "HELLO" {
+		t.Errorf("body = %q, want HELLO", s)
+	}
+}
+
 // The reserved :request_* placeholders give a registry function the request
 // context PostgreSQL functions read with current_setting (spec 15). The HTTP
 // surface matches PostgREST's GUC behavior on every engine.

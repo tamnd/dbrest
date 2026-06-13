@@ -20,6 +20,7 @@ import (
 	"github.com/tamnd/dbrest/pgerr"
 	"github.com/tamnd/dbrest/plan"
 	"github.com/tamnd/dbrest/reqctx"
+	"github.com/tamnd/dbrest/rpc"
 	"github.com/tamnd/dbrest/schema"
 )
 
@@ -467,7 +468,15 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 		body = b
 	}
 
-	call, apiErr := ir.ParseCall(fn, r.URL.RawQuery, r.Header.Values("Prefer"), isGet, r.Header.Get("Content-Type"), body)
+	// A portable function with a single unnamed parameter takes the whole POST
+	// body as that argument, decoded by Content-Type. The native path discovers
+	// its own signatures, so it leaves the unnamed binding to the engine.
+	rawBodyParam, rawBodyType := "", ""
+	if !isGet && !s.backend.Capabilities().NativeRPC {
+		rawBodyParam, rawBodyType = singleRawBodyParam(s.backend.Functions(), fn)
+	}
+
+	call, apiErr := ir.ParseCall(fn, r.URL.RawQuery, r.Header.Values("Prefer"), isGet, r.Header.Get("Content-Type"), body, rawBodyParam, rawBodyType)
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
@@ -507,6 +516,24 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 	}
 
 	s.writeCall(w, r, call, out, res.ResponseControls())
+}
+
+// singleRawBodyParam reports the parameter name and type of a function whose
+// signature is a single unnamed argument, the form that takes the whole POST
+// body as one value decoded by Content-Type. It scans every overload of the
+// name and returns the first single-raw-body match; an absent or multi-parameter
+// function yields empty strings, leaving the normal named-arguments path. See
+// spec 12-rpc and the PostgREST single-unnamed-parameter rule.
+func singleRawBodyParam(reg rpc.Registry, name string) (string, string) {
+	for _, fn := range reg.List() {
+		if fn.Name != name {
+			continue
+		}
+		if p, ok := fn.SingleRawBody(); ok {
+			return p.Name, p.Type
+		}
+	}
+	return "", ""
 }
 
 // writeCall writes a successful RPC response. The status is 200, or 206 when a

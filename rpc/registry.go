@@ -74,7 +74,24 @@ type Param struct {
 	Type     string // canonical type (spec 16)
 	Optional bool   // may be omitted; Default is bound in its place
 	Default  any    // value bound when an optional param is omitted (nil = NULL)
-	Variadic bool   // collects the trailing values (not yet lowered; see notes)
+	Variadic bool   // collects the trailing values into a list, expanded at lowering
+	// RawBody marks the single-unnamed-parameter form: PostgREST binds the whole
+	// raw request body to this parameter, decoded by Content-Type (a JSON value of
+	// any kind for application/json, raw text for text/plain and text/xml, raw
+	// bytes for application/octet-stream), rather than treating the body as a JSON
+	// object of named arguments. The parameter keeps a name so the SQL body can
+	// reference its placeholder.
+	RawBody bool
+}
+
+// SingleRawBody reports whether the function takes exactly one parameter bound
+// from the raw request body, the unnamed-argument form. Such a function receives
+// the whole body as that one argument regardless of the body's JSON shape.
+func (f *Function) SingleRawBody() (Param, bool) {
+	if len(f.Params) == 1 && f.Params[0].RawBody {
+		return f.Params[0], true
+	}
+	return Param{}, false
 }
 
 // Function is one callable function descriptor. Exactly one realization is set;
@@ -296,6 +313,7 @@ func ParseRegistry(rawJSON string) (*StaticRegistry, error) {
 		Optional bool   `json:"optional"`
 		Default  any    `json:"default"`
 		Variadic bool   `json:"variadic"`
+		RawBody  bool   `json:"rawBody"`
 	}
 	type returnDecl struct {
 		Kind    string `json:"kind"`
@@ -341,6 +359,7 @@ func ParseRegistry(rawJSON string) (*StaticRegistry, error) {
 				Optional: p.Optional,
 				Default:  p.Default,
 				Variadic: p.Variadic,
+				RawBody:  p.RawBody,
 			}
 		}
 		var ret ReturnShape

@@ -223,6 +223,45 @@ func TestParseRegistryVariadic(t *testing.T) {
 	}
 }
 
+// TestParseRegistryRawBody checks a "rawBody": true parameter decodes to a
+// raw-body param, and SingleRawBody recognizes a one-parameter function of that
+// shape as taking the whole POST body as its single unnamed argument.
+func TestParseRegistryRawBody(t *testing.T) {
+	reg, err := ParseRegistry(`[{
+		"name": "echo",
+		"sql": "select :payload",
+		"params": [{"name": "payload", "type": "json", "rawBody": true}],
+		"returns": {"kind": "scalar", "type": "json"}
+	}]`)
+	if err != nil {
+		t.Fatalf("ParseRegistry: %v", err)
+	}
+	f, ok := reg.Lookup("echo", ArgSet{"payload": true})
+	if !ok {
+		t.Fatal("echo not found")
+	}
+	if len(f.Params) != 1 || !f.Params[0].RawBody {
+		t.Errorf("params = %+v, want one raw-body param", f.Params)
+	}
+	p, ok := f.SingleRawBody()
+	if !ok || p.Name != "payload" || p.Type != "json" {
+		t.Errorf("SingleRawBody = %+v, %v", p, ok)
+	}
+}
+
+// TestSingleRawBodyRejectsMultiParam checks SingleRawBody only fires on a lone
+// parameter: a function with a raw-body parameter beside another is not the
+// single-unnamed-argument form.
+func TestSingleRawBodyRejectsMultiParam(t *testing.T) {
+	f := &Function{Name: "f", Params: []Param{
+		{Name: "payload", RawBody: true},
+		{Name: "tag"},
+	}}
+	if _, ok := f.SingleRawBody(); ok {
+		t.Error("a raw-body parameter beside another is not a single raw body")
+	}
+}
+
 // TestParseRegistryComment checks a declaration's comment field rides into the
 // Function, where the OpenAPI generator reads it.
 func TestParseRegistryComment(t *testing.T) {
