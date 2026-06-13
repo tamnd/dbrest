@@ -129,6 +129,81 @@ func (a *app) rebuildLocked() error {
 	return nil
 }
 
+// reloadAction is what a db-channel notification asks the server to do.
+type reloadAction int
+
+const (
+	reloadNone reloadAction = iota
+	reloadActionSchema
+	reloadActionConfig
+)
+
+// dbNotifyAction decodes a db-channel NOTIFY payload into a reload action,
+// implementing PostgREST's contract: an empty payload or "reload schema" reloads
+// the schema cache, "reload config" reloads the configuration, and any other
+// payload is ignored.
+func dbNotifyAction(payload string) reloadAction {
+	switch payload {
+	case "", "reload schema":
+		return reloadActionSchema
+	case "reload config":
+		return reloadActionConfig
+	default:
+		return reloadNone
+	}
+}
+
+// handleDBNotify applies the reload a db-channel payload asks for. Like the
+// signal handlers, a failed reload logs and keeps the previous state.
+func (a *app) handleDBNotify(payload string) {
+	switch dbNotifyAction(payload) {
+	case reloadActionSchema:
+		log.Printf("dbrest: db-channel notification, reloading the schema cache")
+		if err := a.reloadSchema(); err != nil {
+			log.Printf("dbrest: schema cache reload failed, keeping the old cache: %v", err)
+		}
+	case reloadActionConfig:
+		log.Printf("dbrest: db-channel notification, reloading the configuration")
+		if err := a.reloadConfig(os.Environ()); err != nil {
+			log.Printf("dbrest: config reload failed, keeping the old config: %v", err)
+		}
+	}
+}
+
+// watchDBChannel starts PostgREST's db-channel listener when db-channel-enabled
+// is set and the backend can listen. A NOTIFY drives reloads through
+// handleDBNotify; a reconnect refreshes the schema cache because notifications
+// sent while the listener was down are lost. A backend with no LISTEN support is
+// silently skipped, leaving signal-driven reloads in place.
+func (a *app) watchDBChannel(ctx context.Context) {
+	a.mu.Lock()
+	enabled := a.cfg.DBChannelEnabled
+	channel := a.cfg.DBChannel
+	a.mu.Unlock()
+	if !enabled {
+		return
+	}
+	l, ok := a.be.(backend.Listener)
+	if !ok {
+		log.Printf("dbrest: backend does not support db-channel; reloads are signal-driven only")
+		return
+	}
+	h := backend.ListenHandler{
+		OnNotify: a.handleDBNotify,
+		OnReconnect: func() {
+			log.Printf("dbrest: db-channel %q reconnected, reloading the schema cache", channel)
+			if err := a.reloadSchema(); err != nil {
+				log.Printf("dbrest: schema cache reload failed, keeping the old cache: %v", err)
+			}
+		},
+	}
+	go func() {
+		if err := l.Listen(ctx, channel, h); err != nil && ctx.Err() == nil {
+			log.Printf("dbrest: db-channel listener stopped: %v", err)
+		}
+	}()
+}
+
 // watchSignals installs the two reload signals. Reload failures log and keep
 // the previous state; they never terminate the process.
 func (a *app) watchSignals() {

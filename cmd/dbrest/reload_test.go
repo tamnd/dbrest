@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -130,6 +131,83 @@ func TestReloadConfigKeepsServingOnBadFile(t *testing.T) {
 	if got := status(t, a, "/films"); got != http.StatusOK {
 		t.Errorf("after failed reload: status = %d, want 200", got)
 	}
+}
+
+// TestDBNotifyAction covers PostgREST's db-channel payload contract: an empty
+// payload and "reload schema" both reload the schema cache, "reload config"
+// reloads the configuration, and anything else is ignored.
+func TestDBNotifyAction(t *testing.T) {
+	cases := []struct {
+		payload string
+		want    reloadAction
+	}{
+		{"", reloadActionSchema},
+		{"reload schema", reloadActionSchema},
+		{"reload config", reloadActionConfig},
+		{"reload everything", reloadNone},
+		{"RELOAD SCHEMA", reloadNone}, // case-sensitive, matching upstream
+		{" reload schema ", reloadNone},
+	}
+	for _, c := range cases {
+		if got := dbNotifyAction(c.payload); got != c.want {
+			t.Errorf("dbNotifyAction(%q) = %d, want %d", c.payload, got, c.want)
+		}
+	}
+}
+
+// TestHandleDBNotifyReloadsSchema is the db-channel schema path: a table created
+// after boot is 404 until a "reload schema" notification (and equally an empty
+// payload), then served, the same effect as SIGUSR1.
+func TestHandleDBNotifyReloadsSchema(t *testing.T) {
+	a := newApp(t, mustConfig(t, map[string]string{"db-anon-role": "web_anon"}))
+
+	if got := status(t, a, "/directors"); got != http.StatusNotFound {
+		t.Fatalf("before notify: status = %d, want 404", got)
+	}
+	if _, err := a.be.(*sqlite.Backend).DB().Exec(`CREATE TABLE directors (id INTEGER PRIMARY KEY, name TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	a.handleDBNotify("reload schema")
+	if got := status(t, a, "/directors"); got != http.StatusOK {
+		t.Errorf("after notify: status = %d, want 200", got)
+	}
+}
+
+// TestHandleDBNotifyReloadsConfig is the db-channel config path: a "reload
+// config" notification applies the reloadable subset, the same effect as
+// SIGUSR2.
+func TestHandleDBNotifyReloadsConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dbrest.conf")
+	write := func(body string) {
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(`db-uri = "x"` + "\n" + `db-anon-role = "web_anon"` + "\n")
+	cfg, err := config.Load(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := newApp(t, cfg)
+	a.cfgPath = path
+
+	write(`db-uri = "x"` + "\n" + `db-anon-role = "web_anon"` + "\n" + `db-max-rows = 1` + "\n")
+	a.handleDBNotify("reload config")
+
+	rec := httptest.NewRecorder()
+	a.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/films", nil))
+	if got := rec.Header().Get("Content-Range"); got != "0-0/*" {
+		t.Errorf("after notify: Content-Range = %q, want 0-0/* (max-rows applied)", got)
+	}
+}
+
+// TestWatchDBChannelSkipsBackendWithoutListener confirms a backend that cannot
+// LISTEN (sqlite) is skipped without blocking or panicking, leaving signal-only
+// reloads. The call returns immediately because no goroutine is spawned.
+func TestWatchDBChannelSkipsBackendWithoutListener(t *testing.T) {
+	a := newApp(t, mustConfig(t, map[string]string{"db-anon-role": "web_anon"}))
+	a.watchDBChannel(context.Background()) // sqlite has no Listener; must not block
 }
 
 // TestSchemaReloadFailureKeepsOldCache mirrors upstream: when re-introspection

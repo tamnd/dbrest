@@ -34,6 +34,7 @@ const defaultPoolMaxConns = 10
 // the function registry, and the search path applied to every request.
 type Backend struct {
 	pool            *pgxpool.Pool
+	connConfig      *pgx.ConnConfig // template for a dedicated LISTEN connection (db-channel)
 	version         Version
 	funcs           rpc.Registry
 	searchPath      []string
@@ -110,7 +111,7 @@ func OpenWith(dsn string, opts Options) (*Backend, error) {
 			loc = l
 		}
 	}
-	return &Backend{pool: pool, version: ParseVersion(ver), loc: loc}, nil
+	return &Backend{pool: pool, connConfig: cfg.ConnConfig.Copy(), version: ParseVersion(ver), loc: loc}, nil
 }
 
 // resolveExecMode picks the pool's default query exec mode. An explicit DSN

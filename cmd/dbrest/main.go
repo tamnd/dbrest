@@ -117,6 +117,7 @@ func run() error {
 		return fmt.Errorf("introspect: %w", err)
 	}
 	a.watchSignals()
+	a.watchDBChannel(context.Background())
 
 	if cfg.AdminEnabled() {
 		startAdmin(cfg, be, a, metrics)
