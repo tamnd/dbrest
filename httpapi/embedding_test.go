@@ -226,6 +226,12 @@ func TestEmbedNoRelationship(t *testing.T) {
 	if env["code"] != "PGRST200" {
 		t.Errorf("code = %v, want PGRST200", env["code"])
 	}
+	// The rendered body carries the searched-pair details, not a null (item 04.4).
+	details, _ := env["details"].(string)
+	want := "Searched for a foreign key relationship between 'films' and 'nonsense' in the schema 'public', but no matches were found."
+	if details != want {
+		t.Errorf("details = %q, want %q", details, want)
+	}
 }
 
 func TestEmbedColumnInCSV(t *testing.T) {

@@ -1,6 +1,8 @@
 package plan
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/tamnd/dbrest/ir"
@@ -65,6 +67,28 @@ func TestEmbedNoRelationshipIsPGRST200(t *testing.T) {
 	if err == nil || err.Code != "PGRST200" {
 		t.Fatalf("want PGRST200, got %v", err)
 	}
+	// PGRST200 names the searched pair in its details (item 04.4), so a client
+	// learns which relationship was looked for, not just that one was missing.
+	if err.Details == nil {
+		t.Fatal("PGRST200 details are nil, want the searched-pair sentence")
+	}
+	want := "Searched for a foreign key relationship between 'films' and 'ghosts'"
+	if !strings.Contains(*err.Details, want) || !strings.Contains(*err.Details, "but no matches were found.") {
+		t.Errorf("details = %q, want it to contain %q", *err.Details, want)
+	}
+}
+
+// A PGRST200 raised for a hinted embed echoes the hint in the details, so a
+// client sees the search was constrained by the hint it gave (item 04.4).
+func TestEmbedNoRelationshipWithHintEchoesHint(t *testing.T) {
+	m := embedModel()
+	_, err := readEmbed(t, m, "title,ghosts!nope(x)")
+	if err == nil || err.Code != "PGRST200" {
+		t.Fatalf("want PGRST200, got %v", err)
+	}
+	if err.Details == nil || !strings.Contains(*err.Details, "using the hint 'nope'") {
+		t.Errorf("details = %v, want it to echo the hint", err.Details)
+	}
 }
 
 func TestEmbedAmbiguousIsPGRST201(t *testing.T) {
@@ -76,6 +100,48 @@ func TestEmbedAmbiguousIsPGRST201(t *testing.T) {
 	// PostgREST returns 300 Multiple Choices for an ambiguous embed.
 	if err.HTTPStatus != 300 {
 		t.Errorf("status = %d, want 300", err.HTTPStatus)
+	}
+	// The details carry the candidate array a client reads to auto-disambiguate
+	// (item 04.4): one entry per surviving edge, each with its cardinality, the
+	// "parent with target" embedding, and the join-column relationship spelling.
+	if err.RawDetails == nil {
+		t.Fatal("PGRST201 details are nil, want the candidate array")
+	}
+	var cands []map[string]string
+	if uerr := json.Unmarshal(err.RawDetails, &cands); uerr != nil {
+		t.Fatalf("details is not a JSON array: %v: %s", uerr, err.RawDetails)
+	}
+	if len(cands) != 2 {
+		t.Fatalf("got %d candidates, want 2: %v", len(cands), cands)
+	}
+	byRel := map[string]map[string]string{}
+	for _, c := range cands {
+		byRel[c["relationship"]] = c
+	}
+	want := "films_director_id_fkey using films(director_id) and people(id)"
+	got, ok := byRel[want]
+	if !ok {
+		t.Fatalf("no candidate with relationship %q, got %v", want, cands)
+	}
+	if got["cardinality"] != "many-to-one" {
+		t.Errorf("cardinality = %q, want many-to-one", got["cardinality"])
+	}
+	if got["embedding"] != "films with people" {
+		t.Errorf("embedding = %q, want %q", got["embedding"], "films with people")
+	}
+	// The hint lists each disambiguated embed spelling and points at the details.
+	if err.Hint == nil {
+		t.Fatal("PGRST201 hint is nil, want the Try-changing list")
+	}
+	for _, frag := range []string{
+		"Try changing 'people' to one of the following:",
+		"'people!films_director_id_fkey'",
+		"'people!films_writer_id_fkey'",
+		"Find the desired relationship in the 'details' key.",
+	} {
+		if !strings.Contains(*err.Hint, frag) {
+			t.Errorf("hint = %q, missing %q", *err.Hint, frag)
+		}
 	}
 }
 

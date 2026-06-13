@@ -28,8 +28,8 @@ func TestConstructorStatusAndCode(t *testing.T) {
 		{"unknown-table", ErrUnknownTable("films"), http.StatusNotFound, CodeUnknownTable},
 		{"unknown-column", ErrUnknownColumn("titel", "films"), http.StatusBadRequest, CodeUnknownColumn},
 		{"undefined-column", ErrUndefinedColumn("todos.nope"), http.StatusBadRequest, CodeUndefinedColumn},
-		{"no-relationship", ErrNoRelationship("films", "actors"), http.StatusBadRequest, CodeNoRelationship},
-		{"ambiguous-embed", ErrAmbiguousEmbed("films", "actors"), http.StatusMultipleChoices, CodeAmbiguousEmbed},
+		{"no-relationship", ErrNoRelationship("films", "actors", "public", ""), http.StatusBadRequest, CodeNoRelationship},
+		{"ambiguous-embed", ErrAmbiguousEmbed("films", "actors", nil), http.StatusMultipleChoices, CodeAmbiguousEmbed},
 		{"no-function", ErrNoFunction("public", "add", []string{"a", "b"}, ""), http.StatusNotFound, CodeNoFunction},
 		{"ambiguous-function", ErrAmbiguousFunction([]string{"api.add(a => integer)", "api.add(a => text)"}), http.StatusMultipleChoices, CodeAmbiguousFunc},
 		{"invalid-path", ErrInvalidPath(), http.StatusNotFound, CodeInvalidPath},
@@ -294,6 +294,65 @@ func TestWithMessage(t *testing.T) {
 	if got.Message != "replaced" {
 		t.Errorf("message = %q, want replaced", got.Message)
 	}
+}
+
+// ErrNoRelationship names the searched pair and the schema in its details, and
+// the schema comes from the parent relation (item 04.4). A bare search reports
+// no hint; a hinted one echoes the hint clause before the schema.
+func TestNoRelationshipDetails(t *testing.T) {
+	bare := ErrNoRelationship("films", "directors", "public", "")
+	if bare.Details == nil {
+		t.Fatal("details are nil")
+	}
+	want := "Searched for a foreign key relationship between 'films' and 'directors' in the schema 'public', but no matches were found."
+	if *bare.Details != want {
+		t.Errorf("details = %q, want %q", *bare.Details, want)
+	}
+
+	hinted := ErrNoRelationship("films", "directors", "api", "fk_director")
+	wantHinted := "Searched for a foreign key relationship between 'films' and 'directors' using the hint 'fk_director' in the schema 'api', but no matches were found."
+	if hinted.Details == nil || *hinted.Details != wantHinted {
+		t.Errorf("hinted details = %v, want %q", hinted.Details, wantHinted)
+	}
+}
+
+// ErrAmbiguousEmbed renders the candidate array verbatim and a Try-changing hint
+// listing each candidate's disambiguated embed spelling (item 04.4). With no
+// candidates it degrades to message only rather than an empty array and hint.
+func TestAmbiguousEmbedDetailsAndHint(t *testing.T) {
+	cands := []EmbedCandidate{
+		{Cardinality: "many-to-one", Embedding: "films with people", Relationship: "films_director_id_fkey using films(director_id) and people(id)", Name: "films_director_id_fkey"},
+		{Cardinality: "many-to-one", Embedding: "films with people", Relationship: "films_writer_id_fkey using films(writer_id) and people(id)", Name: "films_writer_id_fkey"},
+	}
+	e := ErrAmbiguousEmbed("films", "people", cands)
+	if e.RawDetails == nil {
+		t.Fatal("details are nil, want the candidate array")
+	}
+	var got []EmbedCandidate
+	if err := json.Unmarshal(e.RawDetails, &got); err != nil {
+		t.Fatalf("details not an array: %v", err)
+	}
+	if len(got) != 2 || got[0].Cardinality != "many-to-one" {
+		t.Errorf("candidates = %v", got)
+	}
+	// Name is carried for the hint, not the details body.
+	if bytesHasName := json.RawMessage(e.RawDetails); jsonContains(bytesHasName, `"name"`) {
+		t.Error("details array leaked the unexported name key")
+	}
+	wantHint := "Try changing 'people' to one of the following: 'people!films_director_id_fkey', 'people!films_writer_id_fkey'. Find the desired relationship in the 'details' key."
+	if e.Hint == nil || *e.Hint != wantHint {
+		t.Errorf("hint = %v, want %q", e.Hint, wantHint)
+	}
+
+	if bare := ErrAmbiguousEmbed("films", "people", nil); bare.RawDetails != nil || bare.Hint != nil {
+		t.Errorf("no-candidate ambiguous embed should be message only, got details=%s hint=%v", bare.RawDetails, bare.Hint)
+	}
+}
+
+// jsonContains reports whether raw JSON bytes contain the literal substring,
+// used to assert the details array does not serialize the candidate name key.
+func jsonContains(raw json.RawMessage, sub string) bool {
+	return strings.Contains(string(raw), sub)
 }
 
 // JSON rendering is on the error path of every failed request, so it carries its

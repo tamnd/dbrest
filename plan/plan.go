@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/tamnd/dbrest/ir"
 	"github.com/tamnd/dbrest/pgerr"
@@ -116,7 +117,7 @@ func resolveEmbeds(model *schema.Model, parent *schema.Relation, q *ir.Query, se
 func resolveOne(model *schema.Model, parent *schema.Relation, emb *ir.Embed, searchPath []string) (*schema.Relationship, *pgerr.APIError) {
 	cands, found := model.Relationships(parent, emb.Target.Name, searchPath)
 	if !found || len(cands) == 0 {
-		return nil, pgerr.ErrNoRelationship(parent.Name, emb.Target.Name)
+		return nil, pgerr.ErrNoRelationship(parent.Name, emb.Target.Name, searchSchema(searchPath), emb.Hint)
 	}
 	if emb.Hint != "" {
 		filtered := cands[:0:0]
@@ -129,13 +130,33 @@ func resolveOne(model *schema.Model, parent *schema.Relation, emb *ir.Embed, sea
 	}
 	switch len(cands) {
 	case 0:
-		return nil, pgerr.ErrNoRelationship(parent.Name, emb.Target.Name)
+		return nil, pgerr.ErrNoRelationship(parent.Name, emb.Target.Name, searchSchema(searchPath), emb.Hint)
 	case 1:
 		c := cands[0]
 		return &c, nil
 	default:
-		return nil, pgerr.ErrAmbiguousEmbed(parent.Name, emb.Target.Name)
+		return nil, pgerr.ErrAmbiguousEmbed(parent.Name, emb.Target.Name, embedCandidates(parent, cands))
 	}
+}
+
+// embedCandidates renders the surviving relationships into the PGRST201 details
+// entries: each carries its four-way cardinality, the "parent with target"
+// embedding, and the "name using parent(cols) and target(cols)" relationship
+// spelling PostgREST reports. A many-to-many edge spells its end columns the same
+// way; the cardinality field marks it as the junction case.
+func embedCandidates(parent *schema.Relation, cands []schema.Relationship) []pgerr.EmbedCandidate {
+	out := make([]pgerr.EmbedCandidate, len(cands))
+	for i, c := range cands {
+		out[i] = pgerr.EmbedCandidate{
+			Cardinality: c.Cardinality,
+			Embedding:   parent.Name + " with " + c.Target.Name,
+			Relationship: fmt.Sprintf("%s using %s(%s) and %s(%s)",
+				c.Name, parent.Name, strings.Join(c.Local, ", "),
+				c.Target.Name, strings.Join(c.Foreign, ", ")),
+			Name: c.Name,
+		}
+	}
+	return out
 }
 
 // toCardinality maps the schema cardinality to the IR's.
@@ -395,6 +416,19 @@ func returnRelation(model *schema.Model, fn *rpc.Function, searchPath []string) 
 	}
 }
 
+// searchSchema is the schema a relationship search names in its PGRST200 details:
+// the exposed schema the request resolved to, which PostgREST reports there. It
+// is the first entry of the active search path, normalized to public when that is
+// empty. A backend with no schema namespace (SQLite) resolves to the empty
+// schema, but PostgREST always names a schema in this sentence, so the wire form
+// reports public rather than an empty-quoted gap.
+func searchSchema(searchPath []string) string {
+	if len(searchPath) > 0 && searchPath[0] != "" {
+		return searchPath[0]
+	}
+	return "public"
+}
+
 // resolveCallEmbeds binds an RPC call's embeds against the function's result
 // relation. It mirrors the read path by projecting the call's select/where/order
 // onto a synthetic query over that relation, so resolveEmbeds, the embed-filter
@@ -405,7 +439,7 @@ func returnRelation(model *schema.Model, fn *rpc.Function, searchPath []string) 
 func resolveCallEmbeds(model *schema.Model, fn *rpc.Function, c *ir.Call, searchPath []string) *pgerr.APIError {
 	retRel, ok := returnRelation(model, fn, searchPath)
 	if !ok {
-		return pgerr.ErrNoRelationship(fn.Name, c.Embeds[0].Target.Name)
+		return pgerr.ErrNoRelationship(fn.Name, c.Embeds[0].Target.Name, searchSchema(searchPath), c.Embeds[0].Hint)
 	}
 	q := &ir.Query{
 		Kind:     ir.Read,

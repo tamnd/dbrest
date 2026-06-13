@@ -142,18 +142,54 @@ func ErrUndefinedColumn(column string) *APIError {
 
 // ErrNoRelationship is raised when an embed names a resource the schema model
 // has no relationship to (no foreign key connects them, and none is declared).
-// It is PostgREST's PGRST200 with a 400.
-func ErrNoRelationship(parent, target string) *APIError {
-	return New(http.StatusBadRequest, CodeNoRelationship,
+// It is PostgREST's PGRST200 with a 400. The details name the searched pair and
+// the schema the search ran in, matching the sentence PostgREST returns so a
+// client sees why the embed failed and not just that it did. schemaName is the
+// parent's schema; embedHint, when non-empty, is the disambiguation hint the
+// request gave (after the `!`), which the details echo.
+func ErrNoRelationship(parent, target, schemaName, embedHint string) *APIError {
+	e := New(http.StatusBadRequest, CodeNoRelationship,
 		fmt.Sprintf("Could not find a relationship between '%s' and '%s' in the schema cache", parent, target))
+	hintClause := ""
+	if embedHint != "" {
+		hintClause = fmt.Sprintf(" using the hint '%s'", embedHint)
+	}
+	return e.WithDetails(fmt.Sprintf(
+		"Searched for a foreign key relationship between '%s' and '%s'%s in the schema '%s', but no matches were found.",
+		parent, target, hintClause, schemaName))
+}
+
+// EmbedCandidate is one relationship that connects a parent and an embedded
+// resource, rendered into a PGRST201 details entry. Cardinality, Embedding, and
+// Relationship are the three keys PostgREST serializes; Name is the edge name a
+// client uses to disambiguate (target!name) and is carried for the hint, not the
+// details body.
+type EmbedCandidate struct {
+	Cardinality  string `json:"cardinality"`
+	Embedding    string `json:"embedding"`
+	Relationship string `json:"relationship"`
+	Name         string `json:"-"`
 }
 
 // ErrAmbiguousEmbed is raised when more than one relationship connects the
 // parent and the embedded resource and no hint disambiguates. It is PostgREST's
-// PGRST201 with a 300 Multiple Choices.
-func ErrAmbiguousEmbed(parent, target string) *APIError {
-	return New(http.StatusMultipleChoices, CodeAmbiguousEmbed,
+// PGRST201 with a 300 Multiple Choices. The details carry the candidate array
+// clients read to auto-disambiguate, and the hint lists the disambiguated embed
+// spellings (target!name) to try, pointing at the details for the full set.
+func ErrAmbiguousEmbed(parent, target string, cands []EmbedCandidate) *APIError {
+	e := New(http.StatusMultipleChoices, CodeAmbiguousEmbed,
 		fmt.Sprintf("Could not embed because more than one relationship was found for '%s' and '%s'", parent, target))
+	if len(cands) == 0 {
+		return e
+	}
+	e = e.WithDetailsJSON(cands)
+	spellings := make([]string, len(cands))
+	for i, c := range cands {
+		spellings[i] = fmt.Sprintf("'%s!%s'", target, c.Name)
+	}
+	return e.WithHint(fmt.Sprintf(
+		"Try changing '%s' to one of the following: %s. Find the desired relationship in the 'details' key.",
+		target, strings.Join(spellings, ", ")))
 }
 
 // ErrRelatedOrderNotEmbedded is raised when an order=rel(col) term names a

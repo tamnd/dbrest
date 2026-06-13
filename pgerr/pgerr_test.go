@@ -54,7 +54,7 @@ func TestDetailsCanCarryNonStringJSON(t *testing.T) {
 		"embedding":    "orders with addresses",
 		"relationship": "billing using orders(billing_address_id) and addresses(id)",
 	}}
-	base := ErrAmbiguousEmbed("orders", "addresses")
+	base := ErrAmbiguousEmbed("orders", "addresses", nil)
 	e := base.WithDetailsJSON(candidates)
 	if base.RawDetails != nil {
 		t.Error("WithDetailsJSON mutated the receiver")

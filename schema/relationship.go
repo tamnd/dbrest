@@ -67,6 +67,14 @@ type Relationship struct {
 	JLocal   []string
 	JForeign []string
 
+	// Cardinality is the four-way spelling PostgREST reports in a PGRST201 details
+	// array ("many-to-one", "one-to-one", "one-to-many", "many-to-many"), derived
+	// the way upstream derives it: a forward foreign key is many-to-one, or
+	// one-to-one when its columns are unique on the parent; a backward foreign key
+	// is one-to-many, or one-to-one when unique on the target; a junction edge is
+	// many-to-many. Card stays the planner's two-way join shape.
+	Cardinality string
+
 	// hints is the set of names a disambiguation hint may match: the edge name
 	// and each participating column. Matched case-sensitively, like PostgREST.
 	hints []string
@@ -96,13 +104,18 @@ func (m *Model) Relationships(parent *Relation, targetName string, searchPath []
 	// Forward: a foreign key on the parent pointing at the target is to-one.
 	for _, fk := range parent.ForeignKeys {
 		if fk.references(target) {
+			card := "many-to-one"
+			if isUnique(parent, fk.Columns) {
+				card = "one-to-one"
+			}
 			out = append(out, Relationship{
-				Name:    fk.Name,
-				Card:    CardToOne,
-				Target:  target,
-				Local:   fk.Columns,
-				Foreign: fk.RefColumns,
-				hints:   fk.hintNames(),
+				Name:        fk.Name,
+				Card:        CardToOne,
+				Cardinality: card,
+				Target:      target,
+				Local:       fk.Columns,
+				Foreign:     fk.RefColumns,
+				hints:       fk.hintNames(),
 			})
 		}
 	}
@@ -114,16 +127,19 @@ func (m *Model) Relationships(parent *Relation, targetName string, searchPath []
 	for _, fk := range target.ForeignKeys {
 		if fk.references(parent) {
 			card := CardToMany
+			cardinality := "one-to-many"
 			if isUnique(target, fk.Columns) {
 				card = CardToOne
+				cardinality = "one-to-one"
 			}
 			out = append(out, Relationship{
-				Name:    fk.Name,
-				Card:    card,
-				Target:  target,
-				Local:   fk.RefColumns,
-				Foreign: fk.Columns,
-				hints:   fk.hintNames(),
+				Name:        fk.Name,
+				Card:        card,
+				Cardinality: cardinality,
+				Target:      target,
+				Local:       fk.RefColumns,
+				Foreign:     fk.Columns,
+				hints:       fk.hintNames(),
 			})
 		}
 	}
@@ -142,15 +158,16 @@ func (m *Model) Relationships(parent *Relation, targetName string, searchPath []
 					continue // a self-to-self junction needs two distinct keys
 				}
 				out = append(out, Relationship{
-					Name:     j.Name,
-					Card:     CardToMany,
-					Target:   target,
-					Local:    toParent.RefColumns,
-					Foreign:  toTarget.RefColumns,
-					Junction: j,
-					JLocal:   toParent.Columns,
-					JForeign: toTarget.Columns,
-					hints:    junctionHints(j, toTarget),
+					Name:        j.Name,
+					Card:        CardToMany,
+					Cardinality: "many-to-many",
+					Target:      target,
+					Local:       toParent.RefColumns,
+					Foreign:     toTarget.RefColumns,
+					Junction:    j,
+					JLocal:      toParent.Columns,
+					JForeign:    toTarget.Columns,
+					hints:       junctionHints(j, toTarget),
 				})
 			}
 		}
@@ -192,12 +209,13 @@ func (m *Model) declaredEdges(parent, target *Relation) []Relationship {
 			continue
 		}
 		rel := Relationship{
-			Name:    d.Name,
-			Card:    d.Card,
-			Target:  target,
-			Local:   d.Local,
-			Foreign: d.Foreign,
-			hints:   append([]string{d.Name}, d.Hints...),
+			Name:        d.Name,
+			Card:        d.Card,
+			Cardinality: declaredCardinality(d.Card),
+			Target:      target,
+			Local:       d.Local,
+			Foreign:     d.Foreign,
+			hints:       append([]string{d.Name}, d.Hints...),
 		}
 		if d.JunctionName != "" {
 			j, ok := m.Lookup(d.JunctionName, junctionPath(d.JunctionSchema))
@@ -207,6 +225,7 @@ func (m *Model) declaredEdges(parent, target *Relation) []Relationship {
 			rel.Junction = j
 			rel.JLocal = d.JLocal
 			rel.JForeign = d.JForeign
+			rel.Cardinality = "many-to-many"
 		}
 		out = append(out, rel)
 	}
@@ -244,6 +263,17 @@ type DeclaredRel struct {
 	// Hints are extra names a disambiguation hint may match, beyond the edge name
 	// (the participating column names a computed relationship wants hintable).
 	Hints []string
+}
+
+// declaredCardinality spells a declared edge's two-way Card as the PGRST201
+// four-way cardinality. A declared edge carries no parent-side uniqueness or
+// direction, so a to-one edge reads as many-to-one and a to-many edge as
+// one-to-many; a junction edge is set to many-to-many by the caller.
+func declaredCardinality(c Card) string {
+	if c == CardToMany {
+		return "one-to-many"
+	}
+	return "many-to-one"
 }
 
 // isUnique reports whether cols (as a set) is the relation's primary key or one
