@@ -660,6 +660,104 @@ func keysOf(m map[string]json.RawMessage) []string {
 	return ks
 }
 
+// TestIntegrationComputedFields covers finding 03-P11 (computed fields): a
+// function taking a relation's row type and returning a scalar is introspected as
+// a virtual column the planner accepts in select, filter, and order, and the
+// compiler renders as a function call on the row. Before the fix introspection
+// read nothing from pg_proc for relations, so a computed-field select 400'd as an
+// unknown column.
+func TestIntegrationComputedFields(t *testing.T) {
+	be := openBE(t)
+	be.SetSchemas([]string{"_p11cf"})
+	ctx := context.Background()
+
+	if _, err := be.Pool().Exec(ctx, `
+		DROP SCHEMA IF EXISTS _p11cf CASCADE;
+		CREATE SCHEMA _p11cf;
+		CREATE TABLE _p11cf.authors (id int PRIMARY KEY, first_name text, last_name text);
+		INSERT INTO _p11cf.authors VALUES (1,'Ada','Lovelace'), (2,'Alan','Turing');
+		-- computed field: a scalar function of the row, same schema as the table.
+		CREATE FUNCTION _p11cf.full_name(a _p11cf.authors) RETURNS text
+			LANGUAGE sql STABLE AS $$ SELECT a.first_name || ' ' || a.last_name $$;
+		-- a set-returning function over the same row type is a computed relationship,
+		-- not a field; it must not show up among the computed fields.
+		CREATE TABLE _p11cf.books (id int PRIMARY KEY, author_id int, title text);
+		CREATE FUNCTION _p11cf.books(a _p11cf.authors) RETURNS SETOF _p11cf.books
+			LANGUAGE sql STABLE AS $$ SELECT * FROM _p11cf.books WHERE author_id = a.id $$`); err != nil {
+		t.Fatalf("seed schema: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, "DROP SCHEMA IF EXISTS _p11cf CASCADE")
+	})
+
+	model, err := be.Introspect(ctx)
+	if err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+	rel, ok := model.Lookup("authors", []string{"_p11cf"})
+	if !ok {
+		t.Fatal("authors relation not found")
+	}
+
+	// The scalar function is a computed field; the set-returning one is not.
+	if len(rel.Computed) != 1 {
+		t.Fatalf("computed fields = %d, want 1: %+v", len(rel.Computed), rel.Computed)
+	}
+	cf := rel.Computed[0]
+	if cf.Name != "full_name" || cf.FuncSchema != "_p11cf" || cf.Type != "text" {
+		t.Errorf("computed field = %+v, want {full_name _p11cf text}", cf)
+	}
+
+	// select=id,full_name with a filter and order on the computed field, the way a
+	// client uses one. The planner accepts all three references and the compiler
+	// renders the function call.
+	q := &ir.Query{
+		Kind:     ir.Read,
+		Relation: ir.Ref{Schema: "_p11cf", Name: "authors"},
+		Select: []ir.SelectItem{
+			ir.Column{Path: []string{"id"}},
+			ir.Column{Path: []string{"full_name"}},
+		},
+		Order: []ir.OrderTerm{{Path: []string{"full_name"}}},
+	}
+	var where ir.Cond = ir.Compare{
+		Path: []string{"full_name"}, Op: ir.OpEq, Value: ir.Value{Text: "Ada Lovelace"},
+	}
+	q.Where = &where
+
+	plan, perr := planpkg.Read(model, q, []string{"_p11cf"}, planpkg.Options{})
+	if perr != nil {
+		t.Fatalf("plan.Read: %v", perr)
+	}
+	if q.Computed["full_name"] != "_p11cf" {
+		t.Errorf("planner did not bind computed field, q.Computed = %v", q.Computed)
+	}
+
+	res, err := be.Execute(ctx, plan, &reqctx.Context{Method: "GET", Path: "/authors"})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	rs := res.Rows()
+	defer rs.Close()
+	var got []string
+	for rs.Next() {
+		vals, err := rs.Values()
+		if err != nil {
+			t.Fatalf("Values: %v", err)
+		}
+		if len(vals) != 2 {
+			t.Fatalf("columns = %d, want 2 (id, full_name)", len(vals))
+		}
+		got = append(got, fmt.Sprintf("%v", vals[1]))
+	}
+	if err := rs.Err(); err != nil {
+		t.Fatalf("row error: %v", err)
+	}
+	if len(got) != 1 || got[0] != "Ada Lovelace" {
+		t.Errorf("computed-field read = %v, want [Ada Lovelace]", got)
+	}
+}
+
 // TestIntegrationMergedRegistry covers finding 03-P13: a declared portable
 // registry on postgres is reachable and shares one document with the native
 // catalog. The merged registry (portable plus native, the exact composition the

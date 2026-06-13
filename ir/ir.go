@@ -70,6 +70,12 @@ type Query struct {
 	Prefer    PreferSet
 	FromRange bool // limit/offset came from the Range request header, not ?limit=
 	IsPut     bool // the request method was PUT, so PUT upsert validations apply
+	// Computed maps each of this relation's computed-field names to the schema of
+	// the function that backs it. The planner fills it from the resolved relation
+	// so the compiler can render a selected, filtered, or ordered computed field as
+	// a function call on the row instead of a bare column. Nil when the relation has
+	// no computed fields. Each embed carries its own map for its own relation.
+	Computed map[string]string
 }
 
 // Call is a /rpc/<fn> request.

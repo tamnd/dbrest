@@ -69,8 +69,25 @@ func Read(model *schema.Model, q *ir.Query, searchPath []string, opts Options) (
 	if err := validateRelatedOrder(rel, q); err != nil {
 		return nil, err
 	}
+	bindComputed(rel, q)
 
 	return &ir.Plan{Query: q, Rel: rel, ReadOnly: true}, nil
+}
+
+// bindComputed copies the relation's computed-field name-to-schema mapping onto
+// the query so the compiler can render a selected, filtered, or ordered computed
+// field as a function call on the row. It maps every computed field the relation
+// exposes, not only the referenced ones, which keeps it a single pass and costs
+// nothing for the common case of a relation with none (the map stays nil).
+func bindComputed(rel *schema.Relation, q *ir.Query) {
+	if len(rel.Computed) == 0 {
+		return
+	}
+	m := make(map[string]string, len(rel.Computed))
+	for i := range rel.Computed {
+		m[rel.Computed[i].Name] = rel.Computed[i].FuncSchema
+	}
+	q.Computed = m
 }
 
 // resolveEmbeds binds every embed of a query against the model: it finds the
@@ -107,6 +124,7 @@ func resolveEmbeds(model *schema.Model, parent *schema.Relation, q *ir.Query, se
 		if err := validateRelatedOrder(rel.Target, &emb.Query); err != nil {
 			return err
 		}
+		bindComputed(rel.Target, &emb.Query)
 	}
 	return nil
 }
@@ -938,8 +956,14 @@ func checkColumn(rel *schema.Relation, path []string) *pgerr.APIError {
 	if len(path) == 0 {
 		return nil
 	}
-	if !rel.HasColumn(path[0]) {
-		return pgerr.ErrUndefinedColumn(rel.Name + "." + path[0])
+	if rel.HasColumn(path[0]) {
+		return nil
 	}
-	return nil
+	// A computed field is a function-backed virtual column: it is selectable,
+	// filterable, and orderable wherever a real column is, so the name resolves
+	// here and the compiler renders it as a function call on the row.
+	if _, ok := rel.ComputedFieldFor(path[0]); ok {
+		return nil
+	}
+	return pgerr.ErrUndefinedColumn(rel.Name + "." + path[0])
 }

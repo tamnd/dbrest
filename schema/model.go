@@ -93,8 +93,26 @@ type Relation struct {
 	// model projects base-table foreign keys onto the view through it, so a view
 	// embeds the way the base table does (spec 09).
 	ViewColumns []ViewColumn
+	// Computed are the relation's computed fields: functions taking the relation's
+	// row type and returning a scalar, exposed as virtual columns the client can
+	// select, filter, and order by (PostgREST computed fields). The planner accepts
+	// their names where a real column is accepted and the compiler renders each as a
+	// function call on the row. Empty for engines or relations without any.
+	Computed []ComputedField
 
-	byName map[string]*Column
+	byName     map[string]*Column
+	byComputed map[string]*ComputedField
+}
+
+// ComputedField is a function-backed virtual column: a function taking the
+// relation's row type and returning a scalar. Name is the field as the client
+// selects it (the function name); FuncSchema is the schema the function lives in
+// (PostgREST requires it to match the relation's schema); Type is the canonical
+// return type, surfaced in OpenAPI and used for type-driven coercion.
+type ComputedField struct {
+	Name       string
+	FuncSchema string
+	Type       string
 }
 
 // ViewColumn records that a view's output column projects one base-relation
@@ -172,6 +190,10 @@ func (r *Relation) index() {
 	for _, c := range r.Columns {
 		r.byName[c.Name] = c
 	}
+	r.byComputed = make(map[string]*ComputedField, len(r.Computed))
+	for i := range r.Computed {
+		r.byComputed[r.Computed[i].Name] = &r.Computed[i]
+	}
 }
 
 // Column returns the named column and whether it exists.
@@ -184,6 +206,14 @@ func (r *Relation) Column(name string) (*Column, bool) {
 func (r *Relation) HasColumn(name string) bool {
 	_, ok := r.byName[name]
 	return ok
+}
+
+// ComputedFieldFor returns the named computed field and whether it exists. A
+// computed field is selectable, filterable, and orderable like a real column but
+// is backed by a function call rather than stored data.
+func (r *Relation) ComputedFieldFor(name string) (*ComputedField, bool) {
+	c, ok := r.byComputed[name]
+	return c, ok
 }
 
 // ColumnNames returns the column names in ordinal order. It is the whole-row

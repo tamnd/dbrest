@@ -52,6 +52,15 @@ type builder struct {
 	// ctxArgs are the reserved :request_* values an RPC body may bind when a
 	// placeholder is not a declared parameter; see ContextArgs.
 	ctxArgs map[string]any
+	// computed maps the current relation's computed-field names to the schema of
+	// the function backing each, so colRef can render a computed field as a function
+	// call on the row instead of a bare column. It is swapped alongside qual when
+	// descending into an embed, since each relation has its own computed fields.
+	// rootRow is the row reference passed to a computed-field function when no alias
+	// is in force (qual is empty): the unqualified base-relation name, which names
+	// the row of the single FROM relation. See spec 11 (computed fields).
+	computed map[string]string
+	rootRow  string
 }
 
 // newBuilder starts a builder with an empty output buffer.
@@ -82,10 +91,30 @@ func (b *builder) bind(v any) string {
 // colRef renders a column reference, qualified by the current table alias when
 // one is set (inside an embed subquery) and bare otherwise.
 func (b *builder) colRef(name string) string {
+	if sch, ok := b.computed[name]; ok {
+		// A computed field renders as schema.func(row): the row is the current alias
+		// inside an embed, or the bare relation name at the top level (qual empty).
+		rowArg := b.qual
+		if rowArg == "" {
+			rowArg = b.rootRow
+		}
+		return b.d.QuoteIdent(sch) + "." + b.d.QuoteIdent(name) + "(" + rowArg + ")"
+	}
 	if b.qual == "" {
 		return b.d.QuoteIdent(name)
 	}
 	return b.qual + "." + b.d.QuoteIdent(name)
+}
+
+// useRelation points the builder's computed-field rendering at one relation: the
+// name-to-schema map for its computed fields and the unqualified name to pass as
+// the row argument when no alias is in force. It returns the previous pair so a
+// caller descending into an embed can restore the parent's on the way out.
+func (b *builder) useRelation(computed map[string]string, relName string) (map[string]string, string) {
+	savedC, savedR := b.computed, b.rootRow
+	b.computed = computed
+	b.rootRow = b.d.QuoteIdent(relName)
+	return savedC, savedR
 }
 
 // CompileRead lowers a resolved read query to a row-returning SELECT. The result
@@ -120,6 +149,7 @@ func CompileReadCounted(d Dialect, q *ir.Query) (*Statement, *pgerr.APIError) {
 // can extract the total alongside the result rows.
 func compileReadPlain(d Dialect, q *ir.Query, withCount bool) (*Statement, *pgerr.APIError) {
 	b := newBuilder(d)
+	b.useRelation(q.Computed, q.Relation.Name)
 	b.sb.WriteString("SELECT ")
 
 	if err := b.writeSelect(q.Select); err != nil {
@@ -198,6 +228,7 @@ func CompileRowEstimateSource(d Dialect, q *ir.Query) (*Statement, *pgerr.APIErr
 // same set the windowed read applies so an exact count matches its body. The
 // caller has already written the SELECT list up to FROM.
 func (b *builder) writeCountFromAndPredicates(q *ir.Query) *pgerr.APIError {
+	b.useRelation(q.Computed, q.Relation.Name)
 	parent := b.qualify(q.Relation)
 	b.sb.WriteString(parent)
 
@@ -1034,16 +1065,19 @@ func (b *builder) relatedOrderExpr(t ir.OrderTerm, parentAlias string) (string, 
 
 	saved := b.qual
 	b.qual = alias
+	savedC, savedR := b.useRelation(emb.Query.Computed, rel.Target.Name)
 	col := b.colRef(t.Path[0])
 	if len(t.Path) > 1 {
 		frag, err := b.jsonPathExpr(col, t.Path[1:], t.Last)
 		if err != nil {
 			b.qual = saved
+			b.computed, b.rootRow = savedC, savedR
 			return "", err
 		}
 		col = frag
 	}
 	b.qual = saved
+	b.computed, b.rootRow = savedC, savedR
 
 	from := b.qualify(ir.Ref{Schema: rel.Target.Schema, Name: rel.Target.Name}) + " " + alias
 	cond := b.joinCond(alias, rel.Foreign, parentAlias, rel.Local)
