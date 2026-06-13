@@ -107,6 +107,19 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 	q := plan.Query
 	returning := returningCols(q, plan.Rel)
 
+	// An empty column set (POST with an empty array, PATCH with an empty object)
+	// is a no-op: nothing is compiled or run, the affected count is zero, and the
+	// representation is the empty array. The HTTP layer turns that into 201/[] for
+	// an insert and 204 or 200/[] for an update.
+	if backend.IsNoOpMutation(q) {
+		return &bufResult{
+			controls: rc.Controls(),
+			cols:     returning,
+			affected: 0,
+			hasAff:   true,
+		}, nil
+	}
+
 	// For upserts, append xmax to the RETURNING list so we can distinguish
 	// an INSERT from an ON CONFLICT UPDATE and set the 201/200 status correctly.
 	isUpsert := q.Kind == ir.Upsert

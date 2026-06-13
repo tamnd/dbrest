@@ -104,6 +104,19 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 	q := plan.Query
 	returning := returningCols(q, plan.Rel)
 
+	// An empty column set (POST with an empty array, PATCH with an empty object)
+	// is a no-op: nothing is compiled or run, the affected count is zero, and the
+	// representation is the empty array. The HTTP layer turns that into 201/[] for
+	// an insert and 204 or 200/[] for an update.
+	if backend.IsNoOpMutation(q) {
+		return &writeResult{
+			controls: rc.Controls(),
+			cols:     returning,
+			affected: 0,
+			hasAff:   true,
+		}, nil
+	}
+
 	tx, err := b.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, b.MapError(err)

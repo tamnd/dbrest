@@ -7,6 +7,26 @@ import (
 	"github.com/tamnd/dbrest/ir"
 )
 
+// IsNoOpMutation reports whether a write resolves to an empty column set that
+// PostgREST treats as a zero-row no-op rather than an error. A POST with an empty
+// array body (no rows) and a PATCH with an empty object body (no assignments) both
+// touch nothing: the mutation runs against no data, the affected count is zero, and
+// the representation is the empty array. Upsert/PUT and DELETE are excluded; an
+// empty PUT body is a distinct shape, and DELETE carries no payload to be empty.
+func IsNoOpMutation(q *ir.Query) bool {
+	if q == nil || q.Write == nil {
+		return false
+	}
+	switch q.Kind {
+	case ir.Insert:
+		return len(q.Write.Rows) == 0
+	case ir.Update:
+		return len(q.Write.Set) == 0
+	default:
+		return false
+	}
+}
+
 // ShapeWriteRepresentation orders and paginates the rows a mutation returns for
 // its representation. PostgREST v13 dropped limited update/delete (#3013), so
 // order, limit and offset never bound the mutation itself: every matching row

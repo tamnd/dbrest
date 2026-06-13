@@ -53,6 +53,42 @@ func TestExecuteUpdateRepresentationOrderedLimited(t *testing.T) {
 	}
 }
 
+// 07.12: a no-op mutation (an insert with no rows, an update with no column
+// assignments) short-circuits before any SQL runs. The affected count is zero,
+// the representation is empty, and the table is untouched.
+func TestExecuteNoOpInsertRunsNoSQL(t *testing.T) {
+	b := openSeeded(t)
+	res := execWrite(t, b, &ir.Query{
+		Kind:     ir.Insert,
+		Relation: ir.Ref{Name: "films"},
+		Write:    &ir.WriteSpec{Return: ir.ReturnRepresentation, Rows: nil},
+	})
+	if n, ok := res.Affected(); !ok || n != 0 {
+		t.Errorf("Affected = %d,%v want 0,true", n, ok)
+	}
+	if rows := readAll(t, res); len(rows) != 0 {
+		t.Errorf("body rows = %d, want 0", len(rows))
+	}
+	if all := execRead(t, b, &ir.Query{Relation: ir.Ref{Name: "films"}}); len(all) != 4 {
+		t.Errorf("row count = %d, want 4 (nothing inserted)", len(all))
+	}
+}
+
+func TestExecuteNoOpUpdateRunsNoSQL(t *testing.T) {
+	b := openSeeded(t)
+	res := execWrite(t, b, &ir.Query{
+		Kind:     ir.Update,
+		Relation: ir.Ref{Name: "films"},
+		Write:    &ir.WriteSpec{Return: ir.ReturnRepresentation, Set: map[string]ir.Value{}},
+	})
+	if n, ok := res.Affected(); !ok || n != 0 {
+		t.Errorf("Affected = %d,%v want 0,true", n, ok)
+	}
+	if rows := readAll(t, res); len(rows) != 0 {
+		t.Errorf("body rows = %d, want 0", len(rows))
+	}
+}
+
 // offset on a delete representation skips rows in the returned body while still
 // deleting every matching row.
 func TestExecuteDeleteRepresentationOffset(t *testing.T) {

@@ -23,6 +23,18 @@ func (b *Backend) Execute(ctx context.Context, plan *ir.Plan, rc *reqctx.Context
 	if plan.Query == nil {
 		return nil, pgerr.ErrUnsupported("this operation", backendName)
 	}
+	// An empty column set (POST with an empty array, PATCH with an empty object)
+	// is a no-op: nothing is written, the affected count is zero, and the
+	// representation is the empty array. MongoDB rejects an empty $set anyway, so
+	// the short-circuit also keeps the update path from issuing an invalid op.
+	if backend.IsNoOpMutation(plan.Query) {
+		return &bodyResult{
+			controls: rc.Controls(),
+			rows:     newDocRowStream(nil),
+			affected: 0,
+			hasAff:   true,
+		}, nil
+	}
 	switch plan.Query.Kind {
 	case ir.Read:
 		return b.executeRead(ctx, plan, rc)

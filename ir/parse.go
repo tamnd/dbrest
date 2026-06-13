@@ -450,11 +450,27 @@ func decodeBodyObject(contentType string, body []byte) (map[string]any, *pgerr.A
 	case fmtJSON:
 		dec := json.NewDecoder(bytes.NewReader(body))
 		dec.UseNumber()
-		var obj map[string]any
-		if err := dec.Decode(&obj); err != nil {
+		var raw any
+		if err := dec.Decode(&raw); err != nil {
 			return nil, pgerr.ErrParse("update body must be a JSON object")
 		}
-		return obj, nil
+		switch v := raw.(type) {
+		case map[string]any:
+			return v, nil
+		case []any:
+			// PostgREST accepts the empty-array forms [] and [{}] for PATCH as a
+			// no-op update (an empty column set). An array carrying a non-empty
+			// object is not a shape upstream defines for update, so it stays a 400.
+			for _, e := range v {
+				obj, ok := e.(map[string]any)
+				if !ok || len(obj) > 0 {
+					return nil, pgerr.ErrParse("update body must be a JSON object")
+				}
+			}
+			return map[string]any{}, nil
+		default:
+			return nil, pgerr.ErrParse("update body must be a JSON object")
+		}
 	case fmtCSV:
 		objs, _, perr := decodeCSVObjects(body)
 		if perr != nil {
