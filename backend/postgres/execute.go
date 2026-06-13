@@ -399,6 +399,9 @@ func returningCols(q *ir.Query, rel *schema.Relation) []string {
 		return nil
 	}
 	if q.Write != nil && q.Write.Return == ir.ReturnRepresentation {
+		if cols := q.ProjectedColumns(); cols != nil {
+			return cols
+		}
 		return rel.ColumnNames()
 	}
 	if q.Kind == ir.Insert || q.Kind == ir.Upsert {

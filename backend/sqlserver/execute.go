@@ -602,6 +602,9 @@ func injectBeforeWhere(sqlStr, fragment string) string {
 // returningCols decides which columns to read back after a write.
 func returningCols(q *ir.Query, rel *schema.Relation) []string {
 	if q.Write != nil && q.Write.Return == ir.ReturnRepresentation {
+		if cols := q.ProjectedColumns(); cols != nil {
+			return cols
+		}
 		return rel.ColumnNames()
 	}
 	if q.Kind == ir.Insert || q.Kind == ir.Upsert {

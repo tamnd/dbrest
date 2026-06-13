@@ -221,3 +221,38 @@ func TestParseEmbedScopedParam(t *testing.T) {
 		t.Errorf("embed Order = %+v, want name desc", emb.Order)
 	}
 }
+
+// TestProjectedColumns covers the write-representation column projection helper
+// (item 01.19): a plain base-column select narrows the returning set, while any
+// shape the bare RETURNING path cannot reshape falls back to all columns (nil).
+func TestProjectedColumns(t *testing.T) {
+	col := func(name string) SelectItem { return Column{Path: []string{name}} }
+	cases := []struct {
+		name string
+		q    Query
+		want []string
+	}{
+		{"plain list", Query{Select: []SelectItem{col("id"), col("title")}}, []string{"id", "title"}},
+		{"dedup", Query{Select: []SelectItem{col("id"), col("id")}}, []string{"id"}},
+		{"empty select", Query{}, nil},
+		{"star", Query{Select: []SelectItem{Column{Path: []string{"*"}}}}, nil},
+		{"alias falls back", Query{Select: []SelectItem{Column{Path: []string{"title"}, Alias: "t"}}}, nil},
+		{"cast falls back", Query{Select: []SelectItem{Column{Path: []string{"id"}, Cast: "text"}}}, nil},
+		{"json path falls back", Query{Select: []SelectItem{Column{Path: []string{"data", "k"}, Last: JSONArrow2}}}, nil},
+		{"aggregate falls back", Query{Select: []SelectItem{Aggregate{Func: AggCount}}}, nil},
+		{"embed present falls back", Query{Select: []SelectItem{col("id")}, Embeds: []Embed{{}}}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.q.ProjectedColumns()
+			if len(got) != len(tc.want) {
+				t.Fatalf("ProjectedColumns() = %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("ProjectedColumns() = %v, want %v", got, tc.want)
+				}
+			}
+		})
+	}
+}

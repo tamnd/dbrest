@@ -231,3 +231,19 @@ func TestWritePutMultiRowIs400(t *testing.T) {
 		t.Fatalf("want PGRST115 for a multi-row PUT body, got %v", err)
 	}
 }
+
+// A write whose select embeds a resource with no relationship is the read
+// path's PGRST200 rather than silently dropping the embed (item 01.19).
+func TestWriteResolvesEmbedsRejectsUnknown(t *testing.T) {
+	q := &ir.Query{
+		Kind:     ir.Insert,
+		Relation: ir.Ref{Name: "films"},
+		Select:   []ir.SelectItem{ir.EmbedRef{Index: 0}},
+		Embeds:   []ir.Embed{{Target: ir.Ref{Name: "ghosts"}, OutKey: "ghosts"}},
+		Write:    &ir.WriteSpec{Columns: []string{"title"}, Rows: []map[string]ir.Value{{"title": {JSON: "X"}}}, Return: ir.ReturnRepresentation},
+	}
+	_, err := Write(model(), q, nil)
+	if err == nil || err.Code != "PGRST200" {
+		t.Fatalf("want PGRST200 for an unknown write embed, got %v", err)
+	}
+}

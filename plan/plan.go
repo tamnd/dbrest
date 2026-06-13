@@ -144,6 +144,13 @@ func Write(model *schema.Model, q *ir.Query, searchPath []string) (*ir.Plan, *pg
 	if err := validateWrite(rel, q.Write); err != nil {
 		return nil, err
 	}
+	// A return=representation body is shaped by the same select/embeds a read
+	// uses, so resolve the embeds against the target relation here. An unknown or
+	// ambiguous relationship is the read path's PGRST200/201 rather than being
+	// silently dropped from the response. See item 01.19.
+	if err := resolveEmbeds(model, rel, q, searchPath); err != nil {
+		return nil, err
+	}
 	if q.IsPut {
 		if err := validatePut(rel, q); err != nil {
 			return nil, err

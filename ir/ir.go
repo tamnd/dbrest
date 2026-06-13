@@ -106,6 +106,43 @@ type Column struct {
 
 func (Column) isSelect() {}
 
+// ProjectedColumns returns the distinct base column names a plain select list
+// names, in select order, so a write's representation reads back only the
+// columns the client asked for instead of the whole row. It returns nil when
+// the projection is not a simple base-column list (empty, a "*", an aggregate,
+// or an embed present), telling the caller to fall back to every column. A
+// column carrying an alias, a cast, or a JSON sub-path also forces the fallback,
+// because the bare RETURNING/OUTPUT path cannot reshape those (that reshaping is
+// the deferred write-representation embed work, item 01.19).
+func (q *Query) ProjectedColumns() []string {
+	if len(q.Select) == 0 || len(q.Embeds) > 0 {
+		return nil
+	}
+	out := make([]string, 0, len(q.Select))
+	seen := make(map[string]bool, len(q.Select))
+	for _, it := range q.Select {
+		col, ok := it.(Column)
+		if !ok {
+			return nil // an aggregate or an embed reference
+		}
+		if len(col.Path) != 1 || col.Last != JSONNone || col.Cast != "" || col.Alias != "" {
+			return nil
+		}
+		name := col.Path[0]
+		if name == "*" {
+			return nil
+		}
+		if !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // Name returns the output key for the column: its alias if set, else the last
 // path element.
 func (c Column) Name() string {

@@ -498,6 +498,9 @@ func compileWrite(q *ir.Query, returning []string) (*sqlgen.Statement, *pgerr.AP
 // primary key only (for the Location header); for minimal updates/deletes it is nil.
 func returningCols(q *ir.Query, rel *schema.Relation) []string {
 	if q.Write != nil && q.Write.Return == ir.ReturnRepresentation {
+		if cols := q.ProjectedColumns(); cols != nil {
+			return cols
+		}
 		return rel.ColumnNames()
 	}
 	if q.Kind == ir.Insert || q.Kind == ir.Upsert {
