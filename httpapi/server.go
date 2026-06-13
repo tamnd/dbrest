@@ -912,10 +912,12 @@ func (s *Server) writeRead(w http.ResponseWriter, r *http.Request, q *ir.Query, 
 	}
 	w.Header().Set("Content-Range", contentRange(offset, out.nRows, out.total, out.hasTotl))
 
-	// An out-of-range offset is 416: the window starts past the end of the
-	// result. This is only knowable with a count, so it applies when one was
-	// requested (otherwise the empty window is a plain 200 with an empty array).
-	if offset > 0 && out.hasTotl && int64(offset) >= out.total {
+	// An out-of-range offset is 416 only when it is strictly past the end of the
+	// result. An offset equal to the total is in range: it yields zero rows with
+	// 206 and Content-Range "*/total", the way a paginate-until-empty loop whose
+	// total is an exact multiple of the page size lands on the last request. The
+	// boundary is only knowable with a count, so it applies when one was requested.
+	if offset > 0 && out.hasTotl && int64(offset) > out.total {
 		rng := pgerr.ErrRangeNotSatisfiable()
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.WriteHeader(rng.HTTPStatus)
@@ -931,15 +933,14 @@ func (s *Server) writeRead(w http.ResponseWriter, r *http.Request, q *ir.Query, 
 	}
 }
 
-// readStatus applies PostgREST's 200/206 rule: 206 only when a count is known
-// and the page returned is genuinely partial (nRows < total). PostgREST v14
-// returns 200 for count=planned/estimated even though the total is approximate;
-// the estimate is informational, not a range boundary.
+// readStatus applies PostgREST's 200/206 rule: 206 whenever a total is known and
+// the returned span is smaller than it, for every count kind. PostgREST v14
+// returns 206 for count=planned/estimated too (the docs show 206 with
+// Content-Range 0-24/3572000 for a planned count); the estimate drives the
+// status the same as an exact total. Without a count there is no boundary, so a
+// bounded window with no count is a plain 200.
 func readStatus(q *ir.Query, out *rendered, _ int) int {
-	if !out.hasTotl {
-		return http.StatusOK
-	}
-	if q.Count == ir.CountExact && int64(out.nRows) < out.total {
+	if out.hasTotl && int64(out.nRows) < out.total {
 		return http.StatusPartialContent
 	}
 	return http.StatusOK
