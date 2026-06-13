@@ -495,7 +495,7 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 	if plan.Func != nil {
 		// Portable registry function: the function body is a parameterised SQL
 		// statement whose :name placeholders are bound by CompileCall.
-		st, apiErr = sqlgen.CompileCall(Dialect{}, plan.Call, plan.Func)
+		st, apiErr = sqlgen.CompileCall(Dialect{}, plan.Call, plan.Func, sqlgen.ContextArgs(rc))
 	} else {
 		// Native RPC (NativeRPC=true): no registry function — generate EXEC
 		// [schema].[name] @param = @pN from the call's argument map.
@@ -510,7 +510,7 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 		// count=exact is only supported for portable registry functions; native
 		// stored procedures cannot be wrapped in SELECT count(*) in T-SQL.
 		if plan.Call.Count != ir.CountNone && plan.Func != nil {
-			cst, apiErr := sqlgen.CompileCallCount(Dialect{}, plan.Call, plan.Func)
+			cst, apiErr := sqlgen.CompileCallCount(Dialect{}, plan.Call, plan.Func, sqlgen.ContextArgs(rc))
 			if apiErr != nil {
 				return nil, apiErr
 			}

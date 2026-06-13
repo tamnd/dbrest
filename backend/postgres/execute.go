@@ -210,7 +210,7 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 		apiErr *pgerr.APIError
 	)
 	if plan.Func != nil {
-		st, apiErr = sqlgen.CompileCall(Dialect{}, plan.Call, plan.Func)
+		st, apiErr = sqlgen.CompileCall(Dialect{}, plan.Call, plan.Func, sqlgen.ContextArgs(rc))
 	} else {
 		st, apiErr = b.compileNativeCall(plan.Call)
 	}
@@ -279,7 +279,7 @@ func (b *Backend) executeCallRead(ctx context.Context, plan *ir.Plan, rc *reqctx
 	res := &streamResult{ctx: ctx, tx: tx, controls: rc.Controls()}
 
 	if plan.Call.Count != ir.CountNone {
-		cst, apiErr := sqlgen.CompileCallCount(Dialect{}, plan.Call, plan.Func)
+		cst, apiErr := sqlgen.CompileCallCount(Dialect{}, plan.Call, plan.Func, sqlgen.ContextArgs(rc))
 		if apiErr != nil {
 			rollback()
 			return nil, apiErr

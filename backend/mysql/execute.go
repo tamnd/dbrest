@@ -405,7 +405,7 @@ func (b *Backend) executeDeleteEmulated(
 
 // executeCall runs a stored procedure or portable RPC function.
 func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Context) (backend.Result, error) {
-	st, apiErr := sqlgen.CompileCall(Dialect{}, plan.Call, plan.Func)
+	st, apiErr := sqlgen.CompileCall(Dialect{}, plan.Call, plan.Func, sqlgen.ContextArgs(rc))
 	if apiErr != nil {
 		return nil, apiErr
 	}
@@ -414,7 +414,7 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 	if plan.ReadOnly {
 		res := &result{controls: rc.Controls()}
 		if plan.Call.Count != ir.CountNone {
-			cst, apiErr := sqlgen.CompileCallCount(Dialect{}, plan.Call, plan.Func)
+			cst, apiErr := sqlgen.CompileCallCount(Dialect{}, plan.Call, plan.Func, sqlgen.ContextArgs(rc))
 			if apiErr != nil {
 				return nil, apiErr
 			}

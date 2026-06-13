@@ -37,6 +37,18 @@ func rpcFunctions() []*rpc.Function {
 			Query:      &rpc.PortableQuery{SQL: "SELECT title FROM films ORDER BY id"},
 		},
 		{
+			Name:       "get_request_method",
+			Returns:    rpc.ReturnShape{Kind: rpc.ReturnScalar, Type: "text"},
+			Volatility: rpc.Stable,
+			Query:      &rpc.PortableQuery{SQL: "SELECT :request_method"},
+		},
+		{
+			Name:       "get_jwt_claims",
+			Returns:    rpc.ReturnShape{Kind: rpc.ReturnScalar, Type: "json"},
+			Volatility: rpc.Stable,
+			Query:      &rpc.PortableQuery{SQL: "SELECT :request_jwt_claims"},
+		},
+		{
 			Name:       "films_after",
 			Params:     []rpc.Param{{Name: "y", Type: "integer"}},
 			Returns:    rpc.ReturnShape{Kind: rpc.ReturnTable, Columns: []rpc.Column{{Name: "id"}, {Name: "title"}}},
@@ -310,5 +322,38 @@ func TestRPCScalarJSONReturnsRaw(t *testing.T) {
 	}
 	if doc["a"] != float64(1) {
 		t.Errorf("body = %v", doc)
+	}
+}
+
+// The reserved :request_* placeholders give a registry function the request
+// context PostgreSQL functions read with current_setting (spec 15). The HTTP
+// surface matches PostgREST's GUC behavior on every engine.
+func TestRPCContextRequestMethod(t *testing.T) {
+	srv := newRPCServer(t)
+	resp := do(t, srv, http.MethodGet, "/rpc/get_request_method", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var s string
+	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if s != "GET" {
+		t.Errorf("body = %q, want GET", s)
+	}
+}
+
+func TestRPCContextJWTClaimsEmptyObject(t *testing.T) {
+	srv := newRPCServer(t)
+	resp := send(t, srv, http.MethodPost, "/rpc/get_jwt_claims", `{}`, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var claims map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&claims); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(claims) != 0 {
+		t.Errorf("claims = %v, want empty object for anonymous", claims)
 	}
 }

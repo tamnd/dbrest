@@ -18,13 +18,16 @@ import (
 
 // CompileCall lowers a resolved RPC call to a parameterized statement. The
 // function's SQL is rendered with its :name placeholders bound to the arguments
-// (defaults filling omitted optional parameters); a table return additionally
-// wraps the result so post-filters compile around it.
-func CompileCall(d Dialect, c *ir.Call, fn *rpc.Function) (*Statement, *pgerr.APIError) {
+// (defaults filling omitted optional parameters); a placeholder that is not a
+// declared parameter binds a reserved request-context value from ctxArgs (see
+// ContextArgs); a table return additionally wraps the result so post-filters
+// compile around it.
+func CompileCall(d Dialect, c *ir.Call, fn *rpc.Function, ctxArgs map[string]any) (*Statement, *pgerr.APIError) {
 	if fn.Query == nil || strings.TrimSpace(fn.Query.SQL) == "" {
 		return nil, pgerr.ErrUnsupported("this function realization", "sql")
 	}
 	b := newBuilder(d)
+	b.ctxArgs = ctxArgs
 
 	inner, err := b.bindNamed(fn, c.Args)
 	if err != nil {
@@ -73,11 +76,12 @@ func CompileCall(d Dialect, c *ir.Call, fn *rpc.Function) (*Statement, *pgerr.AP
 // read-only statement for a count=exact request, exactly as a table read's count
 // does. It is only valid for a read-only function; a volatile function must not
 // run twice.
-func CompileCallCount(d Dialect, c *ir.Call, fn *rpc.Function) (*Statement, *pgerr.APIError) {
+func CompileCallCount(d Dialect, c *ir.Call, fn *rpc.Function, ctxArgs map[string]any) (*Statement, *pgerr.APIError) {
 	if fn.Query == nil || strings.TrimSpace(fn.Query.SQL) == "" {
 		return nil, pgerr.ErrUnsupported("this function realization", "sql")
 	}
 	b := newBuilder(d)
+	b.ctxArgs = ctxArgs
 	inner, err := b.bindNamed(fn, c.Args)
 	if err != nil {
 		return nil, err
@@ -142,6 +146,14 @@ func (b *builder) bindNamed(fn *rpc.Function, args map[string]ir.Value) (string,
 func (b *builder) argValue(fn *rpc.Function, name string, args map[string]ir.Value) (string, *pgerr.APIError) {
 	p, ok := fn.Param(name)
 	if !ok {
+		// Not a declared parameter: a reserved request-context placeholder
+		// binds the frontend-built value (spec 15: the emulated engines bind
+		// context, they never read a session store). A declared parameter of
+		// the same name takes this path only when undeclared, so it cannot be
+		// shadowed away by a caller.
+		if v, isCtx := b.ctxArgs[name]; isCtx {
+			return b.bind(v), nil
+		}
 		return "", pgerr.ErrInternal("rpc body references undeclared parameter :" + name)
 	}
 	if v, ok := args[name]; ok {

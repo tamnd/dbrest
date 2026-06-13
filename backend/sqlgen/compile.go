@@ -36,6 +36,9 @@ type builder struct {
 	args   []any
 	qual   string
 	aliasN int
+	// ctxArgs are the reserved :request_* values an RPC body may bind when a
+	// placeholder is not a declared parameter; see ContextArgs.
+	ctxArgs map[string]any
 }
 
 // newBuilder starts a builder with an empty output buffer.
