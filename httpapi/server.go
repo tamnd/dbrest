@@ -598,6 +598,27 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 		writeError(w, apiErr)
 		return
 	}
+
+	// A GET /rpc read honors the Range header the same way a table read does:
+	// it overrides ?limit=&offset= and an inverted range is 416.
+	if isGet {
+		if rangeHdr := r.Header.Get("Range"); rangeHdr != "" && !strings.Contains(rangeHdr, "=") {
+			off, lim, ok, inverted := parseRangeHeader(rangeHdr)
+			if inverted {
+				writeError(w, pgerr.ErrRangeNotSatisfiable().
+					WithDetails("The lower boundary must be lower than or equal to the upper boundary in the Range header."))
+				return
+			}
+			if ok {
+				call.Offset = &off
+				if lim >= 0 {
+					l := lim
+					call.Limit = &l
+				}
+			}
+		}
+	}
+
 	// db-max-rows caps an RPC response like a read (an implicit LIMIT).
 	call.Limit = s.capLimit(call.Limit)
 
@@ -658,32 +679,15 @@ func singleRawBodyParam(reg rpc.Registry, name string) (string, string) {
 	return "", ""
 }
 
-// writeCall writes a successful RPC response. The status is 200, or 206 when a
-// bounded window over a table return did not cover the full count. A requested
-// count sets Content-Range, matching a read.
+// writeCall writes a successful RPC response. An RPC read uses the same
+// pagination contract as a table read: Content-Range is always present, an
+// out-of-bounds offset is 416, and the 200/206 rule follows the count.
 func (s *Server) writeCall(w http.ResponseWriter, r *http.Request, call *ir.Call, out *rendered, ctrl *reqctx.ResponseControls) {
-	if applied := call.Prefer.AppliedHeader(); applied != "" {
-		w.Header().Set("Preference-Applied", applied)
-	}
-	w.Header().Set("Content-Type", out.contentType)
-
 	offset := 0
 	if call.Offset != nil {
 		offset = *call.Offset
 	}
-	if out.hasTotl {
-		w.Header().Set("Content-Range", contentRange(offset, out.nRows, out.total, true))
-	}
-
-	status := http.StatusOK
-	hasWindow := call.Limit != nil || call.Offset != nil
-	if hasWindow && out.hasTotl && int64(out.nRows) < out.total {
-		status = http.StatusPartialContent
-	}
-	w.WriteHeader(applyControls(w, ctrl, status))
-	if r.Method != http.MethodHead {
-		w.Write(out.body)
-	}
+	s.writePaged(w, r, call.Prefer.AppliedHeader(), offset, out, ctrl)
 }
 
 func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity, activeSchema string) {
@@ -1016,22 +1020,28 @@ func embedKeys(q *ir.Query) map[string]bool {
 // the controls: a control header is added and a non-zero control status wins
 // over the computed 200/206 default.
 func (s *Server) writeRead(w http.ResponseWriter, r *http.Request, q *ir.Query, out *rendered, ctrl *reqctx.ResponseControls) {
-	if applied := q.Prefer.AppliedHeader(); applied != "" {
-		w.Header().Set("Preference-Applied", applied)
-	}
-	w.Header().Set("Content-Type", out.contentType)
-
 	offset := 0
 	if q.Offset != nil {
 		offset = *q.Offset
 	}
+	s.writePaged(w, r, q.Prefer.AppliedHeader(), offset, out, ctrl)
+}
+
+// writePaged sets the pagination headers and status shared by table reads and
+// RPC reads. Content-Range is always present (the "*" total form without a
+// count). An offset strictly past a known total is 416 with the upstream
+// detail; an offset equal to the total is in range and yields 206 with
+// Content-Range "*/total". The 200/206 rule is 206 whenever a total is known
+// and the returned span is smaller, for every count kind (PostgREST v14 returns
+// 206 for count=planned/estimated too). A function or policy can override the
+// status and add headers through the controls.
+func (s *Server) writePaged(w http.ResponseWriter, r *http.Request, applied string, offset int, out *rendered, ctrl *reqctx.ResponseControls) {
+	if applied != "" {
+		w.Header().Set("Preference-Applied", applied)
+	}
+	w.Header().Set("Content-Type", out.contentType)
 	w.Header().Set("Content-Range", contentRange(offset, out.nRows, out.total, out.hasTotl))
 
-	// An out-of-range offset is 416 only when it is strictly past the end of the
-	// result. An offset equal to the total is in range: it yields zero rows with
-	// 206 and Content-Range "*/total", the way a paginate-until-empty loop whose
-	// total is an exact multiple of the page size lands on the last request. The
-	// boundary is only knowable with a count, so it applies when one was requested.
 	if offset > 0 && out.hasTotl && int64(offset) > out.total {
 		rng := pgerr.ErrRangeNotSatisfiable().
 			WithDetails(fmt.Sprintf("An offset of %d was requested, but there are only %d rows.", offset, out.total))
@@ -1043,23 +1053,14 @@ func (s *Server) writeRead(w http.ResponseWriter, r *http.Request, q *ir.Query, 
 		return
 	}
 
-	w.WriteHeader(applyControls(w, ctrl, readStatus(q, out, offset)))
+	status := http.StatusOK
+	if out.hasTotl && int64(out.nRows) < out.total {
+		status = http.StatusPartialContent
+	}
+	w.WriteHeader(applyControls(w, ctrl, status))
 	if r.Method != http.MethodHead {
 		w.Write(out.body)
 	}
-}
-
-// readStatus applies PostgREST's 200/206 rule: 206 whenever a total is known and
-// the returned span is smaller than it, for every count kind. PostgREST v14
-// returns 206 for count=planned/estimated too (the docs show 206 with
-// Content-Range 0-24/3572000 for a planned count); the estimate drives the
-// status the same as an exact total. Without a count there is no boundary, so a
-// bounded window with no count is a plain 200.
-func readStatus(q *ir.Query, out *rendered, _ int) int {
-	if out.hasTotl && int64(out.nRows) < out.total {
-		return http.StatusPartialContent
-	}
-	return http.StatusOK
 }
 
 // parseRangeHeader parses an HTTP Range header value of the form "start-end"

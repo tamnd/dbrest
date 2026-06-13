@@ -34,30 +34,41 @@ func CompileCall(d Dialect, c *ir.Call, fn *rpc.Function, ctxArgs map[string]any
 		return nil, err
 	}
 
-	// Only a table return can be projected, filtered, ordered, and paginated; a
-	// scalar or setof-scalar return is the function's value(s) verbatim.
-	if fn.Returns.Kind != rpc.ReturnTable || !callHasPostFilter(c) {
+	// A single scalar or a void return is the function's value verbatim, with no
+	// row window to slice. Anything else with no post-filter clause is also
+	// verbatim.
+	isTable := fn.Returns.Kind == rpc.ReturnTable
+	isSetof := isTable || fn.Returns.Kind == rpc.ReturnSetOf
+	if !isSetof || !callHasPostFilter(c) {
 		b.sb.WriteString(inner)
 		return &Statement{SQL: b.sb.String(), Args: b.args}, nil
 	}
 
+	// A setof return is wrapped so it can be paginated like a table read. A table
+	// return carries named columns, so it additionally supports projection,
+	// horizontal filters, and ordering; a setof-scalar has one anonymous column,
+	// so it takes only the limit/offset window.
 	const alias = "_rpc"
 	b.sb.WriteString("SELECT ")
-	if err := b.writeSelect(c.Select); err != nil {
-		return nil, err
+	if isTable {
+		if err := b.writeSelect(c.Select); err != nil {
+			return nil, err
+		}
+	} else {
+		b.sb.WriteString("*")
 	}
 	b.sb.WriteString(" FROM (")
 	b.sb.WriteString(inner)
 	b.sb.WriteString(") ")
 	b.sb.WriteString(alias)
 
-	if c.Where != nil {
+	if isTable && c.Where != nil {
 		b.sb.WriteString(" WHERE ")
 		if err := b.writeCond(*c.Where); err != nil {
 			return nil, err
 		}
 	}
-	hasOrder := len(c.Order) > 0
+	hasOrder := isTable && len(c.Order) > 0
 	if hasOrder {
 		if err := b.writeOrder(c.Order); err != nil {
 			return nil, err

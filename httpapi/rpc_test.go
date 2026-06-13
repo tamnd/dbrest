@@ -543,6 +543,85 @@ func TestRPCContextRequestMethod(t *testing.T) {
 	}
 }
 
+// TestRPCSetofContentRangeAlwaysPresent pins 02.7: an RPC read carries a
+// Content-Range like a table read even with no count requested, the unknown
+// total rendered as 0-2/*.
+func TestRPCSetofContentRangeAlwaysPresent(t *testing.T) {
+	srv := newRPCServer(t)
+	resp := do(t, srv, http.MethodGet, "/rpc/film_titles", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if cr := resp.Header.Get("Content-Range"); cr != "0-2/*" {
+		t.Errorf("Content-Range = %q, want 0-2/*", cr)
+	}
+}
+
+// TestRPCRangeHeaderOnGet pins 02.7: a GET /rpc honors a unitless Range header
+// the way a table read does, slicing the set. With no count the total is
+// unknown, so the status stays 200 (PostgREST's rangeStatus on a missing total)
+// while Content-Range echoes the slice.
+func TestRPCRangeHeaderOnGet(t *testing.T) {
+	srv := newRPCServer(t)
+	resp := do(t, srv, http.MethodGet, "/rpc/film_titles", map[string]string{
+		"Range": "0-1",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if cr := resp.Header.Get("Content-Range"); cr != "0-1/*" {
+		t.Errorf("Content-Range = %q, want 0-1/*", cr)
+	}
+	var titles []string
+	if err := json.NewDecoder(resp.Body).Decode(&titles); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(titles) != 2 || titles[0] != "Metropolis" || titles[1] != "Blade Runner" {
+		t.Errorf("titles = %v, want [Metropolis Blade Runner]", titles)
+	}
+}
+
+// TestRPCRangeHeaderOnGetWithCountIs206 pins 02.7: the same slice with an exact
+// count knows the total exceeds the slice, so it is the 206 a table read gives.
+func TestRPCRangeHeaderOnGetWithCountIs206(t *testing.T) {
+	srv := newRPCServer(t)
+	resp := do(t, srv, http.MethodGet, "/rpc/film_titles", map[string]string{
+		"Range":  "0-1",
+		"Prefer": "count=exact",
+	})
+	if resp.StatusCode != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", resp.StatusCode)
+	}
+	if cr := resp.Header.Get("Content-Range"); cr != "0-1/3" {
+		t.Errorf("Content-Range = %q, want 0-1/3", cr)
+	}
+}
+
+// TestRPCRangeOutOfBoundsIs416 pins 02.7: a GET /rpc Range whose offset is past
+// the known total is the same 416 a table read raises.
+func TestRPCRangeOutOfBoundsIs416(t *testing.T) {
+	srv := newRPCServer(t)
+	resp := do(t, srv, http.MethodGet, "/rpc/film_titles", map[string]string{
+		"Range":  "5-9",
+		"Prefer": "count=exact",
+	})
+	if resp.StatusCode != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("status = %d, want 416", resp.StatusCode)
+	}
+}
+
+// TestRPCInvertedRangeOnGetIs416 pins 02.7: an inverted Range on a GET /rpc is
+// the same 416 a table read raises, before any work runs.
+func TestRPCInvertedRangeOnGetIs416(t *testing.T) {
+	srv := newRPCServer(t)
+	resp := do(t, srv, http.MethodGet, "/rpc/film_titles", map[string]string{
+		"Range": "3-1",
+	})
+	if resp.StatusCode != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("status = %d, want 416", resp.StatusCode)
+	}
+}
+
 func TestRPCContextJWTClaimsEmptyObject(t *testing.T) {
 	srv := newRPCServer(t)
 	resp := send(t, srv, http.MethodPost, "/rpc/get_jwt_claims", `{}`, nil)
