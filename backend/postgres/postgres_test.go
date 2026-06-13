@@ -81,7 +81,7 @@ func TestStatusForSQLState(t *testing.T) {
 		{"25006", 405},
 		{"42883", 404},
 		{"42P01", 404},
-		{"42501", 401}, // matches PostgREST: insufficient_privilege → 401
+		{"42501", 403}, // insufficient_privilege: 403 base, anon lifted to 401 by mapExecError
 		// PTxxx convention
 		{"PT403", 403},
 		{"PT201", 201},
