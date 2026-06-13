@@ -145,6 +145,23 @@ func TestWriteEmitsWWWAuthenticate(t *testing.T) {
 	}
 }
 
+// A full-control raised error carries response headers that Write must merge
+// onto the response, while the fixed envelope headers still win (item 04.9).
+func TestWriteEmitsCarriedHeaders(t *testing.T) {
+	rec := httptest.NewRecorder()
+	e := New(402, "123", "Payment Required").WithHeaders(map[string]string{
+		"X-Reason":     "quota",
+		"Content-Type": "text/plain", // a function must not be able to break the body
+	})
+	e.Write(rec)
+	if h := rec.Header().Get("X-Reason"); h != "quota" {
+		t.Errorf("X-Reason = %q, want quota", h)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json; charset=utf-8" {
+		t.Errorf("content-type = %q, want the reserved envelope type to win", ct)
+	}
+}
+
 func TestAs(t *testing.T) {
 	if As(nil) != nil {
 		t.Error("As(nil) should be nil")

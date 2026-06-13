@@ -61,6 +61,50 @@ func TestMapErrorConstraintMessageVerbatim(t *testing.T) {
 	}
 }
 
+// A function raising SQLSTATE 'PGRST' takes full control: mapPgError reads the
+// envelope from MESSAGE and the status and headers from DETAIL, surfacing the
+// headers on the error so the renderer emits them (item 04.9).
+func TestMapErrorRaisePGRSTFullControl(t *testing.T) {
+	pg := &pgconn.PgError{
+		Code:    "PGRST",
+		Message: `{"code":"123","message":"Payment Required","details":"pay up","hint":"add a card"}`,
+		Detail:  `{"status":402,"headers":{"X-Reason":"quota"}}`,
+	}
+	got := mapPgError(pg)
+	if got.Code != "123" || got.Message != "Payment Required" {
+		t.Errorf("envelope = %q/%q, want 123/Payment Required", got.Code, got.Message)
+	}
+	if got.HTTPStatus != 402 {
+		t.Errorf("status = %d, want 402 from detail.status", got.HTTPStatus)
+	}
+	if got.Details == nil || *got.Details != "pay up" {
+		t.Errorf("details = %v, want 'pay up'", got.Details)
+	}
+	if h := got.Headers.Get("X-Reason"); h != "quota" {
+		t.Errorf("X-Reason header = %q, want quota", h)
+	}
+}
+
+// A malformed full-control payload is PGRST121 (500), not a leaked raw string
+// (item 04.9). The DETAIL here is not valid JSON.
+func TestMapErrorRaisePGRSTMalformed(t *testing.T) {
+	pg := &pgconn.PgError{
+		Code:    "PGRST",
+		Message: `{"code":"123","message":"ok"}`,
+		Detail:  `not json`,
+	}
+	got := mapPgError(pg)
+	if got.Code != "PGRST121" {
+		t.Errorf("code = %q, want PGRST121", got.Code)
+	}
+	if got.HTTPStatus != 500 {
+		t.Errorf("status = %d, want 500", got.HTTPStatus)
+	}
+	if len(got.Headers) != 0 {
+		t.Errorf("a malformed payload must apply no headers, got %v", got.Headers)
+	}
+}
+
 func TestMapErrorPassthrough(t *testing.T) {
 	pg := &pgconn.PgError{Code: "42P01", Message: "relation does not exist", Hint: "check your schema"}
 	got := mapPgError(pg)

@@ -39,6 +39,12 @@ type APIError struct {
 	RawDetails json.RawMessage `json:"-"`
 	// Hint is a suggested fix, or null.
 	Hint *string `json:"hint"`
+	// Headers are extra response headers emitted with the error. A function that
+	// raises a full-control error (SQLSTATE 'PGRST') supplies them in the DETAIL
+	// JSON's headers object; Write merges them onto the response. They are not
+	// part of the JSON body. This is the error-path analog of ResponseControls
+	// headers on the success path.
+	Headers http.Header `json:"-"`
 }
 
 // Error implements the error interface.
@@ -72,6 +78,24 @@ func (e *APIError) WithDetailsJSON(v any) *APIError {
 func (e *APIError) WithHint(hint string) *APIError {
 	c := *e
 	c.Hint = &hint
+	return &c
+}
+
+// WithHeaders returns a copy of e carrying the given response headers, the shape
+// FromRaise returns for a full-control raised error. The headers ride on the
+// error and Write merges them onto the response; an empty map is a no-op.
+func (e *APIError) WithHeaders(h map[string]string) *APIError {
+	if len(h) == 0 {
+		return e
+	}
+	c := *e
+	c.Headers = http.Header{}
+	for k, vs := range e.Headers {
+		c.Headers[k] = vs
+	}
+	for k, v := range h {
+		c.Headers.Set(k, v)
+	}
 	return &c
 }
 
@@ -119,6 +143,14 @@ func (e *APIError) JSON() []byte {
 // whose status alone is not descriptive enough, still names the error code;
 // the "PostgREST" identifier is kept byte-identical for wire compatibility.
 func (e *APIError) Write(w http.ResponseWriter) {
+	// A full-control raised error carries its own headers; merge them first so the
+	// fixed envelope headers below win, keeping the body well-formed even if a
+	// function tries to override Content-Type.
+	for k, vs := range e.Headers {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Proxy-Status", "PostgREST; error="+e.Code)
 	if e.WWWAuthenticate != "" {

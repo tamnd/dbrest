@@ -151,6 +151,16 @@ func (b *Backend) MapError(err error) *pgerr.APIError {
 // class 23 is 400). The named constructors stay for the backends whose driver
 // reports a constraint without PostgreSQL's wording.
 func mapPgError(pg *pgconn.PgError) *pgerr.APIError {
+	// A function can take full control of the response by raising SQLSTATE
+	// 'PGRST': the server reports the chosen envelope in MESSAGE and the status
+	// and headers in DETAIL, both as JSON. FromRaise parses both (or yields
+	// PGRST121 on a malformed payload); its headers ride on the error so the
+	// renderer emits them. This is distinct from the PTxxx status-only convention
+	// handled in statusForSQLState.
+	if pg.Code == "PGRST" {
+		e, headers := pgerr.FromRaise(pg.Message, pg.Detail)
+		return e.WithHeaders(headers)
+	}
 	e := pgerr.New(statusForSQLState(pg.Code), pg.Code, pg.Message)
 	if pg.Detail != "" {
 		e = e.WithDetails(pg.Detail)
