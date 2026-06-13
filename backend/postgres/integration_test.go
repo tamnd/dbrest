@@ -11,6 +11,7 @@ import (
 	"github.com/tamnd/dbrest/backend/postgres"
 	"github.com/tamnd/dbrest/ir"
 	"github.com/tamnd/dbrest/pgerr"
+	"github.com/tamnd/dbrest/openapi"
 	planpkg "github.com/tamnd/dbrest/plan"
 	"github.com/tamnd/dbrest/reqctx"
 	"github.com/tamnd/dbrest/rpc"
@@ -604,6 +605,58 @@ func TestIntegrationNativeResolution(t *testing.T) {
 			t.Errorf("takejson({n:7}) = %d, want 7", got)
 		}
 	})
+}
+
+// TestIntegrationNativeOpenAPI covers the last piece of finding 03-P03: an
+// introspected native function appears in the generated OpenAPI document. The
+// root handler feeds the active schema's native registry into openapi.Generate, so
+// a /rpc/<fn> path is emitted for every function the catalog reported, the same as
+// the portable path does for a registered function.
+func TestIntegrationNativeOpenAPI(t *testing.T) {
+	be := openBE(t)
+	be.SetSchemas([]string{"_dbrest_oa"})
+	ctx := context.Background()
+
+	if _, err := be.Pool().Exec(ctx, `
+		CREATE SCHEMA IF NOT EXISTS _dbrest_oa;
+		CREATE OR REPLACE FUNCTION _dbrest_oa.add2(a int, b int) RETURNS int
+			LANGUAGE sql IMMUTABLE AS $$ SELECT a + b $$`); err != nil {
+		t.Fatalf("seed function: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, "DROP SCHEMA IF EXISTS _dbrest_oa CASCADE")
+	})
+
+	model, err := be.Introspect(ctx)
+	if err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+	reg := be.SchemaFunctions("_dbrest_oa")
+	body, err := openapi.Generate(model, reg, be.Capabilities(), openapi.Options{
+		Host:         "localhost",
+		ActiveSchema: "_dbrest_oa",
+	})
+	if err != nil {
+		t.Fatalf("openapi.Generate: %v", err)
+	}
+
+	var doc struct {
+		Paths map[string]json.RawMessage `json:"paths"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		t.Fatalf("unmarshal document: %v", err)
+	}
+	if _, ok := doc.Paths["/rpc/add2"]; !ok {
+		t.Errorf("native function add2 missing from OpenAPI paths; got %v", keysOf(doc.Paths))
+	}
+}
+
+func keysOf(m map[string]json.RawMessage) []string {
+	ks := make([]string, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
+	}
+	return ks
 }
 
 // TestIntegrationNativeVolatileCount covers finding 03-P02: a POST to a VOLATILE

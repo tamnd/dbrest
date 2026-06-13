@@ -81,7 +81,11 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request, id identity,
 			}
 		}
 	}
-	body, err := openapi.Generate(model, s.backend.Functions(), s.backend.Capabilities(), opts)
+	// The RPC paths come from the registry that resolves /rpc calls in the active
+	// schema: for a NativeRPC backend that introspects its functions, the native
+	// per-schema registry; otherwise the portable registry. This keeps the
+	// document's /rpc/<fn> entries in step with what the call path actually serves.
+	body, err := openapi.Generate(model, s.rpcRegistry(activeSchema), s.backend.Capabilities(), opts)
 	if err != nil {
 		writeError(w, pgerr.ErrInternal(err.Error()))
 		return
