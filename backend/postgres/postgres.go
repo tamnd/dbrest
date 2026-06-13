@@ -41,6 +41,7 @@ type Backend struct {
 	loc             *time.Location            // server TimeZone, for rendering timestamptz like PostgREST
 	funcVol         map[string]rpc.Volatility  // "schema.name" -> volatility, for native RPC access mode
 	funcRet         map[string]rpc.ReturnShape // "schema.name" -> return shape, for native RPC result rendering
+	funcReg         map[string]rpc.Registry    // schema -> native function registry, the function half of the schema cache
 	roleSettings    map[string][]roleSetting  // impersonated-role ALTER ROLE ... SET replays
 	roleIsolation   map[string]pgx.TxIsoLevel // impersonated-role default_transaction_isolation
 
@@ -158,6 +159,18 @@ func (b *Backend) Functions() rpc.Registry {
 		return rpc.EmptyRegistry{}
 	}
 	return b.funcs
+}
+
+// SchemaFunctions returns the native function registry introspected for one
+// exposed schema, the function half of the schema cache. It is empty until
+// Introspect has run, and empty for a schema with no functions, so a caller always
+// has a registry to resolve against. The native RPC path uses it to resolve
+// overloads and partition GET arguments through the shared planner.
+func (b *Backend) SchemaFunctions(schema string) rpc.Registry {
+	if reg, ok := b.funcReg[schema]; ok {
+		return reg
+	}
+	return rpc.EmptyRegistry{}
 }
 
 // Capabilities reports the PostgreSQL feature tiers for the connected server

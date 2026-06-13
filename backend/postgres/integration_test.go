@@ -325,6 +325,114 @@ func TestIntegrationNativeReturnShapes(t *testing.T) {
 	}
 }
 
+// TestIntegrationFunctionRegistry covers finding 03-P03: introspection builds the
+// function half of the schema cache from pg_proc. Each seeded function exercises one
+// signature shape; the per-schema native registry must reconstruct its input
+// parameters (names, optionality, variadic, raw body), its return shape, and its
+// volatility, and group overloads under one name.
+func TestIntegrationFunctionRegistry(t *testing.T) {
+	be := openBE(t)
+	be.SetSchemas([]string{"_dbrest_reg"})
+	ctx := context.Background()
+
+	if _, err := be.Pool().Exec(ctx, `
+		CREATE SCHEMA IF NOT EXISTS _dbrest_reg;
+		CREATE OR REPLACE FUNCTION _dbrest_reg.add2(a int, b int) RETURNS int
+			LANGUAGE sql IMMUTABLE AS $$ SELECT a + b $$;
+		CREATE OR REPLACE FUNCTION _dbrest_reg.greet(name text, greeting text DEFAULT 'hi') RETURNS text
+			LANGUAGE sql STABLE AS $$ SELECT greeting || ' ' || name $$;
+		CREATE OR REPLACE FUNCTION _dbrest_reg.sumall(VARIADIC vals int[]) RETURNS int
+			LANGUAGE sql IMMUTABLE AS $$ SELECT coalesce((SELECT sum(v) FROM unnest(vals) v), 0)::int $$;
+		CREATE OR REPLACE FUNCTION _dbrest_reg.takejson(json) RETURNS int
+			LANGUAGE sql STABLE AS $$ SELECT 1 $$;
+		CREATE OR REPLACE FUNCTION _dbrest_reg.over1(a int) RETURNS int
+			LANGUAGE sql STABLE AS $$ SELECT a $$;
+		CREATE OR REPLACE FUNCTION _dbrest_reg.over1(a int, b int) RETURNS int
+			LANGUAGE sql STABLE AS $$ SELECT a + b $$;
+		CREATE OR REPLACE FUNCTION _dbrest_reg.films(year int) RETURNS TABLE(id int, title text)
+			LANGUAGE sql STABLE AS $$ SELECT 1, 'x' $$`); err != nil {
+		t.Fatalf("seed functions: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, "DROP SCHEMA IF EXISTS _dbrest_reg CASCADE")
+	})
+	if _, err := be.Introspect(ctx); err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+
+	reg := be.SchemaFunctions("_dbrest_reg")
+
+	// add2: two required int parameters, immutable, scalar return.
+	fn, ok := reg.Lookup("add2", rpc.ArgSet{"a": true, "b": true})
+	if !ok {
+		t.Fatal("add2 not resolved")
+	}
+	if len(fn.Params) != 2 || fn.Params[0].Name != "a" || fn.Params[1].Name != "b" {
+		t.Errorf("add2 params = %+v", fn.Params)
+	}
+	if fn.Volatility != rpc.Immutable {
+		t.Errorf("add2 volatility = %v, want Immutable", fn.Volatility)
+	}
+	if got := fn.Required(); len(got) != 2 {
+		t.Errorf("add2 required = %v, want both", got)
+	}
+
+	// greet: the trailing defaulted parameter is optional, so a call with only name
+	// resolves.
+	if fn, ok := reg.Lookup("greet", rpc.ArgSet{"name": true}); !ok {
+		t.Error("greet(name) not resolved despite greeting having a default")
+	} else if p, _ := fn.Param("greeting"); !p.Optional {
+		t.Error("greet.greeting should be optional")
+	}
+
+	// sumall: variadic, so it resolves with no arguments and the parameter is not
+	// required.
+	if fn, ok := reg.Lookup("sumall", rpc.ArgSet{}); !ok {
+		t.Error("sumall() not resolved despite variadic")
+	} else if !fn.Params[0].Variadic {
+		t.Error("sumall.vals should be variadic")
+	}
+
+	// takejson: a lone unnamed json input is a raw body (the request body binds to
+	// it, so it is found by listing, not by an empty argument set).
+	var takejson *rpc.Function
+	for _, f := range reg.List() {
+		if f.Name == "takejson" {
+			takejson = f
+		}
+	}
+	if takejson == nil {
+		t.Error("takejson missing from registry")
+	} else if p, raw := takejson.SingleRawBody(); !raw || p.Type != "json" {
+		t.Errorf("takejson single-raw-body = %v, param %+v", raw, p)
+	}
+
+	// over1: two overloads chosen by argument arity, PGRST203 territory when neither
+	// is more specific. One arg picks the unary, two args the binary.
+	if fn, ok := reg.Lookup("over1", rpc.ArgSet{"a": true}); !ok || len(fn.Params) != 1 {
+		t.Errorf("over1(a) overload = %+v, ok=%v", fn, ok)
+	}
+	if fn, ok := reg.Lookup("over1", rpc.ArgSet{"a": true, "b": true}); !ok || len(fn.Params) != 2 {
+		t.Errorf("over1(a,b) overload = %+v, ok=%v", fn, ok)
+	}
+	if _, ok := reg.Lookup("over1", rpc.ArgSet{"a": true, "z": true}); ok {
+		t.Error("over1(a,z) should not resolve: z names no parameter")
+	}
+
+	// films: only the input year is a parameter; the TABLE columns are the return
+	// shape, not arguments.
+	if fn, ok := reg.Lookup("films", rpc.ArgSet{"year": true}); !ok {
+		t.Error("films(year) not resolved")
+	} else {
+		if len(fn.Params) != 1 || fn.Params[0].Name != "year" {
+			t.Errorf("films params = %+v, want [year]", fn.Params)
+		}
+		if fn.Returns.Kind != rpc.ReturnTable {
+			t.Errorf("films return kind = %v, want ReturnTable", fn.Returns.Kind)
+		}
+	}
+}
+
 // TestIntegrationNativeVolatileCount covers finding 03-P02: a POST to a VOLATILE
 // set-returning function with Prefer: count=exact returns the exact total over the
 // filtered set, and the function runs exactly once. The read path counts with a

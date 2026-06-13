@@ -48,6 +48,16 @@ func (b *Backend) Introspect(ctx context.Context) (*schema.Model, error) {
 	}
 	b.funcRet = ret
 
+	// The native function registry is the function half of PostgREST's schema cache:
+	// full signatures per schema so the native RPC path resolves overloads, raises
+	// PGRST202/PGRST203, and partitions GET arguments from result filters through the
+	// shared planner. Loaded with the catalog and refreshed on every rebuild.
+	reg, err := b.loadFunctionRegistry(ctx, schemas)
+	if err != nil {
+		return nil, err
+	}
+	b.funcReg = reg
+
 	// Impersonated-role settings (ALTER ROLE ... SET) are replayed per request as
 	// transaction-scoped settings, so they are loaded with the catalog and
 	// refreshed on every rebuild, the same lifecycle PostgREST gives them.
