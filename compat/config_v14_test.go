@@ -37,6 +37,9 @@ func localDBREST(t *testing.T) (*httptest.Server, *httpapi.Server) {
 		t.Fatalf("introspect: %v", err)
 	}
 	api := httpapi.NewServer(be, model, nil)
+	// Mirror the live PostgREST rig's db-anon-role=web_anon so tokenless reads
+	// run as anon rather than failing closed with 401.
+	api.SetDefaultRole("web_anon")
 	ts := httptest.NewServer(api)
 	t.Cleanup(ts.Close)
 	return ts, api
