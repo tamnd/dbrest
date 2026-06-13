@@ -1492,6 +1492,50 @@ func TestIntegrationCatalogMetadata(t *testing.T) {
 	}
 }
 
+// TestIntegrationVoidCallStatus proves a void-returning function answers 204 on
+// both verbs, not just POST. A STABLE void function runs through the read path
+// (executeCallRead); before the fix that path never detected void, so a GET
+// answered 200 with a body while a POST to the same function answered 204. Both
+// now signal 204. Finding 03-P17.
+func TestIntegrationVoidCallStatus(t *testing.T) {
+	be := openBE(t)
+	ctx := context.Background()
+
+	if _, err := be.Pool().Exec(ctx, `
+		CREATE OR REPLACE FUNCTION public._dbrest_void_stable() RETURNS void
+			LANGUAGE sql STABLE AS $$ SELECT $$;
+		CREATE OR REPLACE FUNCTION public._dbrest_void_volatile() RETURNS void
+			LANGUAGE sql VOLATILE AS $$ SELECT $$`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, `DROP FUNCTION IF EXISTS public._dbrest_void_stable();
+			DROP FUNCTION IF EXISTS public._dbrest_void_volatile()`)
+	})
+
+	status := func(fn, method string) int {
+		t.Helper()
+		plan := &ir.Plan{
+			ReadOnly: method == "GET",
+			Call:     &ir.Call{Function: ir.Ref{Name: fn}, Args: map[string]ir.Value{}},
+		}
+		res, err := be.Execute(ctx, plan, &reqctx.Context{Method: method, Path: "/rpc/" + fn})
+		if err != nil {
+			t.Fatalf("Execute(%s %s): %v", method, fn, err)
+		}
+		return res.ResponseControls().Status
+	}
+
+	// GET to the stable function runs the read path; POST to the volatile function
+	// runs the write path. Both detect void and signal 204.
+	if got := status("_dbrest_void_stable", "GET"); got != 204 {
+		t.Errorf("GET void status = %d, want 204 (read path void detection)", got)
+	}
+	if got := status("_dbrest_void_volatile", "POST"); got != 204 {
+		t.Errorf("POST void status = %d, want 204", got)
+	}
+}
+
 func condPtr(c ir.Cond) *ir.Cond { return &c }
 func intPtr(n int) *int          { return &n }
 
