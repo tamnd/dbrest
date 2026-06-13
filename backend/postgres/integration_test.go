@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -1181,6 +1182,120 @@ func TestIntegrationArrayPayloadByColumnType(t *testing.T) {
 	if len(labs) != 2 || labs[0] != "a" || labs[1] != "b" {
 		t.Errorf("text[] labs = %v, want [a b]", labs)
 	}
+}
+
+// TestIntegrationViewForeignKeyInference covers finding 03-P09: a base table's
+// foreign keys are projected onto a view over it, so embedding works through a view
+// the same way it does through the base table. It exercises a renamed-column view, a
+// view-over-view chain (the projection runs to a fixpoint), a materialized view, and
+// an end-to-end embed of the referenced table through the view.
+func TestIntegrationViewForeignKeyInference(t *testing.T) {
+	be := openBE(t)
+	ctx := context.Background()
+
+	if _, err := be.Pool().Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS _p9_authors (id int PRIMARY KEY, name text);
+		CREATE TABLE IF NOT EXISTS _p9_books (
+			id int PRIMARY KEY, title text, author_id int REFERENCES _p9_authors(id));
+		TRUNCATE _p9_books, _p9_authors;
+		INSERT INTO _p9_authors (id, name) VALUES (1, 'Le Guin'), (2, 'Butler');
+		INSERT INTO _p9_books (id, title, author_id) VALUES (10, 'A Wizard of Earthsea', 1), (11, 'Kindred', 2);
+		CREATE OR REPLACE VIEW _p9_books_v AS SELECT id, title, author_id FROM _p9_books;
+		CREATE OR REPLACE VIEW _p9_books_renamed AS SELECT id AS book_id, author_id AS writer FROM _p9_books;
+		CREATE OR REPLACE VIEW _p9_books_chain AS SELECT book_id, writer FROM _p9_books_renamed;
+		DROP MATERIALIZED VIEW IF EXISTS _p9_books_m;
+		CREATE MATERIALIZED VIEW _p9_books_m AS SELECT id, author_id FROM _p9_books`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, `
+			DROP MATERIALIZED VIEW IF EXISTS _p9_books_m;
+			DROP VIEW IF EXISTS _p9_books_chain, _p9_books_renamed, _p9_books_v;
+			DROP TABLE IF EXISTS _p9_books, _p9_authors`)
+	})
+
+	model, err := be.Introspect(ctx)
+	if err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+
+	// projectedFK returns the view's foreign key whose source column matches, with
+	// the columns it was projected under.
+	hasFKTo := func(relName, refRel string, wantCols ...string) bool {
+		rel, ok := model.Lookup(relName, []string{"public"})
+		if !ok {
+			return false
+		}
+		for _, fk := range rel.ForeignKeys {
+			if fk.RefRelation == refRel && reflect.DeepEqual(fk.Columns, wantCols) {
+				return true
+			}
+		}
+		return false
+	}
+
+	t.Run("plain view inherits the base FK", func(t *testing.T) {
+		if !hasFKTo("_p9_books_v", "_p9_authors", "author_id") {
+			rel, _ := model.Lookup("_p9_books_v", []string{"public"})
+			t.Errorf("books_v missing projected FK to _p9_authors; FKs = %+v", rel.ForeignKeys)
+		}
+	})
+
+	t.Run("renamed column carries the FK under the view name", func(t *testing.T) {
+		if !hasFKTo("_p9_books_renamed", "_p9_authors", "writer") {
+			rel, _ := model.Lookup("_p9_books_renamed", []string{"public"})
+			t.Errorf("books_renamed missing projected FK on writer; FKs = %+v", rel.ForeignKeys)
+		}
+	})
+
+	t.Run("view-over-view chain resolves to a fixpoint", func(t *testing.T) {
+		if !hasFKTo("_p9_books_chain", "_p9_authors", "writer") {
+			rel, _ := model.Lookup("_p9_books_chain", []string{"public"})
+			t.Errorf("books_chain missing projected FK on writer; FKs = %+v", rel.ForeignKeys)
+		}
+	})
+
+	t.Run("materialized view inherits the base FK", func(t *testing.T) {
+		if !hasFKTo("_p9_books_m", "_p9_authors", "author_id") {
+			rel, _ := model.Lookup("_p9_books_m", []string{"public"})
+			t.Errorf("books_m missing projected FK to _p9_authors; FKs = %+v", rel.ForeignKeys)
+		}
+	})
+
+	t.Run("embedding the referenced table through the view works", func(t *testing.T) {
+		rel, ok := model.Lookup("_p9_books_v", []string{"public"})
+		if !ok {
+			t.Fatal("_p9_books_v not found")
+		}
+		q, perr := ir.ParseRead("_p9_books_v", "select=title,_p9_authors(name)&order=id", nil)
+		if perr != nil {
+			t.Fatalf("parse: %v", perr)
+		}
+		rp, perr := planpkg.Read(model, q, []string{"public"}, planpkg.Options{})
+		if perr != nil {
+			t.Fatalf("plan: %v", perr)
+		}
+		rp.Rel = rel
+		res, err := be.Execute(ctx, rp, &reqctx.Context{Method: "GET", Path: "/_p9_books_v"})
+		if err != nil {
+			t.Fatalf("Execute(embed through view): %v", err)
+		}
+		rs := res.Rows()
+		defer rs.Close()
+		rows := 0
+		for rs.Next() {
+			if _, err := rs.Values(); err != nil {
+				t.Fatalf("Values: %v", err)
+			}
+			rows++
+		}
+		if err := rs.Err(); err != nil {
+			t.Fatalf("row error: %v", err)
+		}
+		if rows != 2 {
+			t.Errorf("embed through view returned %d rows, want 2", rows)
+		}
+	})
 }
 
 // TestIntegrationWideEmbed proves an embed of a table with more than 50 columns

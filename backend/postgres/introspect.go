@@ -30,6 +30,14 @@ func (b *Backend) Introspect(ctx context.Context) (*schema.Model, error) {
 	}
 	fksByRel := groupFKs(fks)
 
+	// View output columns mapped to their base-relation columns, so the model can
+	// project base-table foreign keys onto views and embedding works through a view
+	// the same way it does through its base table (spec 09).
+	viewCols, err := b.loadViewColumns(ctx, schemas)
+	if err != nil {
+		return nil, err
+	}
+
 	// Function volatility drives the native RPC transaction access mode (a STABLE
 	// or IMMUTABLE function runs read-only even on POST), so it is loaded here with
 	// the rest of the catalog and refreshed whenever the model is rebuilt.
@@ -96,6 +104,7 @@ func (b *Backend) Introspect(ctx context.Context) (*schema.Model, error) {
 			PrimaryKey:  pk,
 			Unique:      uniq,
 			ForeignKeys: fksByRel[r.oid],
+			ViewColumns: viewCols[r.oid],
 		})
 	}
 
