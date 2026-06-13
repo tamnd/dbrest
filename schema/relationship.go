@@ -91,13 +91,19 @@ func (m *Model) Relationships(parent *Relation, targetName string, searchPath []
 		}
 	}
 
-	// Backward: a foreign key on the target pointing at the parent is to-many
-	// (the reverse view of the same key).
+	// Backward: a foreign key on the target pointing at the parent is the reverse
+	// view of the same key. It is to-many in general, but to-one when the FK
+	// columns are unique on the target (its primary key or a unique constraint),
+	// because then at most one target row references each parent row (spec 09).
 	for _, fk := range target.ForeignKeys {
 		if fk.references(parent) {
+			card := CardToMany
+			if isUnique(target, fk.Columns) {
+				card = CardToOne
+			}
 			out = append(out, Relationship{
 				Name:    fk.Name,
-				Card:    CardToMany,
+				Card:    card,
 				Target:  target,
 				Local:   fk.RefColumns,
 				Foreign: fk.Columns,
@@ -106,45 +112,99 @@ func (m *Model) Relationships(parent *Relation, targetName string, searchPath []
 		}
 	}
 
-	// Many-to-many: a junction relation with a foreign key to each side. The
-	// junction is not the parent or the target; its two keys supply the two hops.
+	// Many-to-many: a junction relation whose foreign keys to the two ends are
+	// part of its composite primary key. Every (toParent, toTarget) FK pair is a
+	// separate, hintable edge, so two keys to one end make the embed ambiguous
+	// rather than silently picking one (spec 09).
 	for _, j := range m.Relations() {
 		if j == parent || j == target {
 			continue
 		}
-		toParent, toTarget := junctionKeys(j, parent, target)
-		if toParent == nil || toTarget == nil {
-			continue
+		for _, toParent := range junctionFKs(j, parent) {
+			for _, toTarget := range junctionFKs(j, target) {
+				if toParent == toTarget {
+					continue // a self-to-self junction needs two distinct keys
+				}
+				out = append(out, Relationship{
+					Name:     j.Name,
+					Card:     CardToMany,
+					Target:   target,
+					Local:    toParent.RefColumns,
+					Foreign:  toTarget.RefColumns,
+					Junction: j,
+					JLocal:   toParent.Columns,
+					JForeign: toTarget.Columns,
+					hints:    junctionHints(j, toTarget),
+				})
+			}
 		}
-		out = append(out, Relationship{
-			Name:     j.Name,
-			Card:     CardToMany,
-			Target:   target,
-			Local:    toParent.RefColumns,
-			Foreign:  toTarget.RefColumns,
-			Junction: j,
-			JLocal:   toParent.Columns,
-			JForeign: toTarget.Columns,
-			hints:    []string{j.Name, toParent.Name, toTarget.Name},
-		})
 	}
 
 	return out, true
 }
 
-// junctionKeys finds the two foreign keys that make j a junction between parent
-// and target: one pointing at the parent and a distinct one pointing at the
-// target. The distinctness guard matters for a self-referential many-to-many,
-// where both keys point at the same relation.
-func junctionKeys(j, parent, target *Relation) (toParent, toTarget *ForeignKey) {
-	for _, fk := range j.ForeignKeys {
-		if toParent == nil && fk.references(parent) {
-			toParent = fk
-			continue
-		}
-		if toTarget == nil && fk.references(target) {
-			toTarget = fk
+// isUnique reports whether cols (as a set) is the relation's primary key or one
+// of its unique constraints, the test that makes a referencing FK one-to-one.
+func isUnique(r *Relation, cols []string) bool {
+	if sameColumnSet(r.PrimaryKey, cols) {
+		return true
+	}
+	for _, u := range r.Unique {
+		if sameColumnSet(u, cols) {
+			return true
 		}
 	}
-	return toParent, toTarget
+	return false
+}
+
+// sameColumnSet reports whether two column-name lists hold the same set,
+// ignoring order (constraint membership does not depend on column order).
+func sameColumnSet(a, b []string) bool {
+	if len(a) != len(b) || len(a) == 0 {
+		return false
+	}
+	for _, x := range a {
+		if !slices.Contains(b, x) {
+			return false
+		}
+	}
+	return true
+}
+
+// junctionHints is the hint set for a many-to-many edge: the junction name and
+// the target-pointing foreign key, by its constraint name and its columns. The
+// hint identifies the edge by how the junction reaches the target, which is what
+// disambiguates a self-referential junction where both directions share the same
+// pair of columns and only the target side differs (PostgREST).
+func junctionHints(j *Relation, toTarget *ForeignKey) []string {
+	hints := []string{j.Name, toTarget.Name}
+	hints = append(hints, toTarget.Columns...)
+	return hints
+}
+
+// junctionFKs returns the foreign keys on j that point at end and whose columns
+// are part of j's primary key, the PostgREST rule for what makes j a junction.
+// A table with an FK to a relation but no PK over those columns is an incidental
+// referencing table, not a junction, so it yields no edge.
+func junctionFKs(j, end *Relation) []*ForeignKey {
+	var out []*ForeignKey
+	for _, fk := range j.ForeignKeys {
+		if fk.references(end) && isSubset(fk.Columns, j.PrimaryKey) {
+			out = append(out, fk)
+		}
+	}
+	return out
+}
+
+// isSubset reports whether every column in cols appears in set.
+func isSubset(cols, set []string) bool {
+	if len(cols) == 0 {
+		return false
+	}
+	for _, c := range cols {
+		if !slices.Contains(set, c) {
+			return false
+		}
+	}
+	return true
 }

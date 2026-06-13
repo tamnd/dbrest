@@ -18,9 +18,10 @@ func buildEmbedModel() *Model {
 	}
 	actors := &Relation{Schema: "public", Name: "actors", Columns: cols("id", "name")}
 	roles := &Relation{
-		Schema:  "public",
-		Name:    "roles",
-		Columns: cols("film_id", "actor_id"),
+		Schema:     "public",
+		Name:       "roles",
+		Columns:    cols("film_id", "actor_id"),
+		PrimaryKey: []string{"film_id", "actor_id"}, // the composite PK that makes roles a junction
 		ForeignKeys: []*ForeignKey{
 			{Name: "roles_film_id_fkey", Columns: []string{"film_id"}, RefSchema: "public", RefRelation: "films", RefColumns: []string{"id"}},
 			{Name: "roles_actor_id_fkey", Columns: []string{"actor_id"}, RefSchema: "public", RefRelation: "actors", RefColumns: []string{"id"}},
@@ -149,5 +150,153 @@ func TestRelationshipsAmbiguous(t *testing.T) {
 	}
 	if matched != 1 {
 		t.Errorf("writer_id hint matched %d edges, want 1", matched)
+	}
+}
+
+// TestRelationshipsReverseToOneOnPrimaryKey covers 01.8: a foreign key whose
+// columns are the referencing relation's primary key is one-to-one, so its
+// reverse view renders as an object. profiles.user_id is both the PK of
+// profiles and an FK to users, so a user has at most one profile.
+func TestRelationshipsReverseToOneOnPrimaryKey(t *testing.T) {
+	users := &Relation{Schema: "public", Name: "users", Columns: cols("id", "name")}
+	profiles := &Relation{
+		Schema:     "public",
+		Name:       "profiles",
+		Columns:    cols("user_id", "bio"),
+		PrimaryKey: []string{"user_id"},
+		ForeignKeys: []*ForeignKey{{
+			Name: "profiles_user_id_fkey", Columns: []string{"user_id"},
+			RefSchema: "public", RefRelation: "users", RefColumns: []string{"id"},
+		}},
+	}
+	m := NewModel([]*Relation{users, profiles})
+	cands, _ := m.Relationships(rel(t, m, "users"), "profiles", []string{"public"})
+	if len(cands) != 1 {
+		t.Fatalf("got %d candidates, want 1", len(cands))
+	}
+	if cands[0].Card != CardToOne {
+		t.Errorf("Card = %v, want to-one (FK is the profiles PK)", cands[0].Card)
+	}
+}
+
+// TestRelationshipsReverseToOneOnUniqueConstraint covers 01.8 via a unique
+// constraint rather than the primary key: profiles has its own surrogate PK,
+// but a UNIQUE(user_id) constraint still makes the FK one-to-one.
+func TestRelationshipsReverseToOneOnUniqueConstraint(t *testing.T) {
+	users := &Relation{Schema: "public", Name: "users", Columns: cols("id", "name")}
+	profiles := &Relation{
+		Schema:     "public",
+		Name:       "profiles",
+		Columns:    cols("id", "user_id", "bio"),
+		PrimaryKey: []string{"id"},
+		Unique:     [][]string{{"user_id"}},
+		ForeignKeys: []*ForeignKey{{
+			Name: "profiles_user_id_fkey", Columns: []string{"user_id"},
+			RefSchema: "public", RefRelation: "users", RefColumns: []string{"id"},
+		}},
+	}
+	m := NewModel([]*Relation{users, profiles})
+	cands, _ := m.Relationships(rel(t, m, "users"), "profiles", []string{"public"})
+	if len(cands) != 1 {
+		t.Fatalf("got %d candidates, want 1", len(cands))
+	}
+	if cands[0].Card != CardToOne {
+		t.Errorf("Card = %v, want to-one (FK matches a unique constraint)", cands[0].Card)
+	}
+}
+
+// TestRelationshipsReverseToManyWithoutUnique covers the 01.8 negative: a
+// plain FK that is neither the PK nor unique stays to-many, the ordinary
+// reverse-view case (a director owns many films).
+func TestRelationshipsReverseToManyWithoutUnique(t *testing.T) {
+	m := buildEmbedModel()
+	cands, _ := m.Relationships(rel(t, m, "directors"), "films", []string{"public"})
+	if len(cands) != 1 {
+		t.Fatalf("got %d candidates, want 1", len(cands))
+	}
+	if cands[0].Card != CardToMany {
+		t.Errorf("Card = %v, want to-many (FK is neither PK nor unique)", cands[0].Card)
+	}
+}
+
+// TestRelationshipsIncidentalReferencingTableNotJunction covers 01.9: a table
+// that has foreign keys to both ends but does not key them as its primary key
+// is an incidental referencing table, not a junction, so it yields no edge.
+// Here log references both films and actors but keys on its own id.
+func TestRelationshipsIncidentalReferencingTableNotJunction(t *testing.T) {
+	films := &Relation{Schema: "public", Name: "films", Columns: cols("id", "title")}
+	actors := &Relation{Schema: "public", Name: "actors", Columns: cols("id", "name")}
+	log := &Relation{
+		Schema:     "public",
+		Name:       "log",
+		Columns:    cols("id", "film_id", "actor_id"),
+		PrimaryKey: []string{"id"}, // keyed on its own surrogate id, not the FK pair
+		ForeignKeys: []*ForeignKey{
+			{Name: "log_film_id_fkey", Columns: []string{"film_id"}, RefSchema: "public", RefRelation: "films", RefColumns: []string{"id"}},
+			{Name: "log_actor_id_fkey", Columns: []string{"actor_id"}, RefSchema: "public", RefRelation: "actors", RefColumns: []string{"id"}},
+		},
+	}
+	m := NewModel([]*Relation{films, actors, log})
+	cands, _ := m.Relationships(rel(t, m, "films"), "actors", []string{"public"})
+	if len(cands) != 0 {
+		t.Fatalf("got %d candidates, want 0 (log is not a junction)", len(cands))
+	}
+}
+
+// TestRelationshipsJunctionWithExtraPrimaryKeyColumn covers 01.9: the FK
+// columns only need to be a subset of the composite primary key, so a junction
+// that adds another column to its PK (here a role discriminator) still embeds.
+func TestRelationshipsJunctionWithExtraPrimaryKeyColumn(t *testing.T) {
+	films := &Relation{Schema: "public", Name: "films", Columns: cols("id", "title")}
+	actors := &Relation{Schema: "public", Name: "actors", Columns: cols("id", "name")}
+	roles := &Relation{
+		Schema:     "public",
+		Name:       "roles",
+		Columns:    cols("film_id", "actor_id", "character"),
+		PrimaryKey: []string{"film_id", "actor_id", "character"},
+		ForeignKeys: []*ForeignKey{
+			{Name: "roles_film_id_fkey", Columns: []string{"film_id"}, RefSchema: "public", RefRelation: "films", RefColumns: []string{"id"}},
+			{Name: "roles_actor_id_fkey", Columns: []string{"actor_id"}, RefSchema: "public", RefRelation: "actors", RefColumns: []string{"id"}},
+		},
+	}
+	m := NewModel([]*Relation{films, actors, roles})
+	cands, _ := m.Relationships(rel(t, m, "films"), "actors", []string{"public"})
+	if len(cands) != 1 {
+		t.Fatalf("got %d candidates, want 1", len(cands))
+	}
+	if cands[0].Junction == nil || cands[0].Junction.Name != "roles" {
+		t.Fatalf("Junction = %v, want roles", cands[0].Junction)
+	}
+}
+
+// TestRelationshipsSelfJunctionTwoKeys covers 01.9 with a self-referential
+// many-to-many: a friendship junction has two FKs to users, which yields two
+// distinct edges (one per direction), so an unqualified embed is ambiguous and
+// a column hint disambiguates it.
+func TestRelationshipsSelfJunctionTwoKeys(t *testing.T) {
+	users := &Relation{Schema: "public", Name: "users", Columns: cols("id", "name")}
+	friendships := &Relation{
+		Schema:     "public",
+		Name:       "friendships",
+		Columns:    cols("user_id", "friend_id"),
+		PrimaryKey: []string{"user_id", "friend_id"},
+		ForeignKeys: []*ForeignKey{
+			{Name: "friendships_user_id_fkey", Columns: []string{"user_id"}, RefSchema: "public", RefRelation: "users", RefColumns: []string{"id"}},
+			{Name: "friendships_friend_id_fkey", Columns: []string{"friend_id"}, RefSchema: "public", RefRelation: "users", RefColumns: []string{"id"}},
+		},
+	}
+	m := NewModel([]*Relation{users, friendships})
+	cands, _ := m.Relationships(rel(t, m, "users"), "users", []string{"public"})
+	if len(cands) != 2 {
+		t.Fatalf("got %d candidates, want 2 (the two junction directions)", len(cands))
+	}
+	matched := 0
+	for _, c := range cands {
+		if c.MatchesHint("friend_id") {
+			matched++
+		}
+	}
+	if matched != 1 {
+		t.Errorf("friend_id hint matched %d edges, want 1", matched)
 	}
 }

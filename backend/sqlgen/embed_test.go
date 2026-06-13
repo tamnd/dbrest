@@ -51,9 +51,10 @@ func embedModel() *schema.Model {
 	}
 	actors := &schema.Relation{Schema: "public", Name: "actors", Columns: cols("id", "name")}
 	roles := &schema.Relation{
-		Schema:  "public",
-		Name:    "roles",
-		Columns: cols("film_id", "actor_id"),
+		Schema:     "public",
+		Name:       "roles",
+		Columns:    cols("film_id", "actor_id"),
+		PrimaryKey: []string{"film_id", "actor_id"}, // composite PK marks roles a junction
 		ForeignKeys: []*schema.ForeignKey{
 			{Name: "roles_film_id_fkey", Columns: []string{"film_id"}, RefSchema: "public", RefRelation: "films", RefColumns: []string{"id"}},
 			{Name: "roles_actor_id_fkey", Columns: []string{"actor_id"}, RefSchema: "public", RefRelation: "actors", RefColumns: []string{"id"}},

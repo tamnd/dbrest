@@ -58,6 +58,11 @@ type Relation struct {
 	Comment    string
 	Columns    []*Column
 	PrimaryKey []string // column names forming the PK, in order; may be empty
+	// Unique are the relation's unique constraints, each a set of column names. A
+	// foreign key whose columns match the PK or one of these is one-to-one from the
+	// referenced side, so the reverse embed renders as an object (spec 09). An
+	// engine whose introspector does not read unique constraints leaves this empty.
+	Unique [][]string
 	// ForeignKeys are the relation's outgoing foreign keys, the raw material the
 	// planner resolves embeds from (spec 09). Empty on an engine without them.
 	ForeignKeys []*ForeignKey

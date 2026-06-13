@@ -9,6 +9,7 @@ import (
 	"github.com/tamnd/dbrest/ir"
 	"github.com/tamnd/dbrest/plan"
 	"github.com/tamnd/dbrest/reqctx"
+	"github.com/tamnd/dbrest/schema"
 )
 
 // openEmbed seeds two related tables (directors and films, with a films->directors
@@ -63,6 +64,49 @@ func TestIntrospectForeignKey(t *testing.T) {
 	// introspector resolves it to the referenced PK column.
 	if len(fk.RefColumns) != 1 || fk.RefColumns[0] != "id" {
 		t.Errorf("fk ref columns = %v, want [id]", fk.RefColumns)
+	}
+}
+
+// TestIntrospectUniqueConstraint covers 01.8 end-to-end on SQLite: a UNIQUE
+// constraint on a foreign-key column is read from PRAGMA index_list/index_info,
+// recorded on the relation, and makes the reverse embed one-to-one so it renders
+// as an object rather than an array.
+func TestIntrospectUniqueConstraint(t *testing.T) {
+	dsn := "file:" + strings.ReplaceAll(t.Name(), "/", "_") + "?mode=memory&cache=shared"
+	b, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { b.Close() })
+
+	_, err = b.DB().Exec(`
+		CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+		CREATE TABLE profiles (
+			id INTEGER PRIMARY KEY,
+			user_id INTEGER NOT NULL UNIQUE REFERENCES users(id),
+			bio TEXT
+		);
+	`)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	model, err := b.Introspect(context.Background())
+	if err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+	profiles, _ := model.Lookup("profiles", nil)
+	if len(profiles.Unique) != 1 || profiles.Unique[0][0] != "user_id" {
+		t.Fatalf("profiles.Unique = %v, want [[user_id]]", profiles.Unique)
+	}
+
+	users, _ := model.Lookup("users", nil)
+	cands, _ := model.Relationships(users, "profiles", nil)
+	if len(cands) != 1 {
+		t.Fatalf("got %d candidates, want 1", len(cands))
+	}
+	if cands[0].Card != schema.CardToOne {
+		t.Errorf("Card = %v, want to-one (user_id is unique)", cands[0].Card)
 	}
 }
 
