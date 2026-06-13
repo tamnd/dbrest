@@ -243,6 +243,61 @@ func TestIntegrationNativeCallPostFilter(t *testing.T) {
 	}
 }
 
+// TestIntegrationNativeCallSchemaDispatch proves a native RPC resolves in the
+// request's negotiated schema (Accept-Profile / Content-Profile, carried as
+// reqctx.Context.Schema), not always the first configured schema. Two schemas
+// expose a same-named function with distinct results; switching rc.Schema picks
+// the matching one. Finding 03-P04.
+func TestIntegrationNativeCallSchemaDispatch(t *testing.T) {
+	be := openBE(t)
+	be.SetSchemas([]string{"_dbrest_s1", "_dbrest_s2"})
+	ctx := context.Background()
+
+	if _, err := be.Pool().Exec(ctx, `
+		CREATE SCHEMA IF NOT EXISTS _dbrest_s1;
+		CREATE SCHEMA IF NOT EXISTS _dbrest_s2;
+		CREATE OR REPLACE FUNCTION _dbrest_s1.whoami() RETURNS text
+			LANGUAGE sql STABLE AS $$ SELECT 'schema-one' $$;
+		CREATE OR REPLACE FUNCTION _dbrest_s2.whoami() RETURNS text
+			LANGUAGE sql STABLE AS $$ SELECT 'schema-two' $$`); err != nil {
+		t.Fatalf("seed schemas: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, "DROP SCHEMA IF EXISTS _dbrest_s1 CASCADE; DROP SCHEMA IF EXISTS _dbrest_s2 CASCADE")
+	})
+
+	call := func(schema string) string {
+		t.Helper()
+		plan := &ir.Plan{ReadOnly: true, Call: &ir.Call{
+			Function: ir.Ref{Name: "whoami"},
+			Args:     map[string]ir.Value{},
+			ReadOnly: true,
+		}}
+		rc := &reqctx.Context{Method: "GET", Path: "/rpc/whoami", Schema: schema}
+		res, err := be.Execute(ctx, plan, rc)
+		if err != nil {
+			t.Fatalf("Execute(%s): %v", schema, err)
+		}
+		rs := res.Rows()
+		defer rs.Close()
+		if !rs.Next() {
+			t.Fatalf("Execute(%s): no rows", schema)
+		}
+		vals, err := rs.Values()
+		if err != nil {
+			t.Fatalf("Values(%s): %v", schema, err)
+		}
+		return vals[0].(string)
+	}
+
+	if got := call("_dbrest_s1"); got != "schema-one" {
+		t.Errorf("Accept-Profile _dbrest_s1 dispatched to %q, want schema-one", got)
+	}
+	if got := call("_dbrest_s2"); got != "schema-two" {
+		t.Errorf("Accept-Profile _dbrest_s2 dispatched to %q, want schema-two", got)
+	}
+}
+
 func condPtr(c ir.Cond) *ir.Cond { return &c }
 func intPtr(n int) *int          { return &n }
 

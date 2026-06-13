@@ -17,11 +17,11 @@ func TestCompileNativeCallCountWrapsCall(t *testing.T) {
 	b := &Backend{searchPath: []string{"public"}}
 	c := &ir.Call{Function: ir.Ref{Name: "recent_films"}}
 
-	row, apiErr := b.compileNativeCall(c)
+	row, apiErr := b.compileNativeCall(c, "public")
 	if apiErr != nil {
 		t.Fatalf("compileNativeCall: %v", apiErr)
 	}
-	cnt, apiErr := b.compileNativeCallCount(c)
+	cnt, apiErr := b.compileNativeCallCount(c, "public")
 	if apiErr != nil {
 		t.Fatalf("compileNativeCallCount: %v", apiErr)
 	}
@@ -43,7 +43,7 @@ func TestCompileNativeCallCountWithArgs(t *testing.T) {
 		Function: ir.Ref{Name: "search"},
 		Args:     map[string]ir.Value{"q": {Text: "blade"}},
 	}
-	cnt, apiErr := b.compileNativeCallCount(c)
+	cnt, apiErr := b.compileNativeCallCount(c, "app")
 	if apiErr != nil {
 		t.Fatalf("compileNativeCallCount: %v", apiErr)
 	}

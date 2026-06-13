@@ -242,7 +242,7 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 	if plan.Func != nil {
 		st, apiErr = sqlgen.CompileCall(Dialect{}, plan.Call, plan.Func, sqlgen.ContextArgs(rc))
 	} else {
-		st, apiErr = b.compileNativeCall(plan.Call)
+		st, apiErr = b.compileNativeCall(plan.Call, b.callSchema(rc))
 		if apiErr == nil {
 			// A table-valued function result supports the same select, filters,
 			// ordering, and window a table read does; the registry path wraps for
@@ -333,7 +333,7 @@ func (b *Backend) executeCallRead(ctx context.Context, plan *ir.Plan, rc *reqctx
 		if plan.Func != nil {
 			cst, apiErr = sqlgen.CompileCallCount(Dialect{}, plan.Call, plan.Func, sqlgen.ContextArgs(rc))
 		} else {
-			cst, apiErr = b.compileNativeCallCount(plan.Call)
+			cst, apiErr = b.compileNativeCallCount(plan.Call, b.callSchema(rc))
 		}
 		if apiErr != nil {
 			rollback()
@@ -356,6 +356,23 @@ func (b *Backend) executeCallRead(ctx context.Context, plan *ir.Plan, rc *reqctx
 	return res, nil
 }
 
+// callSchema is the schema a native RPC resolves in: the request's negotiated
+// profile (Accept-Profile on GET/HEAD, Content-Profile on POST) when set, else
+// the first configured search-path schema, else public. The HTTP layer already
+// rejected a profile outside the exposed list with PGRST106, so rc.Schema is a
+// vetted member of the configured set by the time it reaches here. This lets a
+// multi-schema deployment dispatch /rpc to the function in the active schema
+// instead of always calling the first one.
+func (b *Backend) callSchema(rc *reqctx.Context) string {
+	if rc != nil && rc.Schema != "" {
+		return rc.Schema
+	}
+	if len(b.searchPath) > 0 {
+		return b.searchPath[0]
+	}
+	return "public"
+}
+
 // compileNativeCall generates the PostgreSQL function-call SQL for the native
 // RPC path (NativeRPC=true), where there is no declared function registry. It
 // renders SELECT * FROM schema.fn(arg := <literal>, ...) with values embedded
@@ -363,12 +380,7 @@ func (b *Backend) executeCallRead(ctx context.Context, plan *ir.Plan, rc *reqctx
 // signature and the call does not depend on pgx OID mapping. String values are
 // single-quote escaped; numeric JSON values are written as numeric literals;
 // booleans become TRUE/FALSE; null or absent values become NULL.
-func (b *Backend) compileNativeCall(c *ir.Call) (*sqlgen.Statement, *pgerr.APIError) {
-	schema := "public"
-	if len(b.searchPath) > 0 {
-		schema = b.searchPath[0]
-	}
-
+func (b *Backend) compileNativeCall(c *ir.Call, schema string) (*sqlgen.Statement, *pgerr.APIError) {
 	d := Dialect{}
 	var sb strings.Builder
 	sb.WriteString("SELECT * FROM ")
@@ -396,8 +408,8 @@ func (b *Backend) compileNativeCall(c *ir.Call) (*sqlgen.Statement, *pgerr.APIEr
 // sqlgen.CompileCallCount (plan.Func is nil), so the count is built here over the
 // same SELECT * FROM schema.fn(...) the row query runs; a scalar-returning function
 // yields its single row and counts as one, a setof yields its rows.
-func (b *Backend) compileNativeCallCount(c *ir.Call) (*sqlgen.Statement, *pgerr.APIError) {
-	inner, apiErr := b.compileNativeCall(c)
+func (b *Backend) compileNativeCallCount(c *ir.Call, schema string) (*sqlgen.Statement, *pgerr.APIError) {
+	inner, apiErr := b.compileNativeCall(c, schema)
 	if apiErr != nil {
 		return nil, apiErr
 	}
