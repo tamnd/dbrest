@@ -156,3 +156,78 @@ func TestWriteUpsertDefaultsConflictToPK(t *testing.T) {
 		t.Errorf("conflict target = %v, want the primary key [id]", got)
 	}
 }
+
+// putQuery builds a PUT upsert addressing id=eq.<idFilter> with a single-object
+// body carrying id=<idBody>, plus optional extra filters and limit.
+func putQuery(idFilter, idBody string, extra *ir.Cond, limit *int) *ir.Query {
+	eq := ir.Cond(ir.Compare{Path: []string{"id"}, Op: ir.OpEq, Value: ir.Value{Text: idFilter}})
+	where := eq
+	if extra != nil {
+		where = ir.And{Kids: []ir.Cond{eq, *extra}}
+	}
+	return &ir.Query{
+		Kind:     ir.Upsert,
+		IsPut:    true,
+		Relation: ir.Ref{Name: "films"},
+		Where:    &where,
+		Limit:    limit,
+		Write: &ir.WriteSpec{
+			Columns:  []string{"id", "title"},
+			Rows:     []map[string]ir.Value{{"id": {JSON: idBody}, "title": {JSON: "X"}}},
+			Conflict: &ir.Conflict{},
+		},
+	}
+}
+
+func TestWritePutHappyPath(t *testing.T) {
+	q := putQuery("1", "1", nil, nil)
+	if _, err := Write(modelPK(), q, nil); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+}
+
+func TestWritePutPartialKeyIs405(t *testing.T) {
+	// A non-eq filter on the key column is not a valid PUT addressing.
+	where := ir.Cond(ir.Compare{Path: []string{"id"}, Op: ir.OpGt, Value: ir.Value{Text: "1"}})
+	q := &ir.Query{
+		Kind: ir.Upsert, IsPut: true, Relation: ir.Ref{Name: "films"}, Where: &where,
+		Write: &ir.WriteSpec{Columns: []string{"id"}, Rows: []map[string]ir.Value{{"id": {JSON: float64(1)}}}, Conflict: &ir.Conflict{}},
+	}
+	_, err := Write(modelPK(), q, nil)
+	if err == nil || err.Code != "PGRST105" {
+		t.Fatalf("want PGRST105, got %v", err)
+	}
+}
+
+func TestWritePutExtraFilterIs405(t *testing.T) {
+	extra := ir.Cond(ir.Compare{Path: []string{"title"}, Op: ir.OpEq, Value: ir.Value{Text: "X"}})
+	_, err := Write(modelPK(), putQuery("1", "1", &extra, nil), nil)
+	if err == nil || err.Code != "PGRST105" {
+		t.Fatalf("want PGRST105 for a non-PK filter, got %v", err)
+	}
+}
+
+func TestWritePutLimitIs400(t *testing.T) {
+	lim := 1
+	_, err := Write(modelPK(), putQuery("1", "1", nil, &lim), nil)
+	if err == nil || err.Code != "PGRST114" {
+		t.Fatalf("want PGRST114, got %v", err)
+	}
+}
+
+func TestWritePutPayloadMismatchIs400(t *testing.T) {
+	// URL says id=eq.999, body says id=1: the keys disagree.
+	_, err := Write(modelPK(), putQuery("999", "1", nil, nil), nil)
+	if err == nil || err.Code != "PGRST115" {
+		t.Fatalf("want PGRST115, got %v", err)
+	}
+}
+
+func TestWritePutMultiRowIs400(t *testing.T) {
+	q := putQuery("1", "1", nil, nil)
+	q.Write.Rows = append(q.Write.Rows, map[string]ir.Value{"id": {JSON: float64(1)}, "title": {JSON: "Y"}})
+	_, err := Write(modelPK(), q, nil)
+	if err == nil || err.Code != "PGRST115" {
+		t.Fatalf("want PGRST115 for a multi-row PUT body, got %v", err)
+	}
+}

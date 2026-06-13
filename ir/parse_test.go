@@ -267,16 +267,49 @@ func TestParseWriteUpsertViaResolution(t *testing.T) {
 	}
 }
 
-func TestParseWriteOnConflictTarget(t *testing.T) {
+// on_conflict without a resolution preference leaves a POST a plain insert, the
+// way PostgREST does: a duplicate key then fails with 409 rather than silently
+// overwriting the existing row (review item 01.14).
+func TestParseWriteOnConflictAloneStaysInsert(t *testing.T) {
 	q, err := ParseWrite(Insert, "films", "on_conflict=id", nil, "", []byte(`{"id":1}`))
 	if err != nil {
 		t.Fatalf("ParseWrite: %v", err)
 	}
+	if q.Kind != Insert {
+		t.Errorf("on_conflict alone should stay an insert, got %v", q.Kind)
+	}
+	if q.Write.Conflict != nil {
+		t.Errorf("conflict = %#v, want nil for a plain insert", q.Write.Conflict)
+	}
+}
+
+// on_conflict combined with a resolution preference promotes to an upsert and
+// carries the named target.
+func TestParseWriteOnConflictWithResolution(t *testing.T) {
+	q, err := ParseWrite(Insert, "films", "on_conflict=id", []string{"resolution=merge-duplicates"}, "", []byte(`{"id":1}`))
+	if err != nil {
+		t.Fatalf("ParseWrite: %v", err)
+	}
 	if q.Kind != Upsert {
-		t.Errorf("on_conflict should make it an upsert, got %v", q.Kind)
+		t.Errorf("on_conflict with resolution should upsert, got %v", q.Kind)
 	}
 	if got := q.Write.Conflict.Target; len(got) != 1 || got[0] != "id" {
 		t.Errorf("conflict target = %v, want [id]", got)
+	}
+}
+
+// A PATCH carrying a stale resolution preference is not promoted to an upsert;
+// resolution and on_conflict are consulted only for inserts and PUT (01.14).
+func TestParseWriteResolutionIgnoredForUpdate(t *testing.T) {
+	q, err := ParseWrite(Update, "films", "on_conflict=id", []string{"resolution=merge-duplicates"}, "", []byte(`{"title":"X"}`))
+	if err != nil {
+		t.Fatalf("ParseWrite: %v", err)
+	}
+	if q.Kind != Update {
+		t.Errorf("Kind = %v, want Update (resolution ignored for PATCH)", q.Kind)
+	}
+	if q.Write.Conflict != nil {
+		t.Errorf("conflict = %#v, want nil for an update", q.Write.Conflict)
 	}
 }
 

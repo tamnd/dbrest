@@ -20,6 +20,9 @@ const (
 	CodeMethodNotAllowed = "PGRST101" // 405 method not allowed (GET on a volatile fn)
 	CodeInvalidBody      = "PGRST102" // 400 invalid request body
 	CodeRangeUnsatisfied = "PGRST103" // 416 requested range not satisfiable
+	CodePutPrimaryKey    = "PGRST105" // 405 PUT filters not exactly the PK with eq
+	CodePutLimit         = "PGRST114" // 400 limit/offset on a PUT
+	CodePutPayloadKey    = "PGRST115" // 400 PUT payload PK differs from the URL filter
 	CodeMediaType        = "PGRST107" // 406 Accept negotiation failed
 	CodeGucHeaders       = "PGRST111" // 500 invalid response.headers from a function
 	CodeGucStatus        = "PGRST112" // 500 invalid response.status from a function
@@ -150,6 +153,30 @@ func ErrAmbiguousFunction(candidates []string) *APIError {
 	e := New(http.StatusMultipleChoices, CodeAmbiguousFunc,
 		"Could not choose the best candidate function between: "+strings.Join(candidates, ", "))
 	return e.WithHint("Try renaming the parameters or the function itself in the database so function overloading can be resolved")
+}
+
+// ErrPutPrimaryKey is raised when a PUT's URL filters are not exactly the
+// relation's primary key columns, each with eq. PostgREST insists a PUT address
+// one row by its whole key, so a partial, extra, or non-eq filter is its
+// PGRST105 with a 405 (verified live).
+func ErrPutPrimaryKey() *APIError {
+	return New(http.StatusMethodNotAllowed, CodePutPrimaryKey,
+		"Filters must include all and only primary key columns with 'eq' operators")
+}
+
+// ErrPutLimit is raised when a PUT carries a limit or offset; PostgREST rejects
+// paginating a single-row replace as its PGRST114 with a 400.
+func ErrPutLimit() *APIError {
+	return New(http.StatusBadRequest, CodePutLimit,
+		"limit/offset querystring parameters are not allowed for PUT")
+}
+
+// ErrPutPayloadKey is raised when a PUT body's primary key values differ from
+// the URL filter values, or the body is not a single object. PostgREST condemns
+// the transaction so nothing is written; it is its PGRST115 with a 400.
+func ErrPutPayloadKey() *APIError {
+	return New(http.StatusBadRequest, CodePutPayloadKey,
+		"Payload values do not match URL in primary key column(s)")
 }
 
 // ErrInvalidPath is raised for a request path PostgREST has no route for: more

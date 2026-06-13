@@ -139,7 +139,9 @@ func ParseWrite(kind QueryKind, relation, rawQuery string, preferHeaders []strin
 	if err != nil {
 		return nil, pgerr.ErrParse("could not parse query string")
 	}
-	q := &Query{Kind: kind, Relation: Ref{Name: relation}}
+	// PUT is the only method the router maps to Upsert; capture it before the
+	// promotion below can also turn a POST into an upsert.
+	q := &Query{Kind: kind, Relation: Ref{Name: relation}, IsPut: kind == Upsert}
 	q.Prefer = ParsePrefer(preferHeaders)
 	if q.Prefer.Count != nil {
 		q.Count = *q.Prefer.Count
@@ -159,11 +161,13 @@ func ParseWrite(kind QueryKind, relation, rawQuery string, preferHeaders []strin
 		w.Tx = *q.Prefer.Tx
 	}
 
-	// An on_conflict target or a resolution preference makes this an upsert; PUT
-	// is always an upsert. The conflict target defaults to the primary key,
-	// which the planner fills in.
+	// PostgREST performs an upsert only for PUT or for a POST carrying a
+	// Prefer: resolution= preference. on_conflict alone leaves a POST a plain
+	// insert (a duplicate key then fails with 409), and both on_conflict and
+	// resolution are ignored entirely for PATCH and DELETE. The conflict target
+	// defaults to the primary key, which the planner fills in.
 	onConflict := vals.Get("on_conflict")
-	if kind == Upsert || onConflict != "" || q.Prefer.Resolution != nil {
+	if q.IsPut || (kind == Insert && q.Prefer.Resolution != nil) {
 		q.Kind = Upsert
 		c := &Conflict{}
 		if onConflict != "" {

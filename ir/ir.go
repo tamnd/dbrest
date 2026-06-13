@@ -60,6 +60,7 @@ type Query struct {
 	Count     CountKind
 	Prefer    PreferSet
 	FromRange bool // limit/offset came from the Range request header, not ?limit=
+	IsPut     bool // the request method was PUT, so PUT upsert validations apply
 }
 
 // Call is a /rpc/<fn> request.
@@ -301,9 +302,11 @@ type WriteSpec struct {
 // MissingMode is the Prefer: missing= behavior for absent payload columns.
 type MissingMode uint8
 
+// MissingNull is the zero value because PostgREST inserts SQL NULL for payload
+// columns a row omits; Prefer: missing=default is the opt-in for column DEFAULTs.
 const (
-	MissingDefault MissingMode = iota
-	MissingNull
+	MissingNull MissingMode = iota
+	MissingDefault
 )
 
 // Conflict describes an upsert conflict resolution.

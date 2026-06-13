@@ -6,7 +6,10 @@
 package plan
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
+	"strconv"
 
 	"github.com/tamnd/dbrest/ir"
 	"github.com/tamnd/dbrest/pgerr"
@@ -141,8 +144,122 @@ func Write(model *schema.Model, q *ir.Query, searchPath []string) (*ir.Plan, *pg
 	if err := validateWrite(rel, q.Write); err != nil {
 		return nil, err
 	}
+	if q.IsPut {
+		if err := validatePut(rel, q); err != nil {
+			return nil, err
+		}
+	}
 
 	return &ir.Plan{Query: q, Rel: rel, ReadOnly: false}, nil
+}
+
+// validatePut enforces PostgREST's PUT contract before any write: the URL
+// filters must be exactly the relation's primary key columns, each with eq
+// (PGRST105); no limit or offset may be present (PGRST114); and the body must
+// be a single object whose primary key values equal the URL's (PGRST115). A PUT
+// addresses one row by its whole key, so anything looser is rejected here rather
+// than writing the wrong row.
+func validatePut(rel *schema.Relation, q *ir.Query) *pgerr.APIError {
+	if q.Limit != nil || q.Offset != nil {
+		return pgerr.ErrPutLimit()
+	}
+	eqs, ok := putEqFilters(q.Where)
+	if !ok {
+		return pgerr.ErrPutPrimaryKey()
+	}
+	pk := rel.PrimaryKey
+	if len(pk) == 0 || len(eqs) != len(pk) {
+		return pgerr.ErrPutPrimaryKey()
+	}
+	for _, c := range pk {
+		if _, ok := eqs[c]; !ok {
+			return pgerr.ErrPutPrimaryKey()
+		}
+	}
+	w := q.Write
+	if w == nil || len(w.Rows) != 1 {
+		return pgerr.ErrPutPayloadKey()
+	}
+	row := w.Rows[0]
+	for _, c := range pk {
+		v, ok := row[c]
+		if !ok || !putKeyMatches(rel, c, v, eqs[c]) {
+			return pgerr.ErrPutPayloadKey()
+		}
+	}
+	return nil
+}
+
+// putEqFilters flattens a PUT's WHERE into a map of column to operand text,
+// accepting only a conjunction of single-column, non-negated, unquantified eq
+// comparisons. It returns ok=false for any other shape (a non-eq operator, an
+// or/not tree, a JSON path, or a quantifier), none of which a PUT may carry.
+func putEqFilters(c *ir.Cond) (map[string]string, bool) {
+	out := map[string]string{}
+	var walk func(n ir.Cond) bool
+	walk = func(n ir.Cond) bool {
+		switch v := n.(type) {
+		case ir.And:
+			for _, k := range v.Kids {
+				if !walk(k) {
+					return false
+				}
+			}
+			return true
+		case ir.Compare:
+			if v.Op != ir.OpEq || len(v.Path) != 1 || v.Quant != ir.QNone || v.Negate {
+				return false
+			}
+			out[v.Path[0]] = v.Value.Text
+			return true
+		default:
+			return false
+		}
+	}
+	if c == nil {
+		return out, true
+	}
+	return out, walk(*c)
+}
+
+// putKeyMatches reports whether a payload value for a primary key column equals
+// the URL filter text. Both sides are coerced through the column's type so 1 and
+// "1" agree; if the type is unknown or either side fails to coerce, the raw text
+// forms are compared.
+func putKeyMatches(rel *schema.Relation, col string, payload ir.Value, urlText string) bool {
+	pj := jsonScalarText(payload.JSON)
+	if c, ok := rel.Column(col); ok && c.Type != "" {
+		pv, perr := pgtypes.ParseScalar(c.Type, pj)
+		uv, uerr := pgtypes.ParseScalar(c.Type, urlText)
+		if perr == nil && uerr == nil {
+			return fmt.Sprint(pv) == fmt.Sprint(uv)
+		}
+	}
+	return pj == urlText
+}
+
+// jsonScalarText renders a decoded JSON scalar as the text PostgREST would
+// compare against a URL operand. A JSON number prints without a trailing zero so
+// 1 stays "1", not "1.000000".
+func jsonScalarText(v any) string {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return t
+	case bool:
+		if t {
+			return "true"
+		}
+		return "false"
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	case json.Number:
+		return t.String()
+	default:
+		b, _ := json.Marshal(t)
+		return string(b)
+	}
 }
 
 // Call resolves a parsed RPC call against the function registry and returns an

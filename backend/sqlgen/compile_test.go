@@ -303,23 +303,23 @@ func TestCompileInsertMultiRow(t *testing.T) {
 }
 
 func TestCompileInsertMissingDefaultAndNull(t *testing.T) {
-	// A row missing a column takes DEFAULT under missing=default ...
+	// A row missing a column takes DEFAULT only under an explicit missing=default ...
 	st, _ := CompileInsert(stub{}, &ir.Query{
 		Relation: ir.Ref{Name: "t"},
 		Write: &ir.WriteSpec{
 			Columns: []string{"a", "b"},
+			Missing: ir.MissingDefault,
 			Rows:    []map[string]ir.Value{{"a": jstr("x")}},
 		},
 	}, nil)
 	if st.SQL != `INSERT INTO "t" ("a", "b") VALUES ($1, DEFAULT)` {
 		t.Errorf("default: SQL = %q", st.SQL)
 	}
-	// ... and a bound NULL under missing=null.
+	// ... and a bound NULL by default (MissingNull is the zero value, item 01.18).
 	st, _ = CompileInsert(stub{}, &ir.Query{
 		Relation: ir.Ref{Name: "t"},
 		Write: &ir.WriteSpec{
 			Columns: []string{"a", "b"},
-			Missing: ir.MissingNull,
 			Rows:    []map[string]ir.Value{{"a": jstr("x")}},
 		},
 	}, nil)
