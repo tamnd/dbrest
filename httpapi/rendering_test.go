@@ -36,6 +36,64 @@ func TestSelectOrderPreservedInJSON(t *testing.T) {
 	}
 }
 
+// TestNullsStrippedArrayOmitsNullKeys pins 02.13: the nulls=stripped parameter
+// on the vendor array type drops null-valued keys from each object and the
+// Content-Type echoes the parameter. Film 4 has a NULL year.
+func TestNullsStrippedArrayOmitsNullKeys(t *testing.T) {
+	srv := newServer(t)
+	resp := do(t, srv, http.MethodGet, "/films?id=eq.4&select=id,title,year,rating", map[string]string{
+		"Accept": "application/vnd.pgrst.array+json;nulls=stripped",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/vnd.pgrst.array+json; nulls=stripped; charset=utf-8" {
+		t.Errorf("Content-Type = %q", ct)
+	}
+	body := readBody(t, resp)
+	if strings.Contains(body, `"year"`) {
+		t.Errorf("null year key should be stripped: %s", body)
+	}
+	if !strings.Contains(body, `"title"`) || !strings.Contains(body, `"rating"`) {
+		t.Errorf("non-null keys should remain: %s", body)
+	}
+}
+
+// TestNullsStrippedObjectOmitsNullKeys pins the same parameter on the object
+// vendor type for a singular request.
+func TestNullsStrippedObjectOmitsNullKeys(t *testing.T) {
+	srv := newServer(t)
+	resp := do(t, srv, http.MethodGet, "/films?id=eq.4&select=id,title,year", map[string]string{
+		"Accept": "application/vnd.pgrst.object+json;nulls=stripped",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/vnd.pgrst.object+json; nulls=stripped; charset=utf-8" {
+		t.Errorf("Content-Type = %q", ct)
+	}
+	body := readBody(t, resp)
+	if strings.Contains(body, `"year"`) {
+		t.Errorf("null year key should be stripped: %s", body)
+	}
+	if strings.HasPrefix(strings.TrimSpace(body), "[") {
+		t.Errorf("object request should not be an array: %s", body)
+	}
+}
+
+// TestNullsStrippedIgnoredOnPlainJSON pins that the parameter is vendor-only:
+// plain application/json keeps null keys, matching PostgREST.
+func TestNullsStrippedIgnoredOnPlainJSON(t *testing.T) {
+	srv := newServer(t)
+	resp := do(t, srv, http.MethodGet, "/films?id=eq.4&select=id,title,year", map[string]string{
+		"Accept": "application/json;nulls=stripped",
+	})
+	body := readBody(t, resp)
+	if !strings.Contains(body, `"year"`) {
+		t.Errorf("plain json should keep the null key: %s", body)
+	}
+}
+
 // TestSelectOrderReversed pins the inverse projection to prove the order tracks
 // the select, not a fixed column order: id,title renders {"id":...,"title":...}.
 func TestSelectOrderReversed(t *testing.T) {

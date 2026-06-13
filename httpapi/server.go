@@ -593,7 +593,7 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 		return
 	}
 	t.mark("parse", parseStart)
-	call.Singular = media == mediaObject
+	call.Singular = singularMedia(media)
 	if apiErr := s.applyTxPolicy(&call.Prefer); apiErr != nil {
 		writeError(w, apiErr)
 		return
@@ -713,7 +713,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity,
 		return
 	}
 	t.mark("parse", parseStart)
-	q.Singular = media == mediaObject
+	q.Singular = singularMedia(media)
 
 	if apiErr := s.applyTxPolicy(&q.Prefer); apiErr != nil {
 		writeError(w, apiErr)
@@ -839,7 +839,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.Que
 		return
 	}
 	t.mark("parse", parseStart)
-	q.Singular = media == mediaObject
+	q.Singular = singularMedia(media)
 
 	if apiErr := s.applyTxPolicy(&q.Prefer); apiErr != nil {
 		writeError(w, apiErr)

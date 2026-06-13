@@ -22,13 +22,30 @@ const (
 
 var supportedMedia = []string{mediaJSON, mediaArray, mediaObject, mediaPlan, mediaCSV, mediaOctet, mediaText}
 
+// The internal media keys for the nulls=stripped variants of the vendor array
+// and object types. They are not real Accept literals; negotiate returns them so
+// the render path knows to drop null-valued keys and echo the parameterized
+// Content-Type.
+const (
+	mediaArrayStripped  = "application/vnd.pgrst.array+json;nulls=stripped"
+	mediaObjectStripped = "application/vnd.pgrst.object+json;nulls=stripped"
+)
+
+// singularMedia reports whether a negotiated media type asks for a single object
+// (the object vendor type or its nulls=stripped variant).
+func singularMedia(media string) bool {
+	return media == mediaObject || media == mediaObjectStripped
+}
+
 // mediaRange is one parsed entry of an Accept header: a type/subtype pair, its
-// quality value, and its position in the header for stable tie-breaking.
+// quality value, its position in the header for stable tie-breaking, and whether
+// it carried the nulls=stripped parameter.
 type mediaRange struct {
-	typ   string
-	sub   string
-	q     float64
-	order int
+	typ        string
+	sub        string
+	q          float64
+	order      int
+	stripNulls bool
 }
 
 // parseAccept parses the Accept header values into media ranges sorted by
@@ -48,14 +65,19 @@ func parseAccept(headers []string) []mediaRange {
 				continue
 			}
 			q := 1.0
+			stripNulls := false
 			for _, p := range segs[1:] {
-				if v, ok := strings.CutPrefix(strings.TrimSpace(p), "q="); ok {
+				p = strings.TrimSpace(p)
+				if v, ok := strings.CutPrefix(p, "q="); ok {
 					if f, err := strconv.ParseFloat(v, 64); err == nil {
 						q = f
 					}
 				}
+				if v, ok := strings.CutPrefix(strings.ToLower(p), "nulls="); ok && strings.TrimSpace(v) == "stripped" {
+					stripNulls = true
+				}
 			}
-			ranges = append(ranges, mediaRange{strings.ToLower(typ), strings.ToLower(sub), q, n})
+			ranges = append(ranges, mediaRange{strings.ToLower(typ), strings.ToLower(sub), q, n, stripNulls})
 			n++
 		}
 	}
@@ -131,6 +153,17 @@ func negotiate(headers []string) (string, bool) {
 			full := vendorSynonym(r.typ + "/" + r.sub)
 			for _, m := range supportedMedia {
 				if m == full {
+					// nulls=stripped applies only to the vendor array and object
+					// types; on plain application/json the parameter is ignored,
+					// matching PostgREST.
+					if r.stripNulls {
+						switch m {
+						case mediaArray:
+							return mediaArrayStripped, true
+						case mediaObject:
+							return mediaObjectStripped, true
+						}
+					}
 					return m, true
 				}
 			}

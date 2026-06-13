@@ -28,18 +28,32 @@ type rendered struct {
 func renderFor(media string, res backend.Result, rawCols map[string]bool) (*rendered, *pgerr.APIError) {
 	switch media {
 	case mediaJSON, mediaArray:
-		out, err := renderRows(res, false, rawCols)
+		out, err := renderRows(res, false, rawCols, false)
 		if err != nil {
 			return nil, err
 		}
 		out.contentType = "application/json; charset=utf-8"
 		return out, nil
+	case mediaArrayStripped:
+		out, err := renderRows(res, false, rawCols, true)
+		if err != nil {
+			return nil, err
+		}
+		out.contentType = "application/vnd.pgrst.array+json; nulls=stripped; charset=utf-8"
+		return out, nil
 	case mediaObject:
-		out, err := renderRows(res, true, rawCols)
+		out, err := renderRows(res, true, rawCols, false)
 		if err != nil {
 			return nil, err
 		}
 		out.contentType = singularMediaType + "; charset=utf-8"
+		return out, nil
+	case mediaObjectStripped:
+		out, err := renderRows(res, true, rawCols, true)
+		if err != nil {
+			return nil, err
+		}
+		out.contentType = "application/vnd.pgrst.object+json; nulls=stripped; charset=utf-8"
 		return out, nil
 	case mediaCSV:
 		return renderCSV(res)
@@ -111,7 +125,7 @@ func renderCall(media string, res backend.Result, fn *rpc.Function, fnName strin
 		out.total, out.hasTotl = total, true
 	}
 
-	if media == mediaObject {
+	if singularMedia(media) {
 		if len(vals) != 1 {
 			return nil, pgerr.ErrSingularZeroMany().
 				WithDetails(fmt.Sprintf("The result contains %d rows", len(vals)))
@@ -205,7 +219,7 @@ func marshalCall(v any) ([]byte, *pgerr.APIError) {
 // This is the Go-shaped assembly path (Result.Rows). The engine-assembled path
 // (Result.Body) is used once the embedding subsystem emits in-engine JSON; the
 // observable body is identical either way.
-func renderRows(res backend.Result, singular bool, rawCols map[string]bool) (*rendered, *pgerr.APIError) {
+func renderRows(res backend.Result, singular bool, rawCols map[string]bool, stripNulls bool) (*rendered, *pgerr.APIError) {
 	rs := res.Rows()
 	defer rs.Close()
 	cols := rs.Columns()
@@ -222,7 +236,7 @@ func renderRows(res backend.Result, singular bool, rawCols map[string]bool) (*re
 		}
 		// Encode each row independently so a large result streams in bounded
 		// memory once the engine-assembled path replaces this shaper.
-		rb, err := encodeRowObject(cols, vals, rawCols)
+		rb, err := encodeRowObject(cols, vals, rawCols, stripNulls)
 		if err != nil {
 			return nil, pgerr.ErrInternal(err.Error())
 		}
@@ -257,25 +271,32 @@ func renderRows(res backend.Result, singular bool, rawCols map[string]bool) (*re
 // projection (column) order, the way PostgREST preserves select order rather
 // than the alphabetical order a Go map would impose. A rawCols column carries
 // engine-assembled JSON emitted verbatim; every other value is encoded normally.
-func encodeRowObject(cols []string, vals []any, rawCols map[string]bool) ([]byte, error) {
+func encodeRowObject(cols []string, vals []any, rawCols map[string]bool, stripNulls bool) ([]byte, error) {
 	var rb bytes.Buffer
 	rb.WriteByte('{')
+	first := true
 	for i, c := range cols {
-		if i > 0 {
-			rb.WriteByte(',')
-		}
-		key, err := jsonNoEscape(c)
-		if err != nil {
-			return nil, err
-		}
-		rb.Write(key)
-		rb.WriteByte(':')
 		var v any
 		if rawCols[c] {
 			v = rawJSON(vals[i])
 		} else {
 			v = vals[i]
 		}
+		// nulls=stripped drops a key whose value is SQL NULL (a nil after the raw
+		// embed unwrap), so the object omits it entirely.
+		if stripNulls && v == nil {
+			continue
+		}
+		if !first {
+			rb.WriteByte(',')
+		}
+		first = false
+		key, err := jsonNoEscape(c)
+		if err != nil {
+			return nil, err
+		}
+		rb.Write(key)
+		rb.WriteByte(':')
 		val, err := jsonNoEscape(v)
 		if err != nil {
 			return nil, err
