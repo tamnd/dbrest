@@ -2,12 +2,14 @@ package postgres_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/tamnd/dbrest/backend/postgres"
 	"github.com/tamnd/dbrest/ir"
+	planpkg "github.com/tamnd/dbrest/plan"
 	"github.com/tamnd/dbrest/reqctx"
 )
 
@@ -584,6 +586,77 @@ func TestIntegrationArrayPayloadByColumnType(t *testing.T) {
 	}
 	if len(labs) != 2 || labs[0] != "a" || labs[1] != "b" {
 		t.Errorf("text[] labs = %v, want [a b]", labs)
+	}
+}
+
+// TestIntegrationWideEmbed proves an embed of a table with more than 50 columns
+// assembles instead of failing. json_build_object caps at 100 arguments (two per
+// key), so a 60-column embed raised 54023; the dialect now chunks the object with
+// jsonb_build_object and || past 50 keys. Finding 01-P07.
+func TestIntegrationWideEmbed(t *testing.T) {
+	be := openBE(t)
+	ctx := context.Background()
+
+	// A parent with a child whose 60 columns force the chunked path.
+	var childCols strings.Builder
+	for i := 0; i < 60; i++ {
+		fmt.Fprintf(&childCols, ", c%d int DEFAULT %d", i, i)
+	}
+	ddl := `
+		CREATE TABLE IF NOT EXISTS _dbrest_test_parent (id int PRIMARY KEY);
+		CREATE TABLE IF NOT EXISTS _dbrest_test_child (
+			id int PRIMARY KEY,
+			parent_id int REFERENCES _dbrest_test_parent(id)` + childCols.String() + `
+		);
+		TRUNCATE _dbrest_test_child, _dbrest_test_parent;
+		INSERT INTO _dbrest_test_parent (id) VALUES (1);
+		INSERT INTO _dbrest_test_child (id, parent_id) VALUES (10, 1);`
+	if _, err := be.Pool().Exec(ctx, ddl); err != nil {
+		t.Fatalf("seed wide tables: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, "DROP TABLE IF EXISTS _dbrest_test_child; DROP TABLE IF EXISTS _dbrest_test_parent")
+	})
+
+	model, err := be.Introspect(ctx)
+	if err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+	rel, ok := model.Lookup("_dbrest_test_parent", []string{"public"})
+	if !ok {
+		t.Fatal("_dbrest_test_parent not found")
+	}
+
+	// GET /_dbrest_test_parent?select=id,_dbrest_test_child(*) embeds every child
+	// column, which is the chunked-object case.
+	q, perr := ir.ParseRead("_dbrest_test_parent", "select=id,_dbrest_test_child(*)", nil)
+	if perr != nil {
+		t.Fatalf("parse: %v", perr)
+	}
+	rp, perr := planpkg.Read(model, q, []string{"public"}, planpkg.Options{})
+	if perr != nil {
+		t.Fatalf("plan: %v", perr)
+	}
+	rp.Rel = rel
+
+	res, err := be.Execute(ctx, rp, &reqctx.Context{Method: "GET", Path: "/_dbrest_test_parent"})
+	if err != nil {
+		t.Fatalf("Execute(wide embed): %v", err)
+	}
+	rs := res.Rows()
+	defer rs.Close()
+	rows := 0
+	for rs.Next() {
+		if _, err := rs.Values(); err != nil {
+			t.Fatalf("Values: %v", err)
+		}
+		rows++
+	}
+	if err := rs.Err(); err != nil {
+		t.Fatalf("row error: %v", err)
+	}
+	if rows != 1 {
+		t.Errorf("wide embed returned %d parent rows, want 1", rows)
 	}
 }
 

@@ -110,12 +110,34 @@ func (Dialect) Upsert(spec sqlgen.UpsertSpec) (string, error) {
 // JSONObject assembles a JSON object with json_build_object, the function whose
 // argument order fixes the key order to the select order (spec 06, "JSON
 // assembly"). Keys are JSON string literals; values are already-compiled SQL.
+//
+// PostgreSQL caps a function call at 100 arguments (FUNC_MAX_ARGS), and each pair
+// is two arguments, so an object of more than 50 keys (a wide embedded table)
+// would raise 54023. Past that threshold the object is built in chunks of 50
+// pairs with jsonb_build_object and concatenated with jsonb's || , then cast back
+// to json so the result type matches the unchunked form for json_agg and the
+// json cast downstream.
 func (Dialect) JSONObject(pairs []sqlgen.Pair) string {
-	parts := make([]string, 0, len(pairs)*2)
-	for _, p := range pairs {
-		parts = append(parts, "'"+strings.ReplaceAll(p.Key, "'", "''")+"'", p.Value)
+	const maxPairs = 50
+	buildChunk := func(chunk []sqlgen.Pair, fn string) string {
+		parts := make([]string, 0, len(chunk)*2)
+		for _, p := range chunk {
+			parts = append(parts, "'"+strings.ReplaceAll(p.Key, "'", "''")+"'", p.Value)
+		}
+		return fn + "(" + strings.Join(parts, ", ") + ")"
 	}
-	return "json_build_object(" + strings.Join(parts, ", ") + ")"
+	if len(pairs) <= maxPairs {
+		return buildChunk(pairs, "json_build_object")
+	}
+	var chunks []string
+	for i := 0; i < len(pairs); i += maxPairs {
+		end := i + maxPairs
+		if end > len(pairs) {
+			end = len(pairs)
+		}
+		chunks = append(chunks, buildChunk(pairs[i:end], "jsonb_build_object"))
+	}
+	return "to_json(" + strings.Join(chunks, " || ") + ")"
 }
 
 // JSONAgg aggregates rows with json_agg. PostgreSQL takes an ORDER BY inside the

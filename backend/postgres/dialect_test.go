@@ -1,6 +1,8 @@
 package postgres
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/tamnd/dbrest/backend/sqlgen"
@@ -254,6 +256,35 @@ func TestSession(t *testing.T) {
 func TestBoolValue(t *testing.T) {
 	if d.BoolValue(true) != "TRUE" || d.BoolValue(false) != "FALSE" {
 		t.Error("BoolValue should render the PostgreSQL keywords")
+	}
+}
+
+// A JSON object of more than 50 keys exceeds json_build_object's 100-argument
+// limit, so the dialect chunks it into jsonb_build_object calls concatenated with
+// || and casts the result back to json. A small object stays a single
+// json_build_object call.
+func TestJSONObjectChunking(t *testing.T) {
+	small := []sqlgen.Pair{{Key: "a", Value: `t."a"`}, {Key: "b", Value: `t."b"`}}
+	got := d.JSONObject(small)
+	if got != `json_build_object('a', t."a", 'b', t."b")` {
+		t.Errorf("small object = %q", got)
+	}
+
+	pairs := make([]sqlgen.Pair, 120)
+	for i := range pairs {
+		name := fmt.Sprintf("c%d", i)
+		pairs[i] = sqlgen.Pair{Key: name, Value: "t." + name}
+	}
+	got = d.JSONObject(pairs)
+	if !strings.HasPrefix(got, "to_json(jsonb_build_object(") {
+		t.Fatalf("large object did not chunk: %q", got[:60])
+	}
+	// 120 pairs at 50 per chunk is three chunks, joined by two || operators.
+	if n := strings.Count(got, "jsonb_build_object("); n != 3 {
+		t.Errorf("chunk count = %d, want 3", n)
+	}
+	if n := strings.Count(got, " || "); n != 2 {
+		t.Errorf("concat count = %d, want 2", n)
 	}
 }
 
