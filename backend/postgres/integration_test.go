@@ -13,6 +13,7 @@ import (
 	"github.com/tamnd/dbrest/pgerr"
 	planpkg "github.com/tamnd/dbrest/plan"
 	"github.com/tamnd/dbrest/reqctx"
+	"github.com/tamnd/dbrest/rpc"
 	"github.com/tamnd/dbrest/schema"
 )
 
@@ -246,6 +247,81 @@ func TestIntegrationNativeCallPostFilter(t *testing.T) {
 	}
 	if titles[0] != "Arrival" {
 		t.Errorf("order=year.desc top row = %q, want Arrival", titles[0])
+	}
+}
+
+// TestIntegrationNativeReturnShapes covers finding 03-P06: the native RPC path
+// resolves a function's return shape from pg_proc (proretset plus the return
+// type's class) and carries it on plan.Func, so the renderer shapes the body by
+// the real return kind instead of guessing from column names. Each seeded function
+// exercises one shape; Execute must populate plan.Func with the matching kind.
+func TestIntegrationNativeReturnShapes(t *testing.T) {
+	be := openBE(t)
+	ctx := context.Background()
+
+	if _, err := be.Pool().Exec(ctx, `
+		CREATE OR REPLACE FUNCTION _dbrest_ret_setof_integers() RETURNS SETOF integer
+			LANGUAGE sql STABLE AS $$ SELECT * FROM (VALUES (1),(2),(3)) v(n) $$;
+		CREATE OR REPLACE FUNCTION _dbrest_ret_point_2d(OUT x int, OUT y int)
+			LANGUAGE sql STABLE AS $$ SELECT 10, 5 $$;
+		CREATE OR REPLACE FUNCTION _dbrest_ret_films() RETURNS TABLE(id int, title text)
+			LANGUAGE sql STABLE AS $$ SELECT * FROM (VALUES (1, 'Dune')) v(id, title) $$;
+		CREATE OR REPLACE FUNCTION _dbrest_ret_scalar() RETURNS integer
+			LANGUAGE sql IMMUTABLE AS $$ SELECT 42 $$;
+		CREATE OR REPLACE FUNCTION _dbrest_ret_void() RETURNS void
+			LANGUAGE plpgsql VOLATILE AS $$ BEGIN END $$`); err != nil {
+		t.Fatalf("seed functions: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, `
+			DROP FUNCTION IF EXISTS _dbrest_ret_setof_integers();
+			DROP FUNCTION IF EXISTS _dbrest_ret_point_2d();
+			DROP FUNCTION IF EXISTS _dbrest_ret_films();
+			DROP FUNCTION IF EXISTS _dbrest_ret_scalar();
+			DROP FUNCTION IF EXISTS _dbrest_ret_void()`)
+	})
+
+	// Introspection fills the return-shape map the native path reads.
+	if _, err := be.Introspect(ctx); err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+
+	cases := []struct {
+		fn       string
+		readOnly bool
+		want     rpc.ReturnKind
+	}{
+		{"_dbrest_ret_setof_integers", true, rpc.ReturnSetOf},
+		{"_dbrest_ret_point_2d", true, rpc.ReturnObject},
+		{"_dbrest_ret_films", true, rpc.ReturnTable},
+		{"_dbrest_ret_scalar", true, rpc.ReturnScalar},
+		{"_dbrest_ret_void", false, rpc.ReturnVoid},
+	}
+	for _, c := range cases {
+		t.Run(c.fn, func(t *testing.T) {
+			plan := &ir.Plan{ReadOnly: c.readOnly, Call: &ir.Call{
+				Function: ir.Ref{Name: c.fn},
+				Args:     map[string]ir.Value{},
+				ReadOnly: c.readOnly,
+			}}
+			method := "GET"
+			if !c.readOnly {
+				method = "POST"
+			}
+			res, err := be.Execute(ctx, plan, &reqctx.Context{Method: method, Path: "/rpc/" + c.fn})
+			if err != nil {
+				t.Fatalf("Execute(%s): %v", c.fn, err)
+			}
+			if rs := res.Rows(); rs != nil {
+				rs.Close()
+			}
+			if plan.Func == nil {
+				t.Fatalf("Execute(%s) did not populate plan.Func from the native catalog", c.fn)
+			}
+			if plan.Func.Returns.Kind != c.want {
+				t.Errorf("%s return kind = %v, want %v", c.fn, plan.Func.Returns.Kind, c.want)
+			}
+		})
 	}
 }
 

@@ -39,7 +39,8 @@ type Backend struct {
 	searchPath      []string
 	extraSearchPath []string                  // db-extra-search-path, appended after the active schema
 	loc             *time.Location            // server TimeZone, for rendering timestamptz like PostgREST
-	funcVol         map[string]rpc.Volatility // "schema.name" -> volatility, for native RPC access mode
+	funcVol         map[string]rpc.Volatility  // "schema.name" -> volatility, for native RPC access mode
+	funcRet         map[string]rpc.ReturnShape // "schema.name" -> return shape, for native RPC result rendering
 	roleSettings    map[string][]roleSetting  // impersonated-role ALTER ROLE ... SET replays
 	roleIsolation   map[string]pgx.TxIsoLevel // impersonated-role default_transaction_isolation
 

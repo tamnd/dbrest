@@ -86,6 +86,8 @@ func renderCall(media string, res backend.Result, fn *rpc.Function, fnName strin
 		}
 	} else if fn.Returns.Kind == rpc.ReturnTable {
 		return renderFor(media, res, nil)
+	} else if fn.Returns.Kind == rpc.ReturnObject {
+		return renderCallObject(media, res)
 	} else if fn.Returns.Kind == rpc.ReturnVoid {
 		return renderVoid(res)
 	}
@@ -159,6 +161,61 @@ func renderCall(media string, res backend.Result, fn *rpc.Function, fnName strin
 		return nil, aerr
 	}
 	out.body = body
+	return out, nil
+}
+
+// renderCallObject shapes a function that returns a single composite row (RETURNS
+// <composite>, not SETOF): PostgREST renders it as one bare JSON object, never an
+// array, and a null body when the function produced no row. The CSV and scalar
+// media types fall back to the column/row shapers a table read uses. The singular
+// object media type keeps its content type; every other JSON media renders the
+// same single object under application/json.
+func renderCallObject(media string, res backend.Result) (*rendered, *pgerr.APIError) {
+	switch media {
+	case mediaCSV:
+		return renderCSV(res)
+	case mediaOctet:
+		return renderScalar(res, false)
+	case mediaText:
+		return renderScalar(res, true)
+	}
+
+	rs := res.Rows()
+	defer rs.Close()
+	cols := rs.Columns()
+
+	var obj []byte
+	n := 0
+	for rs.Next() {
+		if n == 0 {
+			vals, err := rs.Values()
+			if err != nil {
+				return nil, pgerr.ErrInternal(err.Error())
+			}
+			rb, err := encodeRowObject(cols, vals, nil, false)
+			if err != nil {
+				return nil, pgerr.ErrInternal(err.Error())
+			}
+			obj = rb
+		}
+		n++
+	}
+	if err := rs.Err(); err != nil {
+		return nil, pgerr.ErrInternal(err.Error())
+	}
+
+	out := &rendered{nRows: n}
+	if total, ok := res.Count(); ok {
+		out.total, out.hasTotl = total, true
+	}
+	if obj == nil {
+		obj = []byte("null")
+	}
+	out.body = obj
+	out.contentType = "application/json; charset=utf-8"
+	if singularMedia(media) {
+		out.contentType = singularMediaType + "; charset=utf-8"
+	}
 	return out, nil
 }
 

@@ -253,16 +253,36 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 	return res, nil
 }
 
+// portableCall reports whether a call lowers through the portable registry rather
+// than the native catalog. A portable function carries a PortableQuery; a native
+// descriptor (resolved from pg_proc for its return shape) leaves Query nil and is
+// lowered by splicing literals into a SELECT * FROM schema.fn(...). A nil Func is
+// also native (the function was not introspected).
+func portableCall(plan *ir.Plan) bool {
+	return plan.Func != nil && plan.Func.Query != nil
+}
+
 // executeCall lowers and runs an RPC call. A read-only function (stable or
 // immutable) runs in a read-only transaction like executeRead; a volatile
 // function runs in a read-write transaction that commits (or rolls back under
 // Prefer: tx=rollback) so its side effects persist.
 func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Context) (backend.Result, error) {
+	// On the native path the function was not resolved through the portable
+	// registry, so plan.Func is nil. Resolve its descriptor from the introspected
+	// catalog now: it carries the real return shape the renderer needs (so a SETOF
+	// scalar is not truncated to one value and a single composite is not wrapped in
+	// an array) and leaves Query nil so the lowering below still uses the literal
+	// splice. portableCall is the dispatch predicate from here on: a portable
+	// function has a Query, a native descriptor does not.
+	if plan.Func == nil {
+		plan.Func = b.nativeFunc(plan.Call, b.callSchema(rc))
+	}
+
 	var (
 		st     *sqlgen.Statement
 		apiErr *pgerr.APIError
 	)
-	if plan.Func != nil {
+	if portableCall(plan) {
 		st, apiErr = sqlgen.CompileCall(Dialect{}, plan.Call, plan.Func, sqlgen.ContextArgs(rc))
 	} else {
 		st, apiErr = b.compileNativeCall(plan.Call, b.callSchema(rc))
@@ -280,9 +300,9 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 	// On the native path the access mode follows volatility, not only the method:
 	// PostgREST runs a STABLE or IMMUTABLE function read-only even on POST, and
 	// only a VOLATILE function read-write. The registry path already set plan.ReadOnly
-	// from volatility (plan.Func != nil), so only the native path needs the check.
+	// from volatility, so only the native path needs the check.
 	readOnly := plan.ReadOnly
-	if plan.Func == nil {
+	if !portableCall(plan) {
 		readOnly = b.nativeCallReadOnly(plan, rc)
 	}
 	if readOnly {
@@ -379,7 +399,7 @@ func (b *Backend) executeCallRead(ctx context.Context, plan *ir.Plan, rc *reqctx
 			cst    *sqlgen.Statement
 			apiErr *pgerr.APIError
 		)
-		if plan.Func != nil {
+		if portableCall(plan) {
 			cst, apiErr = sqlgen.CompileCallCount(Dialect{}, plan.Call, plan.Func, sqlgen.ContextArgs(rc))
 		} else {
 			cst, apiErr = b.compileNativeCallCount(plan.Call, b.callSchema(rc))
@@ -699,7 +719,24 @@ func (b *Backend) ExplainCall(ctx context.Context, p *ir.Plan, rc *reqctx.Contex
 		return nil, b.MapError(err)
 	}
 
-	st, apiErr := sqlgen.CompileCall(Dialect{}, p.Call, p.Func, sqlgen.ContextArgs(rc))
+	// EXPLAIN compiles the call the same way Execute does, so a native function
+	// (no registry Query) is planned through the literal-splice path rather than
+	// the registry compiler, matching what the call would actually run.
+	if p.Func == nil {
+		p.Func = b.nativeFunc(p.Call, b.callSchema(rc))
+	}
+	var (
+		st     *sqlgen.Statement
+		apiErr *pgerr.APIError
+	)
+	if portableCall(p) {
+		st, apiErr = sqlgen.CompileCall(Dialect{}, p.Call, p.Func, sqlgen.ContextArgs(rc))
+	} else {
+		st, apiErr = b.compileNativeCall(p.Call, b.callSchema(rc))
+		if apiErr == nil {
+			st, apiErr = sqlgen.CompileNativeCallWrap(Dialect{}, p.Call, st)
+		}
+	}
 	if apiErr != nil {
 		return nil, apiErr
 	}

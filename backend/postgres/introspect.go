@@ -39,6 +39,15 @@ func (b *Backend) Introspect(ctx context.Context) (*schema.Model, error) {
 	}
 	b.funcVol = vol
 
+	// Function return shapes drive the native RPC renderer (a SETOF scalar renders
+	// as an array of bare values, a single composite as one object), loaded with the
+	// rest of the catalog and refreshed on every rebuild like volatility.
+	ret, err := b.loadFunctionReturns(ctx, schemas)
+	if err != nil {
+		return nil, err
+	}
+	b.funcRet = ret
+
 	// Impersonated-role settings (ALTER ROLE ... SET) are replayed per request as
 	// transaction-scoped settings, so they are loaded with the catalog and
 	// refreshed on every rebuild, the same lifecycle PostgREST gives them.

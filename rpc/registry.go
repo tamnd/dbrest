@@ -46,10 +46,11 @@ const (
 type ReturnKind uint8
 
 const (
-	ReturnScalar ReturnKind = iota // returns <type>      -> a single value
-	ReturnSetOf                    // returns setof <type> -> an array of values
-	ReturnTable                    // returns table(...)   -> an array of objects
-	ReturnVoid                     // returns void        -> 200 with a null body
+	ReturnScalar ReturnKind = iota // returns <type>        -> a single value
+	ReturnSetOf                    // returns setof <type>  -> an array of values
+	ReturnTable                    // returns table(...)    -> an array of objects
+	ReturnVoid                     // returns void          -> 200 with a null body
+	ReturnObject                   // returns <composite>   -> one object, not an array
 )
 
 // ReturnShape is a function's declared result. Type is the canonical type of a
@@ -366,6 +367,8 @@ func ParseRegistry(rawJSON string) (*StaticRegistry, error) {
 		switch strings.ToLower(d.Returns.Kind) {
 		case "void":
 			ret.Kind = ReturnVoid
+		case "object":
+			ret.Kind = ReturnObject
 		case "setof":
 			ret.Kind = ReturnSetOf
 		case "table":
