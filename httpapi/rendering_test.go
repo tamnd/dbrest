@@ -94,6 +94,44 @@ func TestNullsStrippedIgnoredOnPlainJSON(t *testing.T) {
 	}
 }
 
+// TestCSVQuotesAndNoTrailingBlankLine pins 02.20: a field with a comma and a
+// double quote is RFC 4180 quoted the way PostgREST quotes CSV (comma forces
+// quoting, inner quotes are doubled), records are \n-terminated, and there is no
+// extra trailing blank line after the last record.
+func TestCSVQuotesAndNoTrailingBlankLine(t *testing.T) {
+	srv := newServer(t)
+	send(t, srv, http.MethodPost, "/films", `{"id":91,"title":"A, B \"q\""}`, map[string]string{
+		"Prefer": "return=minimal",
+	})
+	resp := do(t, srv, http.MethodGet, "/films?id=eq.91&select=id,title", map[string]string{
+		"Accept": "text/csv",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body := readBody(t, resp)
+	want := "id,title\n91,\"A, B \"\"q\"\"\"\n"
+	if body != want {
+		t.Errorf("CSV body = %q, want %q", body, want)
+	}
+}
+
+// TestCSVEmptyResultKeepsHeader pins the empty-result CSV shape dbrest produces:
+// the column-name header line plus a newline, with no data rows. The PostgREST
+// empty-result shape itself is verified separately against a live server (02.20).
+func TestCSVEmptyResultKeepsHeader(t *testing.T) {
+	srv := newServer(t)
+	resp := do(t, srv, http.MethodGet, "/films?id=eq.9999&select=id,title", map[string]string{
+		"Accept": "text/csv",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if body := readBody(t, resp); body != "id,title\n" {
+		t.Errorf("empty CSV body = %q, want the header line only", body)
+	}
+}
+
 // TestSelectOrderReversed pins the inverse projection to prove the order tracks
 // the select, not a fixed column order: id,title renders {"id":...,"title":...}.
 func TestSelectOrderReversed(t *testing.T) {

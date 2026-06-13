@@ -391,10 +391,12 @@ func csvCell(v any) string {
 	case []byte:
 		return string(t)
 	case bool:
+		// PostgreSQL's text output (what PostgREST's CSV mirrors) renders booleans
+		// as t/f, not the JSON true/false.
 		if t {
-			return "true"
+			return "t"
 		}
-		return "false"
+		return "f"
 	case json.Number:
 		return t.String()
 	case float64:
