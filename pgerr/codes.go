@@ -38,6 +38,7 @@ const (
 	CodeJWTDecode        = "PGRST301" // 401 JWT could not be decoded (parts/key/alg/signature)
 	CodeJWTRequired      = "PGRST302" // 401 no token sent and the anonymous role is disabled
 	CodeJWTClaims        = "PGRST303" // 401 JWT claims validation or parsing failed
+	CodeAggregatesOff    = "PGRST123" // 400 aggregate functions used while db-aggregates-enabled is off
 	CodeUnsupported      = "PGRST127" // 400 feature not implemented on this backend
 	CodeInternal         = "PGRSTX00" // 500 internal error (upstream group X has only X00)
 )
@@ -247,6 +248,15 @@ func ErrUnsupported(feature, backend string) *APIError {
 	e := New(http.StatusBadRequest, CodeUnsupported, "Feature not implemented")
 	e = e.WithDetails(fmt.Sprintf("%s is not supported by the %s backend", feature, backend))
 	return e.WithHint("see the capability matrix for supported features on this backend")
+}
+
+// ErrAggregatesDisabled is PGRST123, raised when a request uses an aggregate
+// function (count(), col.sum(), ...) while db-aggregates-enabled is off. The
+// message and hint are upstream's, pointing the operator at the config flag.
+func ErrAggregatesDisabled() *APIError {
+	e := New(http.StatusBadRequest, CodeAggregatesOff,
+		"Use of aggregate functions is not allowed")
+	return e.WithHint("Enable the 'db-aggregates-enabled' config parameter to allow the use of aggregate functions")
 }
 
 // ErrFullTextUnavailable is the PGRST127 for a full-text predicate on a column the

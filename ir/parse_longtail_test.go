@@ -133,6 +133,103 @@ func TestOmittedSelectIsAllColumns(t *testing.T) {
 	}
 }
 
+// --- 01.4: aggregate select syntax ---
+
+func TestAggregateCountNoArg(t *testing.T) {
+	q := mustRead(t, "select=count()")
+	agg, ok := q.Select[0].(Aggregate)
+	if !ok {
+		t.Fatalf("Select[0] = %T, want Aggregate", q.Select[0])
+	}
+	if agg.Func != AggCount || agg.Arg != nil || agg.Legacy {
+		t.Errorf("agg = %+v, want count() non-legacy no-arg", agg)
+	}
+	if agg.Name() != "count" {
+		t.Errorf("Name = %q, want count", agg.Name())
+	}
+}
+
+func TestAggregateColumnFunc(t *testing.T) {
+	for name, want := range map[string]AggFunc{
+		"sum": AggSum, "avg": AggAvg, "min": AggMin, "max": AggMax, "count": AggCount,
+	} {
+		q := mustRead(t, "select=year."+name+"()")
+		agg := q.Select[0].(Aggregate)
+		if agg.Func != want {
+			t.Errorf("%s: Func = %d, want %d", name, agg.Func, want)
+		}
+		if agg.Arg == nil || !reflect.DeepEqual(agg.Arg.Path, []string{"year"}) {
+			t.Errorf("%s: Arg = %+v, want path [year]", name, agg.Arg)
+		}
+	}
+}
+
+func TestAggregateAlias(t *testing.T) {
+	q := mustRead(t, "select=total:year.sum()")
+	agg := q.Select[0].(Aggregate)
+	if agg.Alias != "total" || agg.Name() != "total" {
+		t.Errorf("Alias = %q, want total", agg.Alias)
+	}
+}
+
+func TestAggregateOutputCast(t *testing.T) {
+	q := mustRead(t, "select=year.sum()::text")
+	agg := q.Select[0].(Aggregate)
+	if agg.Cast != "text" {
+		t.Errorf("Cast = %q, want text", agg.Cast)
+	}
+	if agg.Arg == nil || agg.Arg.Cast != "" {
+		t.Errorf("input cast should be empty, Arg = %+v", agg.Arg)
+	}
+}
+
+func TestAggregateInputCast(t *testing.T) {
+	q := mustRead(t, "select=year::numeric.sum()")
+	agg := q.Select[0].(Aggregate)
+	if agg.Arg == nil || agg.Arg.Cast != "numeric" {
+		t.Errorf("Arg = %+v, want input cast numeric", agg.Arg)
+	}
+	if agg.Cast != "" {
+		t.Errorf("output cast should be empty, got %q", agg.Cast)
+	}
+}
+
+func TestAggregateAliasInputAndOutputCast(t *testing.T) {
+	q := mustRead(t, "select=total:year::numeric.sum()::text")
+	agg := q.Select[0].(Aggregate)
+	if agg.Alias != "total" || agg.Cast != "text" || agg.Arg == nil || agg.Arg.Cast != "numeric" {
+		t.Errorf("agg = %+v arg = %+v", agg, agg.Arg)
+	}
+}
+
+func TestBareCountIsColumnAtTopLevel(t *testing.T) {
+	q := mustRead(t, "select=count")
+	c, ok := q.Select[0].(Column)
+	if !ok {
+		t.Fatalf("Select[0] = %T, want Column (top-level bare count is a column)", q.Select[0])
+	}
+	if !reflect.DeepEqual(c.Path, []string{"count"}) {
+		t.Errorf("Path = %v, want [count]", c.Path)
+	}
+}
+
+func TestBareCountIsLegacyAggregateInsideEmbed(t *testing.T) {
+	q := mustRead(t, "select=directors(count)")
+	emb := q.Embeds[0]
+	agg, ok := emb.Query.Select[0].(Aggregate)
+	if !ok {
+		t.Fatalf("embed select[0] = %T, want Aggregate", emb.Query.Select[0])
+	}
+	if agg.Func != AggCount || !agg.Legacy {
+		t.Errorf("agg = %+v, want legacy count", agg)
+	}
+}
+
+func TestAggregateMissingColumnRejected(t *testing.T) {
+	// sum() needs a column; only count() may stand alone.
+	errCode(t, "select=sum()", "PGRST100")
+}
+
 // --- 01.7: order modifier grammar ---
 
 func TestOrderModifierGrammar(t *testing.T) {

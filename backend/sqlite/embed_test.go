@@ -78,7 +78,7 @@ func planEmbed(t *testing.T, b *Backend, relation, query string) *ir.Query {
 	if err != nil {
 		t.Fatalf("Introspect: %v", err)
 	}
-	pl, perr := plan.Read(model, q, nil)
+	pl, perr := plan.Read(model, q, nil, plan.Options{})
 	if perr != nil {
 		t.Fatalf("plan.Read: %v", perr)
 	}

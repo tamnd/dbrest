@@ -515,13 +515,52 @@ func TestCompileRangeOperatorRejectedNamed(t *testing.T) {
 	}
 }
 
-func TestCompileAggregateRejected(t *testing.T) {
-	_, err := CompileRead(stub{}, &ir.Query{
+// TestCompileBareCount renders count() with no grouping column as count(*) over
+// the whole relation, keyed to its default response name (item 01.4).
+func TestCompileBareCount(t *testing.T) {
+	st := compile(t, &ir.Query{
 		Relation: ir.Ref{Name: "t"},
 		Select:   []ir.SelectItem{ir.Aggregate{Func: ir.AggCount}},
 	})
-	if err == nil || err.Code != "PGRST127" {
-		t.Fatalf("want PGRST127 for aggregate, got %v", err)
+	want := `SELECT count(*) AS "count" FROM "t"`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+}
+
+// TestCompileColumnAggregateGroupsBy renders category, amount.sum() as a grouped
+// aggregate: the plain column is the GROUP BY key, the aggregate folds per group.
+func TestCompileColumnAggregateGroupsBy(t *testing.T) {
+	st := compile(t, &ir.Query{
+		Relation: ir.Ref{Schema: "public", Name: "sales"},
+		Select: []ir.SelectItem{
+			col("category"),
+			ir.Aggregate{Func: ir.AggSum, Arg: &ir.Column{Path: []string{"amount"}}},
+		},
+	})
+	want := `SELECT "category", sum("amount") AS "sum" FROM "public"."sales" GROUP BY "category"`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+}
+
+// TestCompileAggregateAliasAndCasts honors a response-key alias, an input cast on
+// the aggregated column, and an output cast on the result.
+func TestCompileAggregateAliasAndCasts(t *testing.T) {
+	st := compile(t, &ir.Query{
+		Relation: ir.Ref{Name: "sales"},
+		Select: []ir.SelectItem{
+			ir.Aggregate{
+				Func:  ir.AggSum,
+				Arg:   &ir.Column{Path: []string{"amount"}, Cast: "numeric"},
+				Cast:  "text",
+				Alias: "total",
+			},
+		},
+	})
+	want := `SELECT CAST(sum(CAST("amount" AS numeric)) AS text) AS "total" FROM "sales"`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
 	}
 }
 

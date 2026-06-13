@@ -38,7 +38,7 @@ func readEmbed(t *testing.T, m *schema.Model, sel string) (*ir.Plan, *pgerr.APIE
 	if perr != nil {
 		t.Fatalf("ParseRead: %v", perr)
 	}
-	return Read(m, q, nil)
+	return Read(m, q, nil, Options{})
 }
 
 func TestEmbedResolvesAndBinds(t *testing.T) {

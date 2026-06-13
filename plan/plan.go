@@ -18,6 +18,17 @@ import (
 	"github.com/tamnd/dbrest/schema"
 )
 
+// Options carries request-level toggles the planner needs that are not part of
+// the query itself. The zero value matches a default PostgREST: aggregates are
+// off, so an aggregate select item is rejected with PGRST123 until the
+// db-aggregates-enabled option turns it on.
+type Options struct {
+	// AggregatesEnabled mirrors db-aggregates-enabled. When false, a request using
+	// count()/col.sum()/... is rejected with PGRST123; the legacy bare count an
+	// embed may carry is exempt and always allowed.
+	AggregatesEnabled bool
+}
+
 // Read resolves a parsed read query against the model and returns an executable
 // plan. searchPath orders the schemas an unqualified relation is looked up in.
 //
@@ -25,7 +36,7 @@ import (
 // Embeds, aggregates, and JSON paths are validated by their own subsystems as
 // they land; a query carrying one is passed through for the compiler to reject
 // with a clear PGRST127 rather than being silently accepted here.
-func Read(model *schema.Model, q *ir.Query, searchPath []string) (*ir.Plan, *pgerr.APIError) {
+func Read(model *schema.Model, q *ir.Query, searchPath []string, opts Options) (*ir.Plan, *pgerr.APIError) {
 	rel, ok := model.Lookup(q.Relation.Name, searchPath)
 	if !ok {
 		return nil, pgerr.ErrUnknownTable(q.Relation.Name)
@@ -34,7 +45,7 @@ func Read(model *schema.Model, q *ir.Query, searchPath []string) (*ir.Plan, *pge
 	// fully qualified, model-validated reference.
 	q.Relation = ir.Ref{Schema: rel.Schema, Name: rel.Name}
 
-	if err := validateSelect(rel, q.Select); err != nil {
+	if err := validateSelect(rel, q.Select, opts.AggregatesEnabled); err != nil {
 		return nil, err
 	}
 	// A filter naming an embed (films?actors=not.is.null) is an existence test on
@@ -48,7 +59,7 @@ func Read(model *schema.Model, q *ir.Query, searchPath []string) (*ir.Plan, *pge
 	if err := validateOrder(rel, q.Order); err != nil {
 		return nil, err
 	}
-	if err := resolveEmbeds(model, rel, q, searchPath); err != nil {
+	if err := resolveEmbeds(model, rel, q, searchPath, opts.AggregatesEnabled); err != nil {
 		return nil, err
 	}
 
@@ -60,7 +71,7 @@ func Read(model *schema.Model, q *ir.Query, searchPath []string) (*ir.Plan, *pge
 // hint, and recurses into nested embeds. A missing relationship is PGRST200; an
 // ambiguous one (more than one surviving edge) is PGRST201. The embed's nested
 // select, filters, and ordering are validated against the embedded relation.
-func resolveEmbeds(model *schema.Model, parent *schema.Relation, q *ir.Query, searchPath []string) *pgerr.APIError {
+func resolveEmbeds(model *schema.Model, parent *schema.Relation, q *ir.Query, searchPath []string, aggEnabled bool) *pgerr.APIError {
 	for i := range q.Embeds {
 		emb := &q.Embeds[i]
 		rel, err := resolveOne(model, parent, emb, searchPath)
@@ -72,7 +83,7 @@ func resolveEmbeds(model *schema.Model, parent *schema.Relation, q *ir.Query, se
 		// Bind the embedded relation so the compiler emits a model-validated ref.
 		emb.Query.Relation = ir.Ref{Schema: rel.Target.Schema, Name: rel.Target.Name}
 
-		if err := validateSelect(rel.Target, emb.Query.Select); err != nil {
+		if err := validateSelect(rel.Target, emb.Query.Select, aggEnabled); err != nil {
 			return err
 		}
 		if err := validateCond(rel.Target, emb.Query.Where); err != nil {
@@ -81,7 +92,7 @@ func resolveEmbeds(model *schema.Model, parent *schema.Relation, q *ir.Query, se
 		if err := validateOrder(rel.Target, emb.Query.Order); err != nil {
 			return err
 		}
-		if err := resolveEmbeds(model, rel.Target, &emb.Query, searchPath); err != nil {
+		if err := resolveEmbeds(model, rel.Target, &emb.Query, searchPath, aggEnabled); err != nil {
 			return err
 		}
 	}
@@ -140,7 +151,9 @@ func Write(model *schema.Model, q *ir.Query, searchPath []string) (*ir.Plan, *pg
 	}
 	q.Relation = ir.Ref{Schema: rel.Schema, Name: rel.Name}
 
-	if err := validateSelect(rel, q.Select); err != nil {
+	// A write's return=representation projection is a read shape, but PostgREST
+	// does not allow aggregates there, so the gate stays closed on this path.
+	if err := validateSelect(rel, q.Select, false); err != nil {
 		return nil, err
 	}
 	if err := validateCond(rel, q.Where); err != nil {
@@ -153,7 +166,7 @@ func Write(model *schema.Model, q *ir.Query, searchPath []string) (*ir.Plan, *pg
 	// uses, so resolve the embeds against the target relation here. An unknown or
 	// ambiguous relationship is the read path's PGRST200/201 rather than being
 	// silently dropped from the response. See item 01.19.
-	if err := resolveEmbeds(model, rel, q, searchPath); err != nil {
+	if err := resolveEmbeds(model, rel, q, searchPath, false); err != nil {
 		return nil, err
 	}
 	if q.IsPut {
@@ -400,18 +413,32 @@ func validateWrite(rel *schema.Relation, w *ir.WriteSpec) *pgerr.APIError {
 	return nil
 }
 
-func validateSelect(rel *schema.Relation, items []ir.SelectItem) *pgerr.APIError {
+func validateSelect(rel *schema.Relation, items []ir.SelectItem, aggEnabled bool) *pgerr.APIError {
 	for _, it := range items {
-		col, ok := it.(ir.Column)
-		if !ok {
-			// Aggregates and embeds are checked by their subsystems; leave them.
-			continue
-		}
-		if isStarPath(col.Path) {
-			continue
-		}
-		if err := checkColumn(rel, col.Path); err != nil {
-			return err
+		switch v := it.(type) {
+		case ir.Column:
+			if isStarPath(v.Path) {
+				continue
+			}
+			if err := checkColumn(rel, v.Path); err != nil {
+				return err
+			}
+		case ir.Aggregate:
+			// The count()/col.agg() function forms are gated behind
+			// db-aggregates-enabled; the legacy bare count an embed carries is exempt.
+			if !v.Legacy && !aggEnabled {
+				return pgerr.ErrAggregatesDisabled()
+			}
+			if v.Arg != nil {
+				if isStarPath(v.Arg.Path) {
+					continue
+				}
+				if err := checkColumn(rel, v.Arg.Path); err != nil {
+					return err
+				}
+			}
+		default:
+			// Embed references are checked by resolveEmbeds.
 		}
 	}
 	return nil

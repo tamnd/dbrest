@@ -42,6 +42,12 @@ type builder struct {
 	// embed list an EmbedPredicate indexes into.
 	parentRef string
 	embeds    []ir.Embed
+	// groupBy collects the non-aggregate projected column expressions while the
+	// select list is written; when the projection also carries an aggregate, these
+	// become the GROUP BY so the aggregate folds per distinct value. hasAgg records
+	// whether any aggregate was seen.
+	groupBy []string
+	hasAgg  bool
 	// ctxArgs are the reserved :request_* values an RPC body may bind when a
 	// placeholder is not a declared parameter; see ContextArgs.
 	ctxArgs map[string]any
@@ -133,6 +139,14 @@ func compileReadPlain(d Dialect, q *ir.Query, withCount bool) (*Statement, *pger
 		if err := b.writeCond(*q.Where); err != nil {
 			return nil, err
 		}
+	}
+
+	// An aggregate folds over the rest of the projection: the plain columns become
+	// the GROUP BY keys. With only aggregates and no plain column, the whole
+	// relation is one group and no GROUP BY is emitted.
+	if b.hasAgg && len(b.groupBy) > 0 {
+		b.sb.WriteString(" GROUP BY ")
+		b.sb.WriteString(strings.Join(b.groupBy, ", "))
 	}
 
 	hasOrder := len(q.Order) > 0
@@ -473,24 +487,57 @@ func (b *builder) writeSelect(items []ir.SelectItem) *pgerr.APIError {
 		if i > 0 {
 			b.sb.WriteString(", ")
 		}
-		col, ok := it.(ir.Column)
-		if !ok {
-			return pgerr.ErrUnsupported("aggregates and embedded resources in select", "sql")
-		}
-		expr, err := b.columnExpr(col)
-		if err != nil {
-			return err
-		}
-		b.sb.WriteString(expr)
-		// Alias the output so the renderer sees the PostgREST key, not the raw
-		// column expression. Always alias when a cast is present (the expression
-		// differs from the bare column name) or when an explicit alias was set.
-		if name := col.Name(); name != "" && (name != lastPath(col.Path) || col.Cast != "") {
+		switch v := it.(type) {
+		case ir.Column:
+			expr, err := b.columnExpr(v)
+			if err != nil {
+				return err
+			}
+			b.sb.WriteString(expr)
+			// Alias the output so the renderer sees the PostgREST key, not the raw
+			// column expression. Always alias when a cast is present (the expression
+			// differs from the bare column name) or when an explicit alias was set.
+			if name := v.Name(); name != "" && (name != lastPath(v.Path) || v.Cast != "") {
+				b.sb.WriteString(" AS ")
+				b.sb.WriteString(b.d.QuoteIdent(name))
+			}
+			// A plain column alongside an aggregate is a GROUP BY key.
+			b.groupBy = append(b.groupBy, expr)
+		case ir.Aggregate:
+			expr, err := b.aggregateExpr(v)
+			if err != nil {
+				return err
+			}
+			b.sb.WriteString(expr)
 			b.sb.WriteString(" AS ")
-			b.sb.WriteString(b.d.QuoteIdent(name))
+			b.sb.WriteString(b.d.QuoteIdent(v.Name()))
+			b.hasAgg = true
+		default:
+			return pgerr.ErrUnsupported("embedded resources in select", "sql")
 		}
 	}
 	return nil
+}
+
+// aggregateExpr renders an aggregate call: count(*) for a bare count, or
+// func(arg) over the aggregated column, with an optional input cast on the
+// column and an optional output cast wrapping the result.
+func (b *builder) aggregateExpr(a ir.Aggregate) (string, *pgerr.APIError) {
+	fn := a.Func.String()
+	var inner string
+	if a.Arg == nil {
+		inner = fn + "(*)"
+	} else {
+		arg, err := b.columnExpr(*a.Arg)
+		if err != nil {
+			return "", err
+		}
+		inner = fn + "(" + arg + ")"
+	}
+	if a.Cast != "" {
+		inner = b.d.Cast(inner, a.Cast)
+	}
+	return inner, nil
 }
 
 // columnExpr renders a base column with an optional cast. JSON sub-paths are a

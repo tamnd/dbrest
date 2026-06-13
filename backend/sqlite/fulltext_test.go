@@ -177,7 +177,7 @@ func planRead(t *testing.T, b *Backend, query string) *ir.Plan {
 	if perr != nil {
 		t.Fatalf("ParseRead: %v", perr)
 	}
-	pl, perr := plan.Read(model, q, nil)
+	pl, perr := plan.Read(model, q, nil, plan.Options{})
 	if perr != nil {
 		t.Fatalf("plan.Read: %v", perr)
 	}
@@ -215,7 +215,7 @@ func TestFTSMissingIndexErrors(t *testing.T) {
 	if perr != nil {
 		t.Fatalf("ParseRead: %v", perr)
 	}
-	pl, perr := plan.Read(model, q, nil)
+	pl, perr := plan.Read(model, q, nil, plan.Options{})
 	if perr != nil {
 		t.Fatalf("plan.Read: %v", perr)
 	}
@@ -238,7 +238,7 @@ func TestRegexBackreferenceErrors(t *testing.T) {
 	if perr != nil {
 		t.Fatalf("ParseRead: %v", perr)
 	}
-	pl, perr := plan.Read(model, q, nil)
+	pl, perr := plan.Read(model, q, nil, plan.Options{})
 	if perr != nil {
 		t.Fatalf("plan.Read: %v", perr)
 	}

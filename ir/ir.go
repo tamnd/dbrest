@@ -166,12 +166,43 @@ const (
 	AggMax
 )
 
-// Aggregate is a column aggregate in the select list.
+// Aggregate is a column aggregate in the select list. Cast is an output cast on
+// the aggregate result; an input cast on the aggregated column rides on Arg.Cast.
+// Legacy marks the pre-v12 bare `count` an embed select may carry: it renders a
+// count of the embedded rows and is exempt from the db-aggregates-enabled gate,
+// where the count()/col.agg() function forms are not.
 type Aggregate struct {
-	Func  AggFunc
-	Arg   *Column // nil for count(*)
-	Cast  string
-	Alias string
+	Func   AggFunc
+	Arg    *Column // nil for count()
+	Cast   string
+	Alias  string
+	Legacy bool
+}
+
+// Name is the response key an aggregate renders under: its explicit alias, else
+// the function name (sum, avg, count, min, max), matching PostgREST's default.
+func (a Aggregate) Name() string {
+	if a.Alias != "" {
+		return a.Alias
+	}
+	return a.Func.String()
+}
+
+// String spells an aggregate function the way it appears in SQL and as the
+// default response key.
+func (f AggFunc) String() string {
+	switch f {
+	case AggSum:
+		return "sum"
+	case AggAvg:
+		return "avg"
+	case AggMin:
+		return "min"
+	case AggMax:
+		return "max"
+	default:
+		return "count"
+	}
 }
 
 func (Aggregate) isSelect() {}

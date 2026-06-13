@@ -109,6 +109,7 @@ func (a *app) rebuildLocked() error {
 	srv.SetCORSAllowedOrigins(a.cfg.CORSAllowedOrigins)
 	srv.SetMaxRows(a.cfg.MaxRows)
 	srv.SetPlanEnabled(a.cfg.PlanEnabled)
+	srv.SetAggregatesEnabled(a.cfg.AggregatesEnabled)
 	srv.SetPreRequest(a.cfg.PreRequest)
 	srv.SetAppSettings(a.cfg.AppSettings)
 	srv.SetLogQuery(a.cfg.LogQuery)

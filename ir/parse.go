@@ -51,7 +51,7 @@ func parseQueryString(q *Query, vals url.Values) *pgerr.APIError {
 		if sel == "" {
 			return pgerr.ErrParse("\"failed to parse select parameter ()\" (line 1, column 1)")
 		}
-		items, embeds, perr := parseSelect(sel)
+		items, embeds, perr := parseSelect(sel, false)
 		if perr != nil {
 			return perr
 		}
@@ -514,7 +514,7 @@ func splitComma(s string) []string {
 // parseSelect parses the comma-separated select list at the top level. An item
 // containing a parenthesis is an embed (rel(...)); plain items are columns,
 // optionally alias:col::cast. "*" selects all columns.
-func parseSelect(s string) ([]SelectItem, []Embed, *pgerr.APIError) {
+func parseSelect(s string, nested bool) ([]SelectItem, []Embed, *pgerr.APIError) {
 	// PostgREST treats a bare "*" as "all columns" — equivalent to omitting
 	// the select parameter entirely. We normalise it to an empty list here so
 	// the planner and compiler see no explicit projection.
@@ -533,6 +533,15 @@ func parseSelect(s string) ([]SelectItem, []Embed, *pgerr.APIError) {
 			return nil, nil, pgerr.ErrParse("empty item in select list")
 		}
 		if i := strings.IndexByte(raw, '('); i >= 0 {
+			// An item with empty parens is an aggregate (count(), amount.sum());
+			// anything else is an embedded resource. The aggregate functions are a
+			// closed set, so a name(...) that is not one falls through to the embed.
+			if agg, ok, perr := parseAggregate(raw); perr != nil {
+				return nil, nil, perr
+			} else if ok {
+				items = append(items, agg)
+				continue
+			}
 			emb, perr := parseEmbed(raw, i)
 			if perr != nil {
 				return nil, nil, perr
@@ -541,10 +550,12 @@ func parseSelect(s string) ([]SelectItem, []Embed, *pgerr.APIError) {
 			embeds = append(embeds, emb)
 			continue
 		}
-		// PostgREST supports a bare "count" inside an embed select as a virtual
-		// aggregate that maps to count(*) in the JSON output.
-		if raw == "count" {
-			items = append(items, Aggregate{Func: AggCount})
+		// Inside an embed select, a bare "count" is the legacy virtual aggregate that
+		// maps to count(*) in the JSON output; it predates the count() form and is
+		// exempt from the db-aggregates-enabled gate. At the top level "count" is an
+		// ordinary column reference (PostgREST v12+).
+		if nested && raw == "count" {
+			items = append(items, Aggregate{Func: AggCount, Legacy: true})
 			continue
 		}
 		col, perr := parseColumnItem(raw)
@@ -554,6 +565,100 @@ func parseSelect(s string) ([]SelectItem, []Embed, *pgerr.APIError) {
 		items = append(items, col)
 	}
 	return items, embeds, nil
+}
+
+// aggFuncByName maps the PostgREST aggregate spellings to their IR function.
+var aggFuncByName = map[string]AggFunc{
+	"count": AggCount, "sum": AggSum, "avg": AggAvg, "min": AggMin, "max": AggMax,
+}
+
+// parseAggregate recognizes the aggregate forms count() and path.func(), each
+// with an optional response-key alias, an optional input cast on the aggregated
+// column, and an optional output cast on the result. It reports ok=false (no
+// error) when raw is not an aggregate so the caller can treat it as an embed.
+func parseAggregate(raw string) (Aggregate, bool, *pgerr.APIError) {
+	// The function call is always empty parens. Their absence rules out an
+	// aggregate immediately; a non-empty pair means an embedded resource.
+	head, tail, found := strings.Cut(raw, "()")
+	if !found {
+		return Aggregate{}, false, nil
+	}
+
+	var agg Aggregate
+	// Output cast trails the parens as ::type.
+	if tail != "" {
+		if !strings.HasPrefix(tail, "::") {
+			return Aggregate{}, false, nil
+		}
+		agg.Cast = tail[2:]
+		if agg.Cast == "" {
+			return Aggregate{}, false, pgerr.ErrParse("empty cast target")
+		}
+	}
+	// Strip a response-key alias: the leading name before a single ':' that is not
+	// part of a '::' cast and not inside quotes.
+	if alias, rest, ok := cutAliasAware(head); ok {
+		agg.Alias = unquoteIdent(alias)
+		head = rest
+	}
+	// The function name is the token after the last dot; no dot means the whole
+	// head is the function, which is only valid for the no-argument count().
+	fn := head
+	argSpec := ""
+	if dot := strings.LastIndexByte(head, '.'); dot >= 0 {
+		fn = head[dot+1:]
+		argSpec = head[:dot]
+	}
+	f, ok := aggFuncByName[fn]
+	if !ok {
+		// An unknown function name with empty parens is not an aggregate; let the
+		// caller try it as an embed.
+		return Aggregate{}, false, nil
+	}
+	agg.Func = f
+	if argSpec == "" {
+		if f != AggCount {
+			return Aggregate{}, false, pgerr.ErrParse(fn + "() requires a column argument")
+		}
+		return agg, true, nil
+	}
+	arg, perr := parseColumnItem(argSpec)
+	if perr != nil {
+		return Aggregate{}, false, perr
+	}
+	agg.Arg = &arg
+	return agg, true, nil
+}
+
+// cutAliasAware splits a select-item head on the alias colon: the first ':' that
+// is a single colon (not part of a '::' cast) and lies outside double quotes. It
+// returns ok=false when there is no such colon.
+func cutAliasAware(s string) (alias, rest string, ok bool) {
+	inQuote := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inQuote {
+			if c == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if c == '"' {
+				inQuote = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inQuote = true
+		case ':':
+			if i+1 < len(s) && s[i+1] == ':' {
+				i++ // skip the cast '::'
+				continue
+			}
+			return s[:i], s[i+1:], true
+		}
+	}
+	return "", s, false
 }
 
 // parseEmbed parses rel(...) including an optional alias and hint. The inner
@@ -598,7 +703,7 @@ func parseEmbed(raw string, lparen int) (Embed, *pgerr.APIError) {
 		emb.OutKey = emb.Alias
 	}
 	if inner != "" {
-		items, nested, perr := parseSelect(inner)
+		items, nested, perr := parseSelect(inner, true)
 		if perr != nil {
 			return Embed{}, perr
 		}

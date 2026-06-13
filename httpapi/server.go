@@ -46,6 +46,7 @@ type Server struct {
 	corsOrigins     []string // server-cors-allowed-origins; empty means any
 	maxRows         int      // db-max-rows; 0 means no cap
 	planEnabled     bool     // db-plan-enabled; plans are off by default
+	aggregatesOn    bool     // db-aggregates-enabled; aggregates are off by default
 	preRequest      string   // db-pre-request, carried to the backend per request
 	appSettings     map[string]string
 	logQuery        bool // log-query, carried to the backend per request
@@ -142,6 +143,11 @@ func (s *Server) SetCORSAllowedOrigins(origins []string) { s.corsOrigins = origi
 // default is off, and a plan request then fails the same way as any other
 // unproducible media type.
 func (s *Server) SetPlanEnabled(on bool) { s.planEnabled = on }
+
+// SetAggregatesEnabled applies db-aggregates-enabled: when on, requests may use
+// aggregate functions (count(), col.sum(), ...). It is off by default, matching
+// PostgREST, so an aggregate request answers PGRST123 until an operator opts in.
+func (s *Server) SetAggregatesEnabled(on bool) { s.aggregatesOn = on }
 
 // SetAppSettings carries the app.settings.* options to the backend on every
 // request context, to be applied as transaction settings.
@@ -575,7 +581,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity,
 	// write path.
 	q.Limit = s.capLimit(q.Limit)
 
-	planned, apiErr := plan.Read(s.Model(), q, []string{activeSchema})
+	planned, apiErr := plan.Read(s.Model(), q, []string{activeSchema}, plan.Options{AggregatesEnabled: s.aggregatesOn})
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return

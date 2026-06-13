@@ -19,7 +19,7 @@ func model() *schema.Model {
 
 func TestReadResolvesRelation(t *testing.T) {
 	q := &ir.Query{Relation: ir.Ref{Name: "films"}, Select: []ir.SelectItem{ir.Column{Path: []string{"title"}}}}
-	p, err := Read(model(), q, nil)
+	p, err := Read(model(), q, nil, Options{})
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
@@ -33,7 +33,7 @@ func TestReadResolvesRelation(t *testing.T) {
 
 func TestReadUnknownTable(t *testing.T) {
 	q := &ir.Query{Relation: ir.Ref{Name: "ghosts"}}
-	_, err := Read(model(), q, nil)
+	_, err := Read(model(), q, nil, Options{})
 	if err == nil || err.Code != "PGRST205" {
 		t.Fatalf("want PGRST205, got %v", err)
 	}
@@ -41,7 +41,7 @@ func TestReadUnknownTable(t *testing.T) {
 
 func TestReadUnknownColumnInSelect(t *testing.T) {
 	q := &ir.Query{Relation: ir.Ref{Name: "films"}, Select: []ir.SelectItem{ir.Column{Path: []string{"bogus"}}}}
-	_, err := Read(model(), q, nil)
+	_, err := Read(model(), q, nil, Options{})
 	if err == nil || err.Code != "PGRST204" {
 		t.Fatalf("want PGRST204, got %v", err)
 	}
@@ -50,7 +50,7 @@ func TestReadUnknownColumnInSelect(t *testing.T) {
 func TestReadUnknownColumnInFilter(t *testing.T) {
 	where := ir.Cond(ir.Compare{Path: []string{"missing"}, Op: ir.OpEq, Value: ir.Value{Text: "x"}})
 	q := &ir.Query{Relation: ir.Ref{Name: "films"}, Where: &where}
-	_, err := Read(model(), q, nil)
+	_, err := Read(model(), q, nil, Options{})
 	if err == nil || err.Code != "PGRST204" {
 		t.Fatalf("want PGRST204, got %v", err)
 	}
@@ -58,7 +58,7 @@ func TestReadUnknownColumnInFilter(t *testing.T) {
 
 func TestReadUnknownColumnInOrder(t *testing.T) {
 	q := &ir.Query{Relation: ir.Ref{Name: "films"}, Order: []ir.OrderTerm{{Path: []string{"nope"}}}}
-	_, err := Read(model(), q, nil)
+	_, err := Read(model(), q, nil, Options{})
 	if err == nil || err.Code != "PGRST204" {
 		t.Fatalf("want PGRST204, got %v", err)
 	}
@@ -72,7 +72,7 @@ func TestReadNestedLogicalColumnChecked(t *testing.T) {
 		}},
 	}})
 	q := &ir.Query{Relation: ir.Ref{Name: "films"}, Where: &where}
-	_, err := Read(model(), q, nil)
+	_, err := Read(model(), q, nil, Options{})
 	if err == nil || err.Code != "PGRST204" {
 		t.Fatalf("nested unknown column should be caught, got %v", err)
 	}
@@ -270,7 +270,7 @@ func TestReadReclassifiesEmbedNullFilter(t *testing.T) {
 				Where:    &where,
 				Embeds:   []ir.Embed{{Target: ir.Ref{Name: "films"}, OutKey: "films"}},
 			}
-			if _, err := Read(nullEmbedModel(), q, []string{"public"}); err != nil {
+			if _, err := Read(nullEmbedModel(), q, []string{"public"}, Options{}); err != nil {
 				t.Fatalf("Read: %v", err)
 			}
 			pred, ok := (*q.Where).(ir.EmbedPredicate)
@@ -296,7 +296,7 @@ func TestReadEmbedNullReclassifyLeavesColumns(t *testing.T) {
 	}
 	// title is not a directors column; the filter is a Compare, so column
 	// validation rejects it rather than mistaking it for an embed predicate.
-	_, err := Read(nullEmbedModel(), q, []string{"public"})
+	_, err := Read(nullEmbedModel(), q, []string{"public"}, Options{})
 	if err == nil || err.Code != "PGRST204" {
 		t.Fatalf("want PGRST204 for unknown column, got %v", err)
 	}
