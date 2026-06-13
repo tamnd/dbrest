@@ -182,7 +182,7 @@ func (b *Backend) Execute(ctx context.Context, plan *ir.Plan, rc *reqctx.Context
 // (or roll back under Prefer: tx=rollback). The returned rows carry the
 // function's output for the renderer to shape by return kind.
 func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Context) (backend.Result, error) {
-	st, apiErr := sqlgen.CompileCall(dialect{}, plan.Call, plan.Func)
+	st, apiErr := sqlgen.CompileCall(dialect{}, plan.Call, plan.Func, sqlgen.ContextArgs(rc))
 	if apiErr != nil {
 		return nil, apiErr
 	}
@@ -191,7 +191,7 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 		res := &result{controls: rc.Controls()}
 		// A count over a read-only function runs as its own statement, like a read.
 		if plan.Call.Count != ir.CountNone {
-			cst, apiErr := sqlgen.CompileCallCount(dialect{}, plan.Call, plan.Func)
+			cst, apiErr := sqlgen.CompileCallCount(dialect{}, plan.Call, plan.Func, sqlgen.ContextArgs(rc))
 			if apiErr != nil {
 				return nil, apiErr
 			}
@@ -301,6 +301,19 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 	defer func() { _ = tx.Rollback() }()
 
 	res := &writeResult{controls: rc.Controls()}
+
+	// An upsert's 200-vs-201 status turns on whether any row updated an existing
+	// one. SQLite has no xmax to read back (the PostgreSQL signal), so before the
+	// write we check, in the same transaction, whether any payload row's
+	// conflict-target key already exists; if none does the upsert is all-insert.
+	if q.Kind == ir.Upsert {
+		if allInsert, ok, derr := detectUpsertInsert(ctx, tx, q, plan.Rel); derr != nil {
+			return nil, b.MapError(derr)
+		} else if ok {
+			res.controls.UpsertStatusKnown = true
+			res.controls.UpsertInsert = allInsert
+		}
+	}
 	if len(returning) > 0 {
 		rows, err := tx.QueryContext(ctx, st.SQL, st.Args...)
 		if err != nil {
@@ -336,6 +349,72 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 		return nil, b.MapError(err)
 	}
 	return res, nil
+}
+
+// detectUpsertInsert reports whether an upsert is all-insert (no payload row's
+// conflict-target key already exists) so the HTTP layer can choose 201 over
+// 200. It runs inside the write transaction, before the upsert statement, and
+// returns ok=false when the target columns are unknown (no explicit on_conflict
+// and no primary key), leaving the status to the default. The conflict target
+// defaults to the relation's primary key, matching the upsert's own ON CONFLICT.
+func detectUpsertInsert(ctx context.Context, tx *sql.Tx, q *ir.Query, rel *schema.Relation) (allInsert, ok bool, err error) {
+	if q.Write == nil || len(q.Write.Rows) == 0 {
+		return false, false, nil
+	}
+	// Only merge-duplicates can turn into an update; an ignore-duplicates upsert
+	// (ON CONFLICT DO NOTHING) is a no-op insert on a conflict, which PostgreSQL
+	// reports through RETURNING as all-insert and PostgREST renders as 201. So a
+	// PUT (no Conflict spec) and a merge upsert run detection; an ignore upsert
+	// keeps the 201 default.
+	if q.Write.Conflict != nil && q.Write.Conflict.Resolution == ir.ConflictIgnore {
+		return false, false, nil
+	}
+	target := rel.PrimaryKey
+	if q.Write.Conflict != nil && len(q.Write.Conflict.Target) > 0 {
+		target = q.Write.Conflict.Target
+	}
+	if len(target) == 0 {
+		return false, false, nil
+	}
+
+	d := dialect{}
+	var where strings.Builder
+	for i, c := range target {
+		if i > 0 {
+			where.WriteString(" AND ")
+		}
+		where.WriteString(d.QuoteIdent(c))
+		where.WriteString(" = ?")
+	}
+	query := "SELECT 1 FROM " + d.QuoteIdent(rel.Name) + " WHERE " + where.String() + " LIMIT 1"
+
+	for _, row := range q.Write.Rows {
+		args := make([]any, len(target))
+		for i, c := range target {
+			// A payload missing a key column cannot match an existing row by it;
+			// treat that row as an insert and move on.
+			v, present := row[c]
+			if !present {
+				args = nil
+				break
+			}
+			args[i] = sqlgen.WriteArg(d, v)
+		}
+		if args == nil {
+			continue
+		}
+		var dummy int
+		switch scanErr := tx.QueryRowContext(ctx, query, args...).Scan(&dummy); scanErr {
+		case nil:
+			// At least one row matches an existing key: not an all-insert upsert.
+			return false, true, nil
+		case sql.ErrNoRows:
+			// This row is an insert; keep checking the rest.
+		default:
+			return false, false, scanErr
+		}
+	}
+	return true, true, nil
 }
 
 // compileWrite dispatches to the right compiler for the mutation kind.

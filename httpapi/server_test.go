@@ -420,13 +420,15 @@ func TestDeleteRepresentation(t *testing.T) {
 	}
 }
 
-func TestPostUpsertMergeDuplicates(t *testing.T) {
+// A merge-duplicates upsert that hits an existing row updates it; PostgREST v14
+// reports 200, not 201, because nothing new was created.
+func TestPostUpsertMergeDuplicatesUpdateIs200(t *testing.T) {
 	srv := newServer(t)
 	resp := send(t, srv, http.MethodPost, "/films", `{"id":1,"title":"Metropolis (restored)"}`, map[string]string{
 		"Prefer": "return=representation, resolution=merge-duplicates",
 	})
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("status = %d, want 201", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 	rows := decodeArray(t, resp)
 	if len(rows) != 1 || rows[0]["title"] != "Metropolis (restored)" {
@@ -434,9 +436,33 @@ func TestPostUpsertMergeDuplicates(t *testing.T) {
 	}
 }
 
-func TestPutUpsertIs200(t *testing.T) {
+// A merge-duplicates upsert whose key is new inserts a row, so v14 reports 201.
+func TestPostUpsertMergeDuplicatesInsertIs201(t *testing.T) {
+	srv := newServer(t)
+	resp := send(t, srv, http.MethodPost, "/films", `{"id":50,"title":"Brand New"}`, map[string]string{
+		"Prefer": "return=representation, resolution=merge-duplicates",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", resp.StatusCode)
+	}
+}
+
+// PUT replaces or creates the addressed row. When the key did not exist the row
+// is created, so v14 reports 201.
+func TestPutUpsertNewIs201(t *testing.T) {
 	srv := newServer(t)
 	resp := send(t, srv, http.MethodPut, "/films?id=eq.20", `{"id":20,"title":"New"}`, map[string]string{
+		"Prefer": "return=representation",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", resp.StatusCode)
+	}
+}
+
+// PUT to an existing key replaces it; nothing is created, so v14 reports 200.
+func TestPutUpsertExistingIs200(t *testing.T) {
+	srv := newServer(t)
+	resp := send(t, srv, http.MethodPut, "/films?id=eq.1", `{"id":1,"title":"Metropolis (cut)"}`, map[string]string{
 		"Prefer": "return=representation",
 	})
 	if resp.StatusCode != http.StatusOK {
