@@ -438,12 +438,68 @@ func fieldNames(rows pgx.Rows) []string {
 	return names
 }
 
-// ExplainRead runs EXPLAIN (FORMAT JSON) on the read query and returns the raw
-// JSON plan from PostgreSQL. When analyze is true EXPLAIN ANALYZE is used
-// instead, which also executes the query and includes timing. The request runs
-// in a read-only transaction with the full session setup (role + GUCs) so the
-// planner sees the same context as a real request.
-func (b *Backend) ExplainRead(ctx context.Context, p *ir.Plan, rc *reqctx.Context, analyze bool) ([]byte, error) {
+// explainPrefix builds the "EXPLAIN (...) " clause for a plan request from the
+// parsed options: the output format plus whichever of analyze/verbose/settings/
+// buffers/wal were asked for, in PostgreSQL's option syntax.
+func explainPrefix(opts backend.PlanOptions) string {
+	args := []string{"FORMAT TEXT"}
+	if opts.Format == backend.PlanJSON {
+		args[0] = "FORMAT JSON"
+	}
+	for _, o := range []struct {
+		on   bool
+		name string
+	}{
+		{opts.Analyze, "ANALYZE"}, {opts.Verbose, "VERBOSE"},
+		{opts.Settings, "SETTINGS"}, {opts.Buffers, "BUFFERS"}, {opts.Wal, "WAL"},
+	} {
+		if o.on {
+			args = append(args, o.name)
+		}
+	}
+	return "EXPLAIN (" + strings.Join(args, ", ") + ") "
+}
+
+// runExplain executes the prefixed statement and returns the plan bytes. The
+// JSON format yields a single document; the text format yields one row per plan
+// line, which are joined with newlines into the text body PostgREST returns.
+func (b *Backend) runExplain(ctx context.Context, tx pgx.Tx, opts backend.PlanOptions, sql string, args []any) ([]byte, error) {
+	rows, err := tx.Query(ctx, explainPrefix(opts)+sql, args...)
+	if err != nil {
+		return nil, b.MapError(err)
+	}
+	defer rows.Close()
+	if opts.Format == backend.PlanJSON {
+		var plan []byte
+		for rows.Next() {
+			if err := rows.Scan(&plan); err != nil {
+				return nil, b.MapError(err)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return nil, b.MapError(err)
+		}
+		return plan, nil
+	}
+	var lines []string
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			return nil, b.MapError(err)
+		}
+		lines = append(lines, line)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, b.MapError(err)
+	}
+	return []byte(strings.Join(lines, "\n")), nil
+}
+
+// ExplainRead runs EXPLAIN on the read query and returns the plan in the
+// requested format. The request runs in a read-only transaction with the full
+// session setup (role + GUCs) so the planner sees the same context as a real
+// request.
+func (b *Backend) ExplainRead(ctx context.Context, p *ir.Plan, rc *reqctx.Context, opts backend.PlanOptions) ([]byte, error) {
 	tx, err := b.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return nil, b.MapError(err)
@@ -458,28 +514,48 @@ func (b *Backend) ExplainRead(ctx context.Context, p *ir.Plan, rc *reqctx.Contex
 	if apiErr != nil {
 		return nil, apiErr
 	}
+	return b.runExplain(ctx, tx, opts, st.SQL, st.Args)
+}
 
-	var prefix string
-	if analyze {
-		prefix = "EXPLAIN (ANALYZE, FORMAT JSON) "
-	} else {
-		prefix = "EXPLAIN (FORMAT JSON) "
-	}
-	rows, err := tx.Query(ctx, prefix+st.SQL, st.Args...)
+// ExplainWrite runs EXPLAIN on the mutation. It uses a read-write transaction
+// that always rolls back, so EXPLAIN ANALYZE (which executes the statement)
+// leaves nothing behind, matching PostgREST's plan-only contract.
+func (b *Backend) ExplainWrite(ctx context.Context, p *ir.Plan, rc *reqctx.Context, opts backend.PlanOptions) ([]byte, error) {
+	tx, err := b.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return nil, b.MapError(err)
 	}
-	defer rows.Close()
-	var plan []byte
-	for rows.Next() {
-		if err := rows.Scan(&plan); err != nil {
-			return nil, b.MapError(err)
-		}
-	}
-	if err := rows.Err(); err != nil {
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := applySession(ctx, tx, b, rc); err != nil {
 		return nil, b.MapError(err)
 	}
-	return plan, nil
+
+	st, apiErr := compileWrite(p.Query, returningCols(p.Query, p.Rel))
+	if apiErr != nil {
+		return nil, apiErr
+	}
+	return b.runExplain(ctx, tx, opts, st.SQL, st.Args)
+}
+
+// ExplainCall runs EXPLAIN on the RPC function call. The read-write transaction
+// rolls back, so an EXPLAIN ANALYZE of a volatile function discards its effects.
+func (b *Backend) ExplainCall(ctx context.Context, p *ir.Plan, rc *reqctx.Context, opts backend.PlanOptions) ([]byte, error) {
+	tx, err := b.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, b.MapError(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := applySession(ctx, tx, b, rc); err != nil {
+		return nil, b.MapError(err)
+	}
+
+	st, apiErr := sqlgen.CompileCall(Dialect{}, p.Call, p.Func, sqlgen.ContextArgs(rc))
+	if apiErr != nil {
+		return nil, apiErr
+	}
+	return b.runExplain(ctx, tx, opts, st.SQL, st.Args)
 }
 
 // drainRows reads every row of a pgx cursor into memory, normalizing values so

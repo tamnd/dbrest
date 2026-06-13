@@ -642,6 +642,17 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 	t.mark("plan", planStart)
 
 	rc := s.buildContext(r, id, activeSchema)
+
+	// A plan request on an RPC call returns the EXPLAIN for the function instead
+	// of running it; route it before Execute so mediaPlan never reaches the
+	// call renderer.
+	if media == mediaPlan {
+		s.servePlan(w, r, id, func(exp backend.Explainer, opts backend.PlanOptions) ([]byte, error) {
+			return exp.ExplainCall(r.Context(), planned, rc, opts)
+		})
+		return
+	}
+
 	txStart := time.Now()
 	res, err := s.backend.Execute(r.Context(), planned, rc)
 	if err != nil {
@@ -764,27 +775,13 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity,
 		return
 	}
 
-	// vnd.pgrst.plan+json: return EXPLAIN JSON when the backend supports it.
-	// The db-plan-enabled gate comes first: with the option off the media
-	// type is not producible at all, whatever the backend can do.
+	// application/vnd.pgrst.plan: return the EXPLAIN output when the backend
+	// supports it. servePlan applies the db-plan-enabled gate and the Explainer
+	// check so the plan media type never reaches the renderer.
 	if media == mediaPlan {
-		if !s.planEnabled {
-			writeError(w, pgerr.ErrNotAcceptable(mediaPlan))
-			return
-		}
-		exp, supported := s.backend.(backend.Explainer)
-		if !supported {
-			writeError(w, pgerr.ErrNotAcceptable(mediaPlan))
-			return
-		}
-		planJSON, err := exp.ExplainRead(r.Context(), planned, rc, planAnalyze(acceptHdrs))
-		if err != nil {
-			writeError(w, mapExecError(s.backend, err, id.anonymous))
-			return
-		}
-		w.Header().Set("Content-Type", mediaPlan)
-		w.WriteHeader(http.StatusOK)
-		w.Write(planJSON)
+		s.servePlan(w, r, id, func(exp backend.Explainer, opts backend.PlanOptions) ([]byte, error) {
+			return exp.ExplainRead(r.Context(), planned, rc, opts)
+		})
 		return
 	}
 
@@ -805,6 +802,65 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity,
 	t.mark("response", respStart)
 
 	s.writeRead(w, r, q, out, res.ResponseControls())
+}
+
+// servePlan answers a negotiated application/vnd.pgrst.plan request for any of
+// the three execution paths. It enforces the db-plan-enabled gate and the
+// backend Explainer capability first (406 when either is absent, so the plan
+// media type never falls through to the renderer and 500s), parses the plan
+// options from the Accept header, runs the explain via the supplied selector,
+// and echoes the full parameterized Content-Type. explain picks
+// ExplainRead/ExplainWrite/ExplainCall on the resolved Explainer.
+func (s *Server) servePlan(w http.ResponseWriter, r *http.Request, id identity, explain func(backend.Explainer, backend.PlanOptions) ([]byte, error)) {
+	if !s.planEnabled {
+		writeError(w, pgerr.ErrNotAcceptable(mediaPlan))
+		return
+	}
+	exp, supported := s.backend.(backend.Explainer)
+	if !supported {
+		writeError(w, pgerr.ErrNotAcceptable(mediaPlan))
+		return
+	}
+	opts, _ := parsePlan(r.Header.Values("Accept"))
+	planBytes, err := explain(exp, opts)
+	if err != nil {
+		writeError(w, mapExecError(s.backend, err, id.anonymous))
+		return
+	}
+	w.Header().Set("Content-Type", planContentType(opts))
+	w.WriteHeader(http.StatusOK)
+	w.Write(planBytes)
+}
+
+// planContentType builds the response Content-Type echoed for a plan request:
+// the format suffix, the for="<media>" target, the options= flags that were
+// set, and the charset, matching PostgREST's parameterized plan media type.
+func planContentType(opts backend.PlanOptions) string {
+	sub := "application/vnd.pgrst.plan+text"
+	if opts.Format == backend.PlanJSON {
+		sub = "application/vnd.pgrst.plan+json"
+	}
+	parts := []string{sub}
+	if opts.For != "" {
+		parts = append(parts, `for="`+opts.For+`"`)
+	}
+	var flags []string
+	for _, f := range []struct {
+		on   bool
+		name string
+	}{
+		{opts.Analyze, "analyze"}, {opts.Verbose, "verbose"},
+		{opts.Settings, "settings"}, {opts.Buffers, "buffers"}, {opts.Wal, "wal"},
+	} {
+		if f.on {
+			flags = append(flags, f.name)
+		}
+	}
+	if len(flags) > 0 {
+		parts = append(parts, "options="+strings.Join(flags, "|"))
+	}
+	parts = append(parts, "charset=utf-8")
+	return strings.Join(parts, "; ")
 }
 
 func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.QueryKind, id identity, activeSchema string) {
@@ -866,6 +922,17 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.Que
 		writeError(w, apiErr)
 		return
 	}
+
+	// A plan request on a write returns the EXPLAIN for the mutation instead of
+	// running it. servePlan gates and routes it so mediaPlan never reaches the
+	// renderer (which would 500 on a write).
+	if media == mediaPlan {
+		s.servePlan(w, r, id, func(exp backend.Explainer, opts backend.PlanOptions) ([]byte, error) {
+			return exp.ExplainWrite(r.Context(), planned, rc, opts)
+		})
+		return
+	}
+
 	txStart := time.Now()
 	res, err := s.backend.Execute(r.Context(), planned, rc)
 	if err != nil {

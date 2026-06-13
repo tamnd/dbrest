@@ -4,6 +4,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/tamnd/dbrest/backend"
 )
 
 // The response media types dbrest can produce, in preference order. A wildcard
@@ -85,31 +87,66 @@ func parseAccept(headers []string) []mediaRange {
 	return ranges
 }
 
-// planAnalyze reports whether the Accept header for vnd.pgrst.plan+json carries
-// "options=analyze", which asks for EXPLAIN ANALYZE rather than plain EXPLAIN.
-func planAnalyze(headers []string) bool {
+// planSubtypes are the application/vnd.pgrst.plan family subtypes dbrest
+// recognizes, mapping each to its output format. The bare type and the +text
+// suffix are PostgREST's text default; +json is the machine-readable form.
+var planSubtypes = map[string]backend.PlanFormat{
+	"vnd.pgrst.plan":      backend.PlanText,
+	"vnd.pgrst.plan+text": backend.PlanText,
+	"vnd.pgrst.plan+json": backend.PlanJSON,
+}
+
+// parsePlan scans the Accept header for the application/vnd.pgrst.plan family and
+// returns the parsed plan options. The second return is false when no plan type
+// is present. Output defaults to text (the bare type and +text); +json selects
+// the JSON form. The for="<media>" parameter (default application/json) and the
+// options=a|b|c flags (analyze, verbose, settings, buffers, wal) ride along.
+func parsePlan(headers []string) (backend.PlanOptions, bool) {
 	for _, h := range headers {
 		for part := range strings.SplitSeq(h, ",") {
-			part = strings.TrimSpace(part)
-			segs := strings.Split(part, ";")
+			segs := strings.Split(strings.TrimSpace(part), ";")
 			typ, sub, ok := strings.Cut(strings.TrimSpace(segs[0]), "/")
 			if !ok {
 				continue
 			}
-			if strings.ToLower(typ)+"/"+strings.ToLower(sub) != "application/vnd.pgrst.plan+json" {
+			typ = strings.ToLower(strings.TrimSpace(typ))
+			sub = strings.ToLower(strings.TrimSpace(sub))
+			format, isPlan := planSubtypes[sub]
+			if typ != "application" || !isPlan {
 				continue
 			}
+			opts := backend.PlanOptions{Format: format, For: mediaJSON}
 			for _, p := range segs[1:] {
-				p = strings.TrimSpace(p)
-				if v, ok := strings.CutPrefix(strings.ToLower(p), "options="); ok {
-					if strings.Contains(v, "analyze") {
-						return true
+				k, v, ok := strings.Cut(strings.TrimSpace(p), "=")
+				if !ok {
+					continue
+				}
+				k = strings.ToLower(strings.TrimSpace(k))
+				v = strings.Trim(strings.TrimSpace(v), `"`)
+				switch k {
+				case "for":
+					opts.For = v
+				case "options":
+					for _, o := range strings.Split(strings.ToLower(v), "|") {
+						switch strings.TrimSpace(o) {
+						case "analyze":
+							opts.Analyze = true
+						case "verbose":
+							opts.Verbose = true
+						case "settings":
+							opts.Settings = true
+						case "buffers":
+							opts.Buffers = true
+						case "wal":
+							opts.Wal = true
+						}
 					}
 				}
 			}
+			return opts, true
 		}
 	}
-	return false
+	return backend.PlanOptions{}, false
 }
 
 // vendorSynonym maps the suffixless PostgREST vendor spellings to their +json
@@ -150,6 +187,13 @@ func negotiate(headers []string) (string, bool) {
 				}
 			}
 		default:
+			// The plan family (bare, +text, +json) negotiates to the single plan
+			// sentinel; parsePlan recovers the exact format and options later.
+			if r.typ == "application" {
+				if _, isPlan := planSubtypes[r.sub]; isPlan {
+					return mediaPlan, true
+				}
+			}
 			full := vendorSynonym(r.typ + "/" + r.sub)
 			for _, m := range supportedMedia {
 				if m == full {

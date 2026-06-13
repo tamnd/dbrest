@@ -60,14 +60,40 @@ type Result interface {
 	ResponseControls() *reqctx.ResponseControls
 }
 
-// Explainer is an optional backend capability for the vnd.pgrst.plan+json
-// Accept type. Backends that support EXPLAIN implement this interface;
-// the frontend type-asserts to it and falls back to 406 when absent.
+// PlanFormat is the output format an Accept: application/vnd.pgrst.plan request
+// asks for. PostgREST defaults to text (bare type and the +text suffix); +json
+// asks for the machine-readable form.
+type PlanFormat uint8
+
+const (
+	PlanText PlanFormat = iota // default: EXPLAIN text output
+	PlanJSON                   // +json suffix: EXPLAIN (FORMAT JSON)
+)
+
+// PlanOptions carries the parsed parameters of a plan Accept header. Format
+// selects text vs json; For is the media type the plan is computed for (the
+// for="<media>" parameter, informational on the wire and echoed back); the
+// booleans are the options= flags PostgREST forwards to EXPLAIN.
+type PlanOptions struct {
+	Format   PlanFormat
+	For      string
+	Analyze  bool
+	Verbose  bool
+	Settings bool
+	Buffers  bool
+	Wal      bool
+}
+
+// Explainer is an optional backend capability for the application/vnd.pgrst.plan
+// Accept type. Backends that support EXPLAIN implement this interface; the
+// frontend type-asserts to it and 406s when it is absent. The three methods
+// mirror the three execution paths so a plan can be requested for a read, a
+// write, or an RPC call. Each returns the engine's EXPLAIN output already
+// formatted per opts.Format (text bytes or a JSON document).
 type Explainer interface {
-	// ExplainRead runs EXPLAIN on the read query and returns raw JSON from the
-	// engine's query planner. If analyze is true the engine also executes and
-	// times the query (EXPLAIN ANALYZE equivalent).
-	ExplainRead(ctx context.Context, p *ir.Plan, rc *reqctx.Context, analyze bool) ([]byte, error)
+	ExplainRead(ctx context.Context, p *ir.Plan, rc *reqctx.Context, opts PlanOptions) ([]byte, error)
+	ExplainWrite(ctx context.Context, p *ir.Plan, rc *reqctx.Context, opts PlanOptions) ([]byte, error)
+	ExplainCall(ctx context.Context, p *ir.Plan, rc *reqctx.Context, opts PlanOptions) ([]byte, error)
 }
 
 // RowStream is a forward-only cursor over result rows. The renderer drives it to
