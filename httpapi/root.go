@@ -29,7 +29,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request, id identity,
 	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", rootAllow)
-		writeError(w, errRootMethod(r.Method))
+		writeError(w, pgerr.ErrUnsupportedMethod(r.Method))
 		return
 	}
 	if s.openapiMode == config.OpenAPIDisabled {
@@ -139,13 +139,6 @@ func (s *Server) serveRootSpec(w http.ResponseWriter, r *http.Request, id identi
 // rootAllow is the verb set the root serves: the Allow value OPTIONS answers
 // with and the one a 405 carries so the rejected caller knows what would work.
 const rootAllow = "OPTIONS,GET,HEAD"
-
-// errRootMethod is PostgREST's PGRST117: a verb the root does not answer, a
-// 405 naming the method. The general PGRST117 verb handling is item 02.11;
-// this local constructor covers the root until pgerr grows the shared one.
-func errRootMethod(method string) *pgerr.APIError {
-	return pgerr.New(http.StatusMethodNotAllowed, "PGRST117", "Unsupported HTTP method: "+method)
-}
 
 // errRootDisabled is PostgREST's PGRST126: the root metadata endpoint turned
 // off by openapi-mode=disabled (or an unset db-root-spec in that mode), a 404

@@ -16,31 +16,32 @@ import (
 // Each constructor returns a fully-formed *APIError with the spec-mandated
 // status. Callers add details/hint with WithDetails / WithHint.
 const (
-	CodeParse            = "PGRST100" // 400 query-string parse error
-	CodeMethodNotAllowed = "PGRST101" // 405 method not allowed (GET on a volatile fn)
-	CodeInvalidBody      = "PGRST102" // 400 invalid request body
-	CodeRangeUnsatisfied = "PGRST103" // 416 requested range not satisfiable
-	CodePutPrimaryKey    = "PGRST105" // 405 PUT filters not exactly the PK with eq
-	CodePutLimit         = "PGRST114" // 400 limit/offset on a PUT
-	CodePutPayloadKey    = "PGRST115" // 400 PUT payload PK differs from the URL filter
-	CodeMediaType        = "PGRST107" // 406 Accept negotiation failed
-	CodeGucHeaders       = "PGRST111" // 500 invalid response.headers from a function
-	CodeGucStatus        = "PGRST112" // 500 invalid response.status from a function
-	CodeSingularZeroMany = "PGRST116" // 406 singular requested, zero or many rows
-	CodeInvalidPath      = "PGRST125" // 404 invalid path in request URL
-	CodeNoRelationship   = "PGRST200" // 400 relationship not found
-	CodeAmbiguousEmbed   = "PGRST201" // 300 embedding ambiguous
-	CodeNoFunction       = "PGRST202" // 404 no function matches name/args
-	CodeAmbiguousFunc    = "PGRST203" // 300 overloaded function call ambiguous
-	CodeUnknownColumn    = "PGRST204" // 400 column in write payload not found
-	CodeUnknownTable     = "PGRST205" // 404 table or view not found / not exposed
-	CodeJWTSecretMissing = "PGRST300" // 500 a token was presented but no jwt-secret is configured
-	CodeJWTDecode        = "PGRST301" // 401 JWT could not be decoded (parts/key/alg/signature)
-	CodeJWTRequired      = "PGRST302" // 401 no token sent and the anonymous role is disabled
-	CodeJWTClaims        = "PGRST303" // 401 JWT claims validation or parsing failed
-	CodeAggregatesOff    = "PGRST123" // 400 aggregate functions used while db-aggregates-enabled is off
-	CodeUnsupported      = "PGRST127" // 400 feature not implemented on this backend
-	CodeInternal         = "PGRSTX00" // 500 internal error (upstream group X has only X00)
+	CodeParse             = "PGRST100" // 400 query-string parse error
+	CodeMethodNotAllowed  = "PGRST101" // 405 method not allowed (GET on a volatile fn)
+	CodeUnsupportedMethod = "PGRST117" // 405 unsupported HTTP method on the resource
+	CodeInvalidBody       = "PGRST102" // 400 invalid request body
+	CodeRangeUnsatisfied  = "PGRST103" // 416 requested range not satisfiable
+	CodePutPrimaryKey     = "PGRST105" // 405 PUT filters not exactly the PK with eq
+	CodePutLimit          = "PGRST114" // 400 limit/offset on a PUT
+	CodePutPayloadKey     = "PGRST115" // 400 PUT payload PK differs from the URL filter
+	CodeMediaType         = "PGRST107" // 406 Accept negotiation failed
+	CodeGucHeaders        = "PGRST111" // 500 invalid response.headers from a function
+	CodeGucStatus         = "PGRST112" // 500 invalid response.status from a function
+	CodeSingularZeroMany  = "PGRST116" // 406 singular requested, zero or many rows
+	CodeInvalidPath       = "PGRST125" // 404 invalid path in request URL
+	CodeNoRelationship    = "PGRST200" // 400 relationship not found
+	CodeAmbiguousEmbed    = "PGRST201" // 300 embedding ambiguous
+	CodeNoFunction        = "PGRST202" // 404 no function matches name/args
+	CodeAmbiguousFunc     = "PGRST203" // 300 overloaded function call ambiguous
+	CodeUnknownColumn     = "PGRST204" // 400 column in write payload not found
+	CodeUnknownTable      = "PGRST205" // 404 table or view not found / not exposed
+	CodeJWTSecretMissing  = "PGRST300" // 500 a token was presented but no jwt-secret is configured
+	CodeJWTDecode         = "PGRST301" // 401 JWT could not be decoded (parts/key/alg/signature)
+	CodeJWTRequired       = "PGRST302" // 401 no token sent and the anonymous role is disabled
+	CodeJWTClaims         = "PGRST303" // 401 JWT claims validation or parsing failed
+	CodeAggregatesOff     = "PGRST123" // 400 aggregate functions used while db-aggregates-enabled is off
+	CodeUnsupported       = "PGRST127" // 400 feature not implemented on this backend
+	CodeInternal          = "PGRSTX00" // 500 internal error (upstream group X has only X00)
 )
 
 // ErrParse is a query-string syntax error (bad operator, malformed logic tree).
@@ -238,6 +239,16 @@ func ErrMethodNotAllowed(msg string) *APIError {
 func ErrInvalidRPCMethod(method string) *APIError {
 	return New(http.StatusMethodNotAllowed, CodeMethodNotAllowed,
 		fmt.Sprintf("Cannot use the %s method on RPC", method))
+}
+
+// ErrUnsupportedMethod is PostgREST's PGRST117 (405): an HTTP method the server
+// does not implement on any resource, such as TRACE or a verb the table or
+// function endpoint never answers. The text is upstream's "Unsupported HTTP
+// method: <method>". OPTIONS is never this error; it is answered with an Allow
+// header.
+func ErrUnsupportedMethod(method string) *APIError {
+	return New(http.StatusMethodNotAllowed, CodeUnsupportedMethod,
+		"Unsupported HTTP method: "+method)
 }
 
 // CodeReadOnlyTransaction is PostgreSQL's read_only_sql_transaction. PostgREST

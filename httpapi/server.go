@@ -304,6 +304,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if s.serveCORS(w, r) {
 		return
 	}
+	if r.Method == http.MethodOptions {
+		// OPTIONS describes the resource with an Allow header and runs no
+		// transaction, so it answers before authentication and schema negotiation,
+		// the way PostgREST does. A CORS preflight was already handled by serveCORS.
+		s.handleOptions(w, r)
+		return
+	}
 	id, apiErr := s.authenticate(r)
 	if apiErr != nil {
 		writeError(w, apiErr)
@@ -339,8 +346,49 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		s.handleWrite(w, r, ir.Delete, id, activeSchema)
 	default:
-		writeError(w, pgerr.ErrUnsupported(r.Method+" requests", "dbrest"))
+		// A verb the server implements nowhere (TRACE, CONNECT, a custom method)
+		// is PostgREST's 405 PGRST117, not the capability gate's PGRST127.
+		writeError(w, pgerr.ErrUnsupportedMethod(r.Method))
 	}
+}
+
+// tableAllow is the Allow value an OPTIONS on a table or view answers with: the
+// full verb set a relation endpoint accepts, in PostgREST's order.
+const tableAllow = "OPTIONS,GET,HEAD,POST,PUT,PATCH,DELETE"
+
+// handleOptions answers an OPTIONS request with an Allow header naming the
+// methods the resource accepts and a 200 with no body, the way PostgREST does.
+// The root answers its own verb set, a function answers by volatility (a
+// volatile function is POST-only, otherwise GET/HEAD/POST are allowed too), and
+// every table or view answers the full relation verb set. No transaction runs.
+func (s *Server) handleOptions(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/" {
+		w.Header().Set("Allow", rootAllow)
+	} else if fn, ok := rpcName(r.URL.Path); ok {
+		w.Header().Set("Allow", s.rpcAllow(fn))
+	} else {
+		w.Header().Set("Allow", tableAllow)
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// rpcAllow is the Allow value for an OPTIONS on /rpc/<fn>: a volatile function
+// accepts only OPTIONS and POST, every other (read-only) function also accepts
+// GET and HEAD. A non-registry (native) backend does not resolve volatility
+// here, so it answers the read-capable set, matching PostgREST's default for a
+// function whose volatility is not yet known.
+func (s *Server) rpcAllow(fn string) string {
+	const readable = "OPTIONS,GET,HEAD,POST"
+	const writeOnly = "OPTIONS,POST"
+	if s.backend.Capabilities().NativeRPC {
+		return readable
+	}
+	for _, f := range s.backend.Functions().List() {
+		if f.Name == fn && !f.Volatility.ReadOnly() {
+			return writeOnly
+		}
+	}
+	return readable
 }
 
 // corsExposedHeaders is the Access-Control-Expose-Headers value PostgREST
@@ -447,8 +495,10 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 
 	isGet := r.Method == http.MethodGet || r.Method == http.MethodHead
 	if !isGet && r.Method != http.MethodPost {
-		writeError(w, pgerr.ErrMethodNotAllowed(
-			"Method "+r.Method+" not allowed on a function; use GET or POST"))
+		// PUT, PATCH, or DELETE on a function is PostgREST's PGRST101 with the
+		// exact "Cannot use the <method> method on RPC" text. OPTIONS never
+		// reaches here; it is answered with an Allow header before routing.
+		writeError(w, pgerr.ErrInvalidRPCMethod(r.Method))
 		return
 	}
 
