@@ -232,6 +232,76 @@ func TestCompileEmptyInMatchesNothing(t *testing.T) {
 	}
 }
 
+// TestCompileQuantifiedEqExpandsToOr checks eq(any) over a list fans out into an
+// OR of equalities, each value bound (item 01.1).
+func TestCompileQuantifiedEqExpandsToOr(t *testing.T) {
+	where := ir.Cond(ir.Compare{
+		Path:  []string{"id"},
+		Op:    ir.OpEq,
+		Quant: ir.QAny,
+		Value: ir.Value{List: []string{"1", "2", "3"}},
+	})
+	st := compile(t, &ir.Query{Relation: ir.Ref{Name: "t"}, Where: &where})
+	want := `SELECT * FROM "t" WHERE ("id" = $1 OR "id" = $2 OR "id" = $3)`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+	if len(st.Args) != 3 || st.Args[0] != "1" || st.Args[2] != "3" {
+		t.Errorf("Args = %v", st.Args)
+	}
+}
+
+// TestCompileQuantifiedGtExpandsToAnd checks gt(all) fans out into an AND.
+func TestCompileQuantifiedGtExpandsToAnd(t *testing.T) {
+	where := ir.Cond(ir.Compare{
+		Path:  []string{"year"},
+		Op:    ir.OpGt,
+		Quant: ir.QAll,
+		Value: ir.Value{List: []string{"1990", "2000"}},
+	})
+	st := compile(t, &ir.Query{Relation: ir.Ref{Name: "t"}, Where: &where})
+	want := `SELECT * FROM "t" WHERE ("year" > $1 AND "year" > $2)`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+}
+
+// TestCompileQuantifiedMatchUsesDialectRegex checks match(any) routes each
+// element through the dialect regex seam (PatternMark replaced by the bind).
+func TestCompileQuantifiedMatchUsesDialectRegex(t *testing.T) {
+	where := ir.Cond(ir.Compare{
+		Path:  []string{"c"},
+		Op:    ir.OpMatch,
+		Quant: ir.QAny,
+		Value: ir.Value{List: []string{"^a", "b$"}},
+	})
+	st := compile(t, &ir.Query{Relation: ir.Ref{Name: "t"}, Where: &where})
+	want := `SELECT * FROM "t" WHERE ("c" ~ $1 OR "c" ~ $2)`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+	if len(st.Args) != 2 || st.Args[0] != "^a" || st.Args[1] != "b$" {
+		t.Errorf("Args = %v", st.Args)
+	}
+}
+
+// TestCompileQuantifiedNegated checks a negated quantified compare wraps the
+// whole fan-out in NOT (…).
+func TestCompileQuantifiedNegated(t *testing.T) {
+	where := ir.Cond(ir.Compare{
+		Path:   []string{"id"},
+		Op:     ir.OpEq,
+		Quant:  ir.QAny,
+		Negate: true,
+		Value:  ir.Value{List: []string{"1", "2"}},
+	})
+	st := compile(t, &ir.Query{Relation: ir.Ref{Name: "t"}, Where: &where})
+	want := `SELECT * FROM "t" WHERE NOT (("id" = $1 OR "id" = $2))`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+}
+
 func TestCompileCount(t *testing.T) {
 	st, err := CompileCount(stub{}, &ir.Query{Relation: ir.Ref{Name: "films"}})
 	if err != nil {

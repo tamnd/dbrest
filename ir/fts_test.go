@@ -90,14 +90,18 @@ func TestParseFTSNegated(t *testing.T) {
 }
 
 // TestQuantifierStillParses guards that splitting fts-config from the quantifier
-// branch did not break op(any)/op(all) on the comparison operators.
+// branch did not break op(any)/op(all) on the comparison operators. PostgREST
+// spells the operand as a {…} list, which becomes Value.List (item 01.1).
 func TestQuantifierStillParses(t *testing.T) {
-	cmp := fetchCompare(t, "id=eq(any).1")
+	cmp := fetchCompare(t, "id=eq(any).{1,2}")
 	if cmp.Op != OpEq {
 		t.Errorf("Op = %v, want OpEq", cmp.Op)
 	}
 	if cmp.Quant != QAny {
 		t.Errorf("Quant = %d, want QAny", cmp.Quant)
+	}
+	if len(cmp.Value.List) != 2 || cmp.Value.List[0] != "1" || cmp.Value.List[1] != "2" {
+		t.Errorf("List = %v, want [1 2]", cmp.Value.List)
 	}
 }
 

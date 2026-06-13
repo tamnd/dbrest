@@ -582,6 +582,20 @@ func (b *builder) writeCompare(c ir.Compare) *pgerr.APIError {
 	}
 	col := b.colRef(c.Path[0])
 
+	// A quantified filter (op(any)/op(all) over a {…} list) expands to a disjunction
+	// or conjunction of the real operator, one predicate per element (item 01.1).
+	if c.Quant != ir.QNone {
+		frag, err := b.writeQuantified(col, c)
+		if err != nil {
+			return err
+		}
+		if c.Negate {
+			frag = "NOT (" + frag + ")"
+		}
+		b.sb.WriteString(frag)
+		return nil
+	}
+
 	var frag string
 	var err *pgerr.APIError
 	switch c.Op {
@@ -598,20 +612,12 @@ func (b *builder) writeCompare(c ir.Compare) *pgerr.APIError {
 			frag = col + " " + binaryOp(c.Op) + " " + b.bind(c.Value.Text)
 		}
 	case ir.OpGt, ir.OpGte, ir.OpLt, ir.OpLte, ir.OpLike:
-		if c.Quant != ir.QNone {
-			frag, err = b.writeLikeQuantified(col, ir.OpLike, c.Quant, c.Value.List)
-		} else {
-			frag = col + " " + binaryOp(c.Op) + " " + b.bind(c.Value.Text)
-		}
+		frag = col + " " + binaryOp(c.Op) + " " + b.bind(c.Value.Text)
 	case ir.OpILike:
-		if c.Quant != ir.QNone {
-			frag, err = b.writeLikeQuantified(col, ir.OpILike, c.Quant, c.Value.List)
-		} else {
-			var ok bool
-			frag, ok = b.d.ILike(col, b.bind(c.Value.Text))
-			if !ok {
-				return pgerr.ErrUnsupported("case-insensitive LIKE", "sql")
-			}
+		var ok bool
+		frag, ok = b.d.ILike(col, b.bind(c.Value.Text))
+		if !ok {
+			return pgerr.ErrUnsupported("case-insensitive LIKE", "sql")
 		}
 	case ir.OpIn:
 		frag, err = b.writeIn(col, c.Value.List)
@@ -702,38 +708,61 @@ func (b *builder) writeIn(col string, list []string) (string, *pgerr.APIError) {
 	return col + " IN (" + strings.Join(parts, ", ") + ")", nil
 }
 
-// writeLikeQuantified expands like(any)/{...} and like(all)/{...} into a
-// conjunction or disjunction of individual LIKE / ILIKE predicates. An empty
-// list generates a no-match literal (1 = 0) for ANY and always-match (1 = 1)
-// for ALL, consistent with SQL ANY/ALL semantics over an empty set.
-func (b *builder) writeLikeQuantified(col string, op ir.Op, q ir.Quant, list []string) (string, *pgerr.APIError) {
+// writeQuantified expands a quantified filter (op(any)/op(all) over a {…} list)
+// into a disjunction (ANY) or conjunction (ALL) of the real operator, one
+// predicate per element. An empty list is a no-match literal (1 = 0) for ANY and
+// always-match (1 = 1) for ALL, consistent with SQL ANY/ALL over an empty set,
+// though the parser now rejects an empty list upstream. See item 01.1.
+func (b *builder) writeQuantified(col string, c ir.Compare) (string, *pgerr.APIError) {
+	list := c.Value.List
 	if len(list) == 0 {
-		if q == ir.QAny {
+		if c.Quant == ir.QAny {
 			return "1 = 0", nil
 		}
 		return "1 = 1", nil
 	}
 	sep := " OR "
-	if q == ir.QAll {
+	if c.Quant == ir.QAll {
 		sep = " AND "
 	}
 	parts := make([]string, len(list))
-	for i, pat := range list {
-		bound := b.bind(pat)
-		if op == ir.OpILike {
-			expr, ok := b.d.ILike(col, bound)
-			if !ok {
-				return "", pgerr.ErrUnsupported("case-insensitive LIKE", "sql")
-			}
-			parts[i] = expr
-		} else {
-			parts[i] = col + " LIKE " + bound
+	for i, v := range list {
+		frag, err := b.quantElem(col, c.Op, v)
+		if err != nil {
+			return "", err
 		}
+		parts[i] = frag
 	}
 	if len(parts) == 1 {
 		return parts[0], nil
 	}
 	return "(" + strings.Join(parts, sep) + ")", nil
+}
+
+// quantElem lowers one element of a quantified list to its single-operator SQL
+// predicate, using the operator's real infix/regex/ILIKE form.
+func (b *builder) quantElem(col string, op ir.Op, v string) (string, *pgerr.APIError) {
+	switch op {
+	case ir.OpEq, ir.OpGt, ir.OpGte, ir.OpLt, ir.OpLte, ir.OpLike:
+		return col + " " + binaryOp(op) + " " + b.bind(v), nil
+	case ir.OpILike:
+		expr, ok := b.d.ILike(col, b.bind(v))
+		if !ok {
+			return "", pgerr.ErrUnsupported("case-insensitive LIKE", "sql")
+		}
+		return expr, nil
+	case ir.OpMatch, ir.OpIMatch:
+		if feat := b.d.RegexFeatureGap(v); feat != "" {
+			return "", pgerr.ErrUnsupported(feat, "sql")
+		}
+		expr, ok := b.d.Regex(col, v, op == ir.OpIMatch)
+		if !ok {
+			return "", pgerr.ErrUnsupported("regular-expression match", "sql")
+		}
+		return strings.Replace(expr, PatternMark, b.bind(v), 1), nil
+	default:
+		return "", pgerr.ErrUnsupported("quantifier on "+opName(op), "sql")
+	}
 }
 
 func (b *builder) writeIs(col, text string) (string, *pgerr.APIError) {

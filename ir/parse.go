@@ -44,7 +44,13 @@ func ParseRead(relation, rawQuery string, preferHeaders []string) (*Query, *pger
 // limit/offset window, and the horizontal-filter tree. A write uses the filter
 // tree as its WHERE and the select list as its returning projection.
 func parseQueryString(q *Query, vals url.Values) *pgerr.APIError {
-	if sel := vals.Get("select"); sel != "" {
+	// An omitted select defaults to all columns; an explicitly empty select= is a
+	// parse error, matching PostgREST (item 01.5).
+	if vals.Has("select") {
+		sel := vals.Get("select")
+		if sel == "" {
+			return pgerr.ErrParse("\"failed to parse select parameter ()\" (line 1, column 1)")
+		}
 		items, embeds, perr := parseSelect(sel)
 		if perr != nil {
 			return perr
@@ -67,15 +73,14 @@ func applyParams(q *Query, vals url.Values) *pgerr.APIError {
 		if key == "select" {
 			continue // consumed by the caller / by the embed parens
 		}
-		if i := strings.IndexByte(key, '.'); i >= 0 {
-			if idx := findEmbed(q.Embeds, key[:i]); idx >= 0 {
-				prefix := key[:i]
-				ev := scoped[prefix]
+		if head, rest, ok := cutIdentAware(key, '.'); ok {
+			if idx := findEmbed(q.Embeds, head); idx >= 0 {
+				ev := scoped[head]
 				if ev == nil {
 					ev = url.Values{}
-					scoped[prefix] = ev
+					scoped[head] = ev
 				}
-				ev[key[i+1:]] = vs
+				ev[rest] = vs
 				continue
 			}
 		}
@@ -615,10 +620,12 @@ func parseColumnItem(raw string) (Column, *pgerr.APIError) {
 			return Column{}, pgerr.ErrParse("empty cast target")
 		}
 	}
-	// alias: leading name before a single ':' (not '::', already stripped)
-	if i := strings.IndexByte(raw, ':'); i >= 0 {
-		col.Alias = raw[:i]
-		raw = raw[i+1:]
+	// alias: leading name before a single ':' (not '::', already stripped). The
+	// split is quote-aware so an aliased or target name may itself contain a colon
+	// when double-quoted (item 01.2).
+	if alias, rest, ok := cutIdentAware(raw, ':'); ok {
+		col.Alias = unquoteIdent(alias)
+		raw = rest
 	}
 	path, last, perr := parsePath(raw)
 	if perr != nil {
@@ -636,28 +643,46 @@ func parsePath(raw string) ([]string, JSONStep, *pgerr.APIError) {
 		return nil, JSONNone, pgerr.ErrParse("empty column reference")
 	}
 	last := JSONNone
-	// normalize ->> and -> into a delimiter sweep
+	// Sweep ->> and -> into hops, but treat an arrow inside a double-quoted segment
+	// as part of the identifier rather than a delimiter (item 01.2).
 	var hops []string
-	rest := raw
-	for {
-		i2 := strings.Index(rest, "->>")
-		i1 := strings.Index(rest, "->")
-		switch {
-		case i2 >= 0 && (i1 == -1 || i2 <= i1):
-			hops = append(hops, rest[:i2])
-			rest = rest[i2+3:]
-			last = JSONArrow2
-		case i1 >= 0:
-			hops = append(hops, rest[:i1])
-			rest = rest[i1+2:]
-			last = JSONArrow
-		default:
-			hops = append(hops, rest)
-			rest = ""
+	start := 0
+	inQuote := false
+	for i := 0; i < len(raw); {
+		c := raw[i]
+		if inQuote {
+			if c == '\\' && i+1 < len(raw) {
+				i += 2
+				continue
+			}
+			if c == '"' {
+				inQuote = false
+			}
+			i++
+			continue
 		}
-		if rest == "" {
-			break
+		if c == '"' {
+			inQuote = true
+			i++
+			continue
 		}
+		if c == '-' && i+1 < len(raw) && raw[i+1] == '>' {
+			hops = append(hops, raw[start:i])
+			if i+2 < len(raw) && raw[i+2] == '>' {
+				last = JSONArrow2
+				i += 3
+			} else {
+				last = JSONArrow
+				i += 2
+			}
+			start = i
+			continue
+		}
+		i++
+	}
+	hops = append(hops, raw[start:])
+	for j := range hops {
+		hops[j] = unquoteIdent(hops[j])
 	}
 	if slices.Contains(hops, "") {
 		return nil, JSONNone, pgerr.ErrParse("empty hop in column path")
@@ -677,24 +702,37 @@ func parseOrder(s string) ([]OrderTerm, *pgerr.APIError) {
 		if p == "" {
 			return nil, pgerr.ErrParse("empty order term")
 		}
-		segs := strings.Split(p, ".")
+		// Peel the column quote-aware so a double-quoted name may contain a dot
+		// before the modifier list is split (item 01.2).
+		colPart, modPart, hasMods := cutIdentAware(p, '.')
 		var t OrderTerm
-		path, _, perr := parsePath(segs[0])
+		path, _, perr := parsePath(colPart)
 		if perr != nil {
 			return nil, perr
 		}
 		t.Path = path
-		for _, mod := range segs[1:] {
+		var mods []string
+		if hasMods {
+			mods = strings.Split(modPart, ".")
+		}
+		// PostgREST's grammar is column[.asc|.desc][.nullsfirst|.nullslast] in that
+		// fixed order: at most one direction, then at most one nulls modifier, no
+		// repeats and no direction after a nulls modifier (item 01.7).
+		var sawDir, sawNulls bool
+		for _, mod := range mods {
 			switch mod {
-			case "asc":
-				t.Desc = false
-			case "desc":
-				t.Desc = true
-			case "nullsfirst":
-				v := true
-				t.NullsFirst = &v
-			case "nullslast":
-				v := false
+			case "asc", "desc":
+				if sawDir || sawNulls {
+					return nil, pgerr.ErrParse("unexpected order modifier: " + mod)
+				}
+				sawDir = true
+				t.Desc = mod == "desc"
+			case "nullsfirst", "nullslast":
+				if sawNulls {
+					return nil, pgerr.ErrParse("unexpected order modifier: " + mod)
+				}
+				sawNulls = true
+				v := mod == "nullsfirst"
 				t.NullsFirst = &v
 			default:
 				return nil, pgerr.ErrParse("unknown order modifier: " + mod)
@@ -798,8 +836,9 @@ func parseLogical(op, raw string) (Cond, *pgerr.APIError) {
 			kids = append(kids, node)
 			continue
 		}
-		// column.op.value
-		col, rest, ok := strings.Cut(p, ".")
+		// column.op.value, the column split quote-aware so a double-quoted name may
+		// contain a dot (item 01.2).
+		col, rest, ok := cutIdentAware(p, '.')
 		if !ok {
 			return nil, pgerr.ErrParse("malformed predicate in logical: " + p)
 		}
@@ -874,6 +913,25 @@ func parseCompare(path []string, raw string) (Compare, *pgerr.APIError) {
 		return Compare{}, pgerr.ErrParse("unknown operator: " + base)
 	}
 	c.Op = op
+	// A quantifier applies to a braces list and is valid only for the operators
+	// PostgREST allows it on; every element is parsed from the {…} literal, with
+	// LIKE/ILIKE wildcards translated per element (item 01.1).
+	if c.Quant != QNone {
+		if !isQuantifiable(op) {
+			return Compare{}, pgerr.ErrParse("quantifier any/all is not valid for operator: " + base)
+		}
+		list, perr := parseBraceList(operand)
+		if perr != nil {
+			return Compare{}, perr
+		}
+		if op == OpLike || op == OpILike {
+			for i, p := range list {
+				list[i] = strings.ReplaceAll(p, "*", "%")
+			}
+		}
+		c.Value = Value{List: list}
+		return c, nil
+	}
 	switch op {
 	case OpIn:
 		list, perr := parseInList(operand)
@@ -890,23 +948,21 @@ func parseCompare(path []string, raw string) (Compare, *pgerr.APIError) {
 		}
 	case OpLike, OpILike:
 		// PostgREST maps * to % in LIKE/ILIKE patterns so URL-friendly wildcards work.
-		if c.Quant != QNone {
-			// like(any)/{*cat*,*laundry*} — expand {…} into a list, * → % in each.
-			list, perr := parseLikeList(operand)
-			if perr != nil {
-				return Compare{}, perr
-			}
-			for i, p := range list {
-				list[i] = strings.ReplaceAll(p, "*", "%")
-			}
-			c.Value = Value{List: list}
-		} else {
-			c.Value = Value{Text: strings.ReplaceAll(operand, "*", "%")}
-		}
+		c.Value = Value{Text: strings.ReplaceAll(operand, "*", "%")}
 	default:
 		c.Value = Value{Text: operand}
 	}
 	return c, nil
+}
+
+// isQuantifiable reports whether an operator accepts an any/all quantifier, the
+// set PostgREST allows: eq, gt, gte, lt, lte, like, ilike, match, imatch.
+func isQuantifiable(op Op) bool {
+	switch op {
+	case OpEq, OpGt, OpGte, OpLt, OpLte, OpLike, OpILike, OpMatch, OpIMatch:
+		return true
+	}
+	return false
 }
 
 // parseInList parses (a,b,"c,d") into a slice, honoring double-quoted elements.
@@ -916,8 +972,10 @@ func parseInList(raw string) ([]string, *pgerr.APIError) {
 		return nil, pgerr.ErrParse("in. expects a parenthesized list")
 	}
 	inner := raw[1 : len(raw)-1]
+	// PostgREST's grammar requires at least one element; ?id=in.() is a parse
+	// error, not an empty match (item 01.3).
 	if inner == "" {
-		return []string{}, nil
+		return nil, pgerr.ErrParse("in. expects at least one value")
 	}
 	parts, err := splitTopLevel(inner, ',')
 	if err != nil {
@@ -927,29 +985,58 @@ func parseInList(raw string) ([]string, *pgerr.APIError) {
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
 		if len(p) >= 2 && p[0] == '"' && p[len(p)-1] == '"' {
-			p = p[1 : len(p)-1]
+			// A quoted element may escape an interior quote as \" and a backslash as
+			// \\ (item 01.2); strip the quotes and unescape.
+			p = unescapeQuoted(p[1 : len(p)-1])
 		}
 		out = append(out, p)
 	}
 	return out, nil
 }
 
-// parseLikeList parses a {pat1,pat2,...} literal (PostgREST quantified-LIKE
-// syntax) into a slice of raw pattern strings. No wildcard translation is done
-// here; the caller applies * → % after parsing.
-func parseLikeList(raw string) ([]string, *pgerr.APIError) {
+// unescapeQuoted reverses the in-list quoting escapes: \" -> " and \\ -> \. Any
+// other backslash sequence keeps the following character literally.
+func unescapeQuoted(s string) string {
+	if !strings.ContainsRune(s, '\\') {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			i++
+			b.WriteByte(s[i])
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+// parseBraceList parses a {a,b,"c,d"} array literal (PostgREST's quantified
+// operand) into its elements, honoring double-quoted elements so a comma or
+// reserved character can appear inside one. No wildcard translation is done here;
+// a LIKE/ILIKE caller applies * → % afterward (items 01.1, 01.2).
+func parseBraceList(raw string) ([]string, *pgerr.APIError) {
 	raw = strings.TrimSpace(raw)
 	if len(raw) < 2 || raw[0] != '{' || raw[len(raw)-1] != '}' {
-		return nil, pgerr.ErrParse("like(any/all) expects a {…} list")
+		return nil, pgerr.ErrParse("any/all expects a {…} list")
 	}
 	inner := raw[1 : len(raw)-1]
 	if inner == "" {
-		return []string{}, nil
+		return nil, pgerr.ErrParse("any/all list must have at least one value")
 	}
-	parts := strings.Split(inner, ",")
-	out := make([]string, len(parts))
-	for i, p := range parts {
-		out[i] = strings.TrimSpace(p)
+	parts, err := splitTopLevel(inner, ',')
+	if err != nil {
+		return nil, pgerr.ErrParse("malformed any/all list")
+	}
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if len(p) >= 2 && p[0] == '"' && p[len(p)-1] == '"' {
+			p = unescapeQuoted(p[1 : len(p)-1])
+		}
+		out = append(out, p)
 	}
 	return out, nil
 }
@@ -1020,29 +1107,81 @@ func opFromToken(tok string) (Op, bool) {
 	return 0, false
 }
 
-// splitTopLevel splits s on sep, ignoring sep inside () and "".
+// splitTopLevel splits s on sep, ignoring sep inside (), {}, and "". Inside a
+// quoted span a backslash escapes the next byte, so an escaped quote does not end
+// the span and an escaped separator is not a split point (items 01.1, 01.2).
 func splitTopLevel(s string, sep byte) ([]string, error) {
 	var out []string
 	depth := 0
 	inQuote := false
 	start := 0
 	for i := 0; i < len(s); i++ {
-		switch c := s[i]; {
-		case c == '"':
-			inQuote = !inQuote
-		case inQuote:
-			// skip
-		case c == '(':
+		c := s[i]
+		if inQuote {
+			switch {
+			case c == '\\' && i+1 < len(s):
+				i++ // skip the escaped byte
+			case c == '"':
+				inQuote = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inQuote = true
+		case '(', '{':
 			depth++
-		case c == ')':
+		case ')', '}':
 			depth--
-		case c == sep && depth == 0:
-			out = append(out, s[start:i])
-			start = i + 1
+		case sep:
+			if depth == 0 {
+				out = append(out, s[start:i])
+				start = i + 1
+			}
 		}
 	}
 	out = append(out, s[start:])
 	return out, nil
+}
+
+// cutIdentAware splits s at the first sep byte that is not inside a double-quoted
+// identifier segment, returning the text before and after it and whether one was
+// found. A backslash inside quotes escapes the next byte. This lets a reserved
+// character (dot, colon) sit inside a %22-quoted column or relation name without
+// being treated as a delimiter (item 01.2).
+func cutIdentAware(s string, sep byte) (before, after string, found bool) {
+	inQuote := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inQuote {
+			if c == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if c == '"' {
+				inQuote = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inQuote = true
+		case sep:
+			return s[:i], s[i+1:], true
+		}
+	}
+	return s, "", false
+}
+
+// unquoteIdent strips one layer of surrounding double quotes from an identifier
+// segment so a reserved character can appear in a column or relation name; an
+// interior doubled quote ("") unescapes to a single quote, as in SQL. A segment
+// that is not fully quoted is returned unchanged (item 01.2).
+func unquoteIdent(s string) string {
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		return strings.ReplaceAll(s[1:len(s)-1], `""`, `"`)
+	}
+	return s
 }
 
 // sortStrings sorts in place (small slices; avoids importing sort everywhere).

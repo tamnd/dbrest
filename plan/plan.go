@@ -527,6 +527,21 @@ func checkOperand(rel *schema.Relation, c ir.Compare) *pgerr.APIError {
 	if !ok {
 		return nil
 	}
+	// A quantified comparison (eq/gt/gte/lt/lte over a {…} list) carries its
+	// operands in the list; coerce each against the column type. Quantified
+	// pattern operators (like/ilike/match/imatch) take patterns, not typed values,
+	// and are left alone (item 01.1).
+	if c.Quant != ir.QNone {
+		switch c.Op {
+		case ir.OpEq, ir.OpGt, ir.OpGte, ir.OpLt, ir.OpLte:
+			for _, v := range c.Value.List {
+				if err := coerce(col.Type, v); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
 	switch c.Op {
 	case ir.OpEq, ir.OpNeq, ir.OpGt, ir.OpGte, ir.OpLt, ir.OpLte:
 		return coerce(col.Type, c.Value.Text)
