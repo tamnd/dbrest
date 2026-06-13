@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/tamnd/dbrest/backend/sqlgen"
 	"github.com/tamnd/dbrest/ir"
 	"github.com/tamnd/dbrest/plan"
-	"github.com/tamnd/dbrest/backend/sqlgen"
 )
 
 // openSales seeds a sales table with a category and an amount so an aggregate

@@ -11,8 +11,8 @@ import (
 
 	"github.com/tamnd/dbrest/backend/postgres"
 	"github.com/tamnd/dbrest/ir"
-	"github.com/tamnd/dbrest/pgerr"
 	"github.com/tamnd/dbrest/openapi"
+	"github.com/tamnd/dbrest/pgerr"
 	planpkg "github.com/tamnd/dbrest/plan"
 	"github.com/tamnd/dbrest/reqctx"
 	"github.com/tamnd/dbrest/rpc"

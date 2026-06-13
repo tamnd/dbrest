@@ -157,7 +157,9 @@ func (w jwk) toKey() (*verKey, error) {
 			X:     new(big.Int).SetBytes(x),
 			Y:     new(big.Int).SetBytes(y),
 		}
-		if !pub.Curve.IsOnCurve(pub.X, pub.Y) {
+		// ECDH validates the point lies on the curve (and is not the identity),
+		// the modern replacement for the deprecated Curve.IsOnCurve.
+		if _, err := pub.ECDH(); err != nil {
 			return nil, errors.New("EC key: point not on curve")
 		}
 		return &verKey{kid: w.Kid, alg: w.Alg, key: pub}, nil

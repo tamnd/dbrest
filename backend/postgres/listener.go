@@ -43,7 +43,7 @@ func (b *Backend) Listen(ctx context.Context, channel string, h backend.ListenHa
 		firstConnect = false
 
 		err = b.waitForNotifications(ctx, conn, channel, h)
-		conn.Close(context.Background())
+		_ = conn.Close(context.Background())
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}

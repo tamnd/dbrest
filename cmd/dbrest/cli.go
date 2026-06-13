@@ -49,7 +49,7 @@ func probeReady(cfg *config.Config) error {
 	if err != nil {
 		return fmt.Errorf("ready probe: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("ready probe: %s answered %d", url, resp.StatusCode)
 	}

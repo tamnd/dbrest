@@ -31,10 +31,10 @@ func (s *rowStream) Close() error           { return nil }
 // rowResult is a backend.Result backed by an in-memory row stream.
 type rowResult struct{ s *rowStream }
 
-func (r rowResult) Body() io.Reader                 { return nil }
-func (r rowResult) Rows() backend.RowStream         { return r.s }
-func (r rowResult) Count() (int64, bool)            { return 0, false }
-func (r rowResult) Affected() (int64, bool)         { return 0, false }
+func (r rowResult) Body() io.Reader         { return nil }
+func (r rowResult) Rows() backend.RowStream { return r.s }
+func (r rowResult) Count() (int64, bool)    { return 0, false }
+func (r rowResult) Affected() (int64, bool) { return 0, false }
 func (r rowResult) ResponseControls() *reqctx.ResponseControls {
 	return &reqctx.ResponseControls{}
 }

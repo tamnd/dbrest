@@ -336,7 +336,7 @@ func TestAmbiguousEmbedDetailsAndHint(t *testing.T) {
 		t.Errorf("candidates = %v", got)
 	}
 	// Name is carried for the hint, not the details body.
-	if bytesHasName := json.RawMessage(e.RawDetails); jsonContains(bytesHasName, `"name"`) {
+	if bytesHasName := e.RawDetails; jsonContains(bytesHasName, `"name"`) {
 		t.Error("details array leaked the unexported name key")
 	}
 	wantHint := "Try changing 'people' to one of the following: 'people!films_director_id_fkey', 'people!films_writer_id_fkey'. Find the desired relationship in the 'details' key."

@@ -38,13 +38,13 @@ type Backend struct {
 	version         Version
 	funcs           rpc.Registry
 	searchPath      []string
-	extraSearchPath []string                  // db-extra-search-path, appended after the active schema
-	loc             *time.Location            // server TimeZone, for rendering timestamptz like PostgREST
+	extraSearchPath []string                   // db-extra-search-path, appended after the active schema
+	loc             *time.Location             // server TimeZone, for rendering timestamptz like PostgREST
 	funcVol         map[string]rpc.Volatility  // "schema.name" -> volatility, for native RPC access mode
 	funcRet         map[string]rpc.ReturnShape // "schema.name" -> return shape, for native RPC result rendering
 	funcReg         map[string]rpc.Registry    // schema -> native function registry, the function half of the schema cache
-	roleSettings    map[string][]roleSetting  // impersonated-role ALTER ROLE ... SET replays
-	roleIsolation   map[string]pgx.TxIsoLevel // impersonated-role default_transaction_isolation
+	roleSettings    map[string][]roleSetting   // impersonated-role ALTER ROLE ... SET replays
+	roleIsolation   map[string]pgx.TxIsoLevel  // impersonated-role default_transaction_isolation
 
 	hoistedTxSettings []string                 // db-hoisted-tx-settings: which function SET options hoist to the tx
 	funcProconfig     map[string][]roleSetting // "schema.name" -> function SET clause (pg_proc.proconfig)

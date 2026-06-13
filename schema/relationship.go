@@ -200,7 +200,8 @@ func (m *Model) Relationships(parent *Relation, targetName string, searchPath []
 				kept = append(kept, e)
 			}
 		}
-		out = append(kept, declared...)
+		kept = append(kept, declared...)
+		out = kept
 	}
 
 	return out, true

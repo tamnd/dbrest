@@ -141,7 +141,7 @@ func TestSelectOrderReversed(t *testing.T) {
 	yearPos := strings.Index(body, `"year"`)
 	ratingPos := strings.Index(body, `"rating"`)
 	titlePos := strings.Index(body, `"title"`)
-	if !(yearPos < ratingPos && ratingPos < titlePos) {
+	if yearPos >= ratingPos || ratingPos >= titlePos {
 		t.Errorf("keys not in select order year,rating,title: %s", body)
 	}
 }

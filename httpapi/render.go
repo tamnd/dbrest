@@ -74,7 +74,8 @@ func renderFor(media string, res backend.Result, rawCols map[string]bool) (*rend
 // singular request. fnName is the bare function name; it is used for native-RPC
 // heuristic detection when fn is nil.
 func renderCall(media string, res backend.Result, fn *rpc.Function, fnName string) (*rendered, *pgerr.APIError) {
-	if fn == nil {
+	switch {
+	case fn == nil:
 		// Native RPC: detect scalar vs table by inspecting column names.
 		// res.Rows().Columns() does not advance the cursor; the stream remains
 		// fully readable for the render path below.
@@ -84,11 +85,11 @@ func renderCall(media string, res backend.Result, fn *rpc.Function, fnName strin
 		} else {
 			return renderFor(media, res, nil)
 		}
-	} else if fn.Returns.Kind == rpc.ReturnTable {
+	case fn.Returns.Kind == rpc.ReturnTable:
 		return renderFor(media, res, nil)
-	} else if fn.Returns.Kind == rpc.ReturnObject {
+	case fn.Returns.Kind == rpc.ReturnObject:
 		return renderCallObject(media, res)
-	} else if fn.Returns.Kind == rpc.ReturnVoid {
+	case fn.Returns.Kind == rpc.ReturnVoid:
 		return renderVoid(res)
 	}
 	switch media {

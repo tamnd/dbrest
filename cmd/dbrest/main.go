@@ -156,11 +156,11 @@ func listenAPI(cfg *config.Config) (net.Listener, error) {
 	}
 	mode, err := strconv.ParseUint(cfg.ServerUnixSocketMode, 8, 32)
 	if err != nil {
-		ln.Close()
+		_ = ln.Close()
 		return nil, fmt.Errorf("server-unix-socket-mode: %w", err)
 	}
 	if err := os.Chmod(cfg.ServerUnixSocket, os.FileMode(mode)); err != nil {
-		ln.Close()
+		_ = ln.Close()
 		return nil, err
 	}
 	return ln, nil

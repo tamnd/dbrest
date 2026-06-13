@@ -684,13 +684,13 @@ func extractCountWindow(cols []string, buf [][]any) ([]string, [][]any, int64) {
 			total = int64(n)
 		}
 	}
-	outCols := append(cols[:idx:idx], cols[idx+1:]...)
+	cols = append(cols[:idx:idx], cols[idx+1:]...)
 	for i, row := range buf {
 		if idx < len(row) {
 			buf[i] = append(row[:idx:idx], row[idx+1:]...)
 		}
 	}
-	return outCols, buf, total
+	return cols, buf, total
 }
 
 // explainPrefix builds the "EXPLAIN (...) " clause for a plan request from the

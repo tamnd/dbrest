@@ -354,14 +354,7 @@ func ParseRegistry(rawJSON string) (*StaticRegistry, error) {
 		}
 		params := make([]Param, len(d.Params))
 		for i, p := range d.Params {
-			params[i] = Param{
-				Name:     p.Name,
-				Type:     p.Type,
-				Optional: p.Optional,
-				Default:  p.Default,
-				Variadic: p.Variadic,
-				RawBody:  p.RawBody,
-			}
+			params[i] = Param(p)
 		}
 		var ret ReturnShape
 		switch strings.ToLower(d.Returns.Kind) {

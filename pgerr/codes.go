@@ -17,40 +17,40 @@ import (
 // Each constructor returns a fully-formed *APIError with the spec-mandated
 // status. Callers add details/hint with WithDetails / WithHint.
 const (
-	CodeParse              = "PGRST100" // 400 query-string parse error
-	CodeMethodNotAllowed   = "PGRST101" // 405 method not allowed (GET on a volatile fn)
-	CodeUnsupportedMethod  = "PGRST117" // 405 unsupported HTTP method on the resource
-	CodeInvalidPreferences = "PGRST122" // 400 invalid preference under handling=strict
-	CodeInvalidBody        = "PGRST102" // 400 invalid request body
-	CodeRangeUnsatisfied   = "PGRST103" // 416 requested range not satisfiable
-	CodePutPrimaryKey      = "PGRST105" // 405 PUT filters not exactly the PK with eq
-	CodePutLimit           = "PGRST114" // 400 limit/offset on a PUT
-	CodePutPayloadKey      = "PGRST115" // 400 PUT payload PK differs from the URL filter
-	CodeMediaType          = "PGRST107" // 406 Accept negotiation failed
-	CodeGucHeaders         = "PGRST111" // 500 invalid response.headers from a function
-	CodeGucStatus          = "PGRST112" // 500 invalid response.status from a function
-	CodeSingularZeroMany   = "PGRST116" // 406 singular requested, zero or many rows
-	CodeInvalidPath        = "PGRST125" // 404 invalid path in request URL
+	CodeParse                   = "PGRST100" // 400 query-string parse error
+	CodeMethodNotAllowed        = "PGRST101" // 405 method not allowed (GET on a volatile fn)
+	CodeUnsupportedMethod       = "PGRST117" // 405 unsupported HTTP method on the resource
+	CodeInvalidPreferences      = "PGRST122" // 400 invalid preference under handling=strict
+	CodeInvalidBody             = "PGRST102" // 400 invalid request body
+	CodeRangeUnsatisfied        = "PGRST103" // 416 requested range not satisfiable
+	CodePutPrimaryKey           = "PGRST105" // 405 PUT filters not exactly the PK with eq
+	CodePutLimit                = "PGRST114" // 400 limit/offset on a PUT
+	CodePutPayloadKey           = "PGRST115" // 400 PUT payload PK differs from the URL filter
+	CodeMediaType               = "PGRST107" // 406 Accept negotiation failed
+	CodeGucHeaders              = "PGRST111" // 500 invalid response.headers from a function
+	CodeGucStatus               = "PGRST112" // 500 invalid response.status from a function
+	CodeSingularZeroMany        = "PGRST116" // 406 singular requested, zero or many rows
+	CodeInvalidPath             = "PGRST125" // 404 invalid path in request URL
 	CodeRelatedOrderNotToOne    = "PGRST118" // 400 order=rel(col) on a non-to-one embed
 	CodeRelatedOrderNotEmbedded = "PGRST108" // 400 order=rel(col) on a resource not in select
-	CodeNoRelationship     = "PGRST200" // 400 relationship not found
-	CodeAmbiguousEmbed     = "PGRST201" // 300 embedding ambiguous
-	CodeNoFunction         = "PGRST202" // 404 no function matches name/args
-	CodeAmbiguousFunc      = "PGRST203" // 300 overloaded function call ambiguous
-	CodeUnknownColumn      = "PGRST204" // 400 column in write payload not found
-	CodeUnknownTable       = "PGRST205" // 404 table or view not found / not exposed
-	CodeJWTSecretMissing   = "PGRST300" // 500 a token was presented but no jwt-secret is configured
-	CodeJWTDecode          = "PGRST301" // 401 JWT could not be decoded (parts/key/alg/signature)
-	CodeJWTRequired        = "PGRST302" // 401 no token sent and the anonymous role is disabled
-	CodeJWTClaims          = "PGRST303" // 401 JWT claims validation or parsing failed
-	CodeAggregatesOff      = "PGRST123" // 400 aggregate functions used while db-aggregates-enabled is off
-	CodeMaxAffected        = "PGRST124" // 400 mutation/RPC affected more rows than Prefer: max-affected
-	CodeUnsupported        = "PGRST127" // 400 feature not implemented on this backend
-	CodeDBConnection       = "PGRST000" // 503 cannot connect to the database (bad URI or service down)
-	CodeDBClient           = "PGRST001" // 503 database client error, retrying the connection
-	CodeAcquireTimeout     = "PGRST003" // 504 timed out acquiring a connection from the pool
-	CodeInternal           = "PGRSTX00" // 500 internal error (upstream group X has only X00)
-	CodeBodyTooLarge       = "PGRSTX13" // 413 request body exceeds the configured max-request-body
+	CodeNoRelationship          = "PGRST200" // 400 relationship not found
+	CodeAmbiguousEmbed          = "PGRST201" // 300 embedding ambiguous
+	CodeNoFunction              = "PGRST202" // 404 no function matches name/args
+	CodeAmbiguousFunc           = "PGRST203" // 300 overloaded function call ambiguous
+	CodeUnknownColumn           = "PGRST204" // 400 column in write payload not found
+	CodeUnknownTable            = "PGRST205" // 404 table or view not found / not exposed
+	CodeJWTSecretMissing        = "PGRST300" // 500 a token was presented but no jwt-secret is configured
+	CodeJWTDecode               = "PGRST301" // 401 JWT could not be decoded (parts/key/alg/signature)
+	CodeJWTRequired             = "PGRST302" // 401 no token sent and the anonymous role is disabled
+	CodeJWTClaims               = "PGRST303" // 401 JWT claims validation or parsing failed
+	CodeAggregatesOff           = "PGRST123" // 400 aggregate functions used while db-aggregates-enabled is off
+	CodeMaxAffected             = "PGRST124" // 400 mutation/RPC affected more rows than Prefer: max-affected
+	CodeUnsupported             = "PGRST127" // 400 feature not implemented on this backend
+	CodeDBConnection            = "PGRST000" // 503 cannot connect to the database (bad URI or service down)
+	CodeDBClient                = "PGRST001" // 503 database client error, retrying the connection
+	CodeAcquireTimeout          = "PGRST003" // 504 timed out acquiring a connection from the pool
+	CodeInternal                = "PGRSTX00" // 500 internal error (upstream group X has only X00)
+	CodeBodyTooLarge            = "PGRSTX13" // 413 request body exceeds the configured max-request-body
 )
 
 // ErrParse is a query-string syntax error (bad operator, malformed logic tree).

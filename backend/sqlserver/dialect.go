@@ -288,12 +288,13 @@ func (Dialect) ArrayLiteral(pgText string) string {
 	quoted := make([]string, len(parts))
 	for i, p := range parts {
 		p = strings.TrimSpace(p)
-		if p == "NULL" {
+		switch {
+		case p == "NULL":
 			quoted[i] = "null"
-		} else if len(p) >= 2 && p[0] == '"' && p[len(p)-1] == '"' {
+		case len(p) >= 2 && p[0] == '"' && p[len(p)-1] == '"':
 			// PostgreSQL double-quote escaping: "foo" is already valid JSON; pass through.
 			quoted[i] = p
-		} else {
+		default:
 			quoted[i] = `"` + strings.ReplaceAll(p, `"`, `\"`) + `"`
 		}
 	}

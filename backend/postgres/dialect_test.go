@@ -176,14 +176,14 @@ func TestCast(t *testing.T) {
 		"jsonb":            `("x")::jsonb`,
 		// Types outside the alias table pass through verbatim rather than
 		// degrading to text, so they resolve the way PostgREST relies on.
-		"money":            `("x")::money`,
-		"interval":         `("x")::interval`,
-		"bytea":            `("x")::bytea`,
-		"inet":             `("x")::inet`,
-		"mood":             `("x")::mood`,
-		"numeric(10,2)":    `("x")::numeric(10,2)`,
-		"int[]":            `("x")::int[]`,
-		"public.color":     `("x")::public.color`,
+		"money":         `("x")::money`,
+		"interval":      `("x")::interval`,
+		"bytea":         `("x")::bytea`,
+		"inet":          `("x")::inet`,
+		"mood":          `("x")::mood`,
+		"numeric(10,2)": `("x")::numeric(10,2)`,
+		"int[]":         `("x")::int[]`,
+		"public.color":  `("x")::public.color`,
 	}
 	for in, want := range cases {
 		if got := d.Cast(`"x"`, in); got != want {
