@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -36,6 +37,7 @@ type Backend struct {
 	funcs         rpc.Registry
 	searchPath    []string
 	searchPathSQL string // pre-built "SET LOCAL search_path TO ..." statement
+	loc           *time.Location // server TimeZone, for rendering timestamptz like PostgREST
 }
 
 // Open connects to PostgreSQL by connection string (a libpq URI or keyword/value
@@ -75,7 +77,18 @@ func Open(dsn string) (*Backend, error) {
 		pool.Close()
 		return nil, err
 	}
-	return &Backend{pool: pool, version: ParseVersion(ver)}, nil
+	// PostgREST assembles JSON in the database, so a timestamptz renders in the
+	// server's TimeZone. Capture it once here and render timestamptz in the same
+	// zone (DST included) so the wire value matches; fall back to UTC when the
+	// name does not resolve to a Go location.
+	loc := time.UTC
+	var tz string
+	if err := pool.QueryRow(ctx, "SHOW timezone").Scan(&tz); err == nil {
+		if l, lerr := time.LoadLocation(tz); lerr == nil {
+			loc = l
+		}
+	}
+	return &Backend{pool: pool, version: ParseVersion(ver), loc: loc}, nil
 }
 
 // Pool exposes the underlying connection pool, for tests that seed a database.

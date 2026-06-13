@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -60,7 +61,7 @@ func (b *Backend) executeRead(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 		return nil, b.MapError(err)
 	}
 
-	res := &streamResult{ctx: ctx, tx: tx, controls: rc.Controls()}
+	res := &streamResult{ctx: ctx, tx: tx, controls: rc.Controls(), loc: b.loc}
 
 	if plan.Query.Count != ir.CountNone {
 		total, err := b.computeCount(ctx, tx, plan.Query)
@@ -142,7 +143,7 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 			return nil, b.MapError(err)
 		}
 		cols := fieldNames(rows)
-		buf, err := drainRows(rows)
+		buf, err := drainRows(rows, b.loc)
 		if err != nil {
 			return nil, b.MapError(err)
 		}
@@ -274,7 +275,7 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 	}
 	isVoid := isVoidResult(rows)
 	cols := fieldNames(rows)
-	buf, err := drainRows(rows)
+	buf, err := drainRows(rows, b.loc)
 	if err != nil {
 		return nil, b.MapError(err)
 	}
@@ -323,7 +324,7 @@ func (b *Backend) executeCallRead(ctx context.Context, plan *ir.Plan, rc *reqctx
 		return nil, b.MapError(err)
 	}
 
-	res := &streamResult{ctx: ctx, tx: tx, controls: rc.Controls()}
+	res := &streamResult{ctx: ctx, tx: tx, controls: rc.Controls(), loc: b.loc}
 
 	if plan.Call.Count != ir.CountNone {
 		var (
@@ -639,7 +640,7 @@ func (b *Backend) ExplainCall(ctx context.Context, p *ir.Plan, rc *reqctx.Contex
 // drainRows reads every row of a pgx cursor into memory, normalizing values so
 // json/jsonb, bytea, and date columns render correctly. The rows are closed by
 // drainRows; the caller must not close them again.
-func drainRows(rows pgx.Rows) ([][]any, error) {
+func drainRows(rows pgx.Rows, loc *time.Location) ([][]any, error) {
 	defer rows.Close()
 	fields := rows.FieldDescriptions()
 	var out [][]any
@@ -648,7 +649,7 @@ func drainRows(rows pgx.Rows) ([][]any, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, normalizeValues(vals, fields))
+		out = append(out, normalizeValues(vals, fields, loc))
 	}
 	return out, rows.Err()
 }

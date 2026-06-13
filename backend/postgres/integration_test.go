@@ -3,6 +3,7 @@ package postgres_test
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/tamnd/dbrest/backend/postgres"
@@ -359,6 +360,96 @@ func TestIntegrationNativeCallJSONArg(t *testing.T) {
 	}
 	if got := call("_dbrest_test_tx"); got != `{"name":"Ada"}` {
 		t.Errorf("text arg returned %q, want the serialized object", got)
+	}
+}
+
+// TestIntegrationTemporalRendering proves date, time, timetz, interval,
+// timestamp, and timestamptz columns render through the backend as the same JSON
+// strings PostgreSQL itself emits (to_json), instead of Go struct or Z-suffixed
+// RFC3339 spellings. The expected values are read back from the server with
+// to_json so the assertion tracks the live server's TimeZone. Finding 03-P07.
+func TestIntegrationTemporalRendering(t *testing.T) {
+	be := openBE(t)
+	ctx := context.Background()
+
+	if _, err := be.Pool().Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS _dbrest_test_temporal (
+			id   int PRIMARY KEY,
+			d    date,
+			t    time,
+			ttz  timetz,
+			iv   interval,
+			ts   timestamp,
+			tstz timestamptz
+		);
+		TRUNCATE _dbrest_test_temporal;
+		INSERT INTO _dbrest_test_temporal VALUES (
+			1,
+			'2017-01-02',
+			'13:00:00.5',
+			'13:00:00+02',
+			'1 day 02:03:04.5',
+			'2017-01-01 14:30:00.123456',
+			'2017-07-01 14:30:00+05'
+		)`); err != nil {
+		t.Fatalf("seed temporal table: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, "DROP TABLE IF EXISTS _dbrest_test_temporal")
+	})
+
+	cols := []string{"d", "t", "ttz", "iv", "ts", "tstz"}
+	// The oracle: PostgreSQL's own JSON spelling for each column, stripped of the
+	// surrounding quotes a JSON string carries.
+	want := make([]string, len(cols))
+	for i, c := range cols {
+		var j string
+		if err := be.Pool().QueryRow(ctx,
+			"SELECT to_json("+c+")::text FROM _dbrest_test_temporal WHERE id = 1").Scan(&j); err != nil {
+			t.Fatalf("oracle to_json(%s): %v", c, err)
+		}
+		want[i] = strings.Trim(j, `"`)
+	}
+
+	model, err := be.Introspect(ctx)
+	if err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+	rel, ok := model.Lookup("_dbrest_test_temporal", []string{"public"})
+	if !ok {
+		t.Fatal("_dbrest_test_temporal not found")
+	}
+	sel := make([]ir.SelectItem, len(cols))
+	for i, c := range cols {
+		sel[i] = ir.Column{Path: []string{c}}
+	}
+	plan := &ir.Plan{Rel: rel, Query: &ir.Query{
+		Kind:     ir.Read,
+		Relation: ir.Ref{Schema: "public", Name: "_dbrest_test_temporal"},
+		Select:   sel,
+	}}
+	res, err := be.Execute(ctx, plan, &reqctx.Context{Method: "GET", Path: "/_dbrest_test_temporal"})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	rs := res.Rows()
+	defer rs.Close()
+	if !rs.Next() {
+		t.Fatal("no rows")
+	}
+	vals, err := rs.Values()
+	if err != nil {
+		t.Fatalf("Values: %v", err)
+	}
+	for i, c := range cols {
+		got, ok := vals[i].(string)
+		if !ok {
+			t.Errorf("column %s rendered as %T (%v), want a string", c, vals[i], vals[i])
+			continue
+		}
+		if got != want[i] {
+			t.Errorf("column %s = %q, want %q (PostgreSQL to_json)", c, got, want[i])
+		}
 	}
 }
 
