@@ -1,6 +1,9 @@
 package ir
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParsePreferRecognizesEachToken(t *testing.T) {
 	p := ParsePrefer([]string{"return=representation, resolution=merge-duplicates, missing=null, tx=rollback, handling=strict"})
@@ -100,6 +103,42 @@ func TestParsePreferMaxAffectedBadValue(t *testing.T) {
 		}
 		if p.StrictError() == nil {
 			t.Errorf("max-affected=%q under strict should be a PGRST122 offender", v)
+		}
+	}
+}
+
+// TestParsePreferTimeZoneValid checks a valid IANA name is captured and echoed,
+// unlike max-affected it is honored under lenient too.
+func TestParsePreferTimeZoneValid(t *testing.T) {
+	for _, h := range []string{"timezone=America/Los_Angeles", "handling=strict, timezone=America/Los_Angeles"} {
+		p := ParsePrefer([]string{h})
+		if p.TimeZone == nil || *p.TimeZone != "America/Los_Angeles" {
+			t.Fatalf("%q: TimeZone = %v, want America/Los_Angeles", h, p.TimeZone)
+		}
+		if p.StrictError() != nil {
+			t.Errorf("%q: valid timezone should not be an offender", h)
+		}
+		// The Preference-Applied echo carries the honored timezone token.
+		if !strings.Contains(p.AppliedHeader(), "timezone=America/Los_Angeles") {
+			t.Errorf("%q: AppliedHeader = %q, missing timezone echo", h, p.AppliedHeader())
+		}
+	}
+}
+
+// TestParsePreferTimeZoneInvalid checks an unknown or empty zone is an offender:
+// ignored (no echo) under lenient, a PGRST122 under strict.
+func TestParsePreferTimeZoneInvalid(t *testing.T) {
+	for _, v := range []string{"Mars/Phobos", "Not_A_Zone", ""} {
+		lenient := ParsePrefer([]string{"timezone=" + v})
+		if lenient.TimeZone != nil {
+			t.Errorf("timezone=%q set TimeZone = %v, want nil", v, *lenient.TimeZone)
+		}
+		if lenient.AppliedHeader() != "" {
+			t.Errorf("timezone=%q lenient AppliedHeader = %q, want empty", v, lenient.AppliedHeader())
+		}
+		strict := ParsePrefer([]string{"handling=strict, timezone=" + v})
+		if strict.StrictError() == nil {
+			t.Errorf("timezone=%q under strict should be a PGRST122 offender", v)
 		}
 	}
 }

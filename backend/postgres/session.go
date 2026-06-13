@@ -27,6 +27,12 @@ func queueSessionItems(batch *pgx.Batch, b *Backend, rc *reqctx.Context) int {
 		batch.Queue(b.searchPathSQL)
 		n++
 	}
+	if rc.TimeZone != "" {
+		// set_config(...,true) is the SET LOCAL timezone analog, parameterized so a
+		// name with a slash (America/Los_Angeles) needs no identifier quoting.
+		batch.Queue("SELECT set_config('timezone',$1,true)", rc.TimeZone)
+		n++
+	}
 	batch.Queue(
 		"SELECT set_config($1,$2,true),set_config($3,$4,true),"+
 			"set_config($5,$6,true),set_config($7,$8,true),set_config($9,$10,true)",

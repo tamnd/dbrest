@@ -59,6 +59,12 @@ type Context struct {
 	// request, the log-query option.
 	LogQuery bool
 
+	// TimeZone is the Prefer: timezone= request timezone, already validated by
+	// ir.ParsePrefer. A backend that supports it applies SET LOCAL timezone for the
+	// request; the emulated render path converts temporals to it. Empty means the
+	// client stated no timezone and the engine default stands.
+	TimeZone string
+
 	controls ResponseControls
 }
 

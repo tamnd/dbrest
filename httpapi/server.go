@@ -642,6 +642,9 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 	t.mark("plan", planStart)
 
 	rc := s.buildContext(r, id, activeSchema)
+	if call.Prefer.TimeZone != nil {
+		rc.TimeZone = *call.Prefer.TimeZone
+	}
 
 	// A plan request on an RPC call returns the EXPLAIN for the function instead
 	// of running it; route it before Execute so mediaPlan never reaches the
@@ -769,6 +772,9 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity,
 	t.mark("plan", planStart)
 
 	rc := s.buildContext(r, id, activeSchema)
+	if q.Prefer.TimeZone != nil {
+		rc.TimeZone = *q.Prefer.TimeZone
+	}
 
 	if apiErr := s.authorize(rc, planned); apiErr != nil {
 		writeError(w, apiErr)
@@ -918,6 +924,9 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.Que
 	t.mark("plan", planStart)
 
 	rc := s.buildContext(r, id, activeSchema)
+	if q.Prefer.TimeZone != nil {
+		rc.TimeZone = *q.Prefer.TimeZone
+	}
 	if apiErr := s.authorize(rc, planned); apiErr != nil {
 		writeError(w, apiErr)
 		return

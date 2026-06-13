@@ -3,6 +3,7 @@ package ir
 import (
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/tamnd/dbrest/pgerr"
 )
@@ -32,6 +33,13 @@ type PreferSet struct {
 	// enforce on a non-nil pointer alone without consulting Handling.
 	MaxAffected *int64
 
+	// TimeZone is the Prefer: timezone= request timezone, validated against the Go
+	// tz database (the portable analog of pg_timezone_names). It is honored whenever
+	// valid; an invalid name is an offender, ignored under lenient and a strict
+	// violation under handling=strict. Backends that support it apply SET LOCAL
+	// timezone; the emulated render path converts temporals to it.
+	TimeZone *string
+
 	// applied maps a preference key to its honored "key=value" token. The header
 	// is emitted in PostgREST's canonical order, not encounter order.
 	applied map[string]string
@@ -45,6 +53,7 @@ type PreferSet struct {
 var preferKeys = map[string]bool{
 	"return": true, "count": true, "resolution": true,
 	"missing": true, "tx": true, "handling": true, "max-affected": true,
+	"timezone": true,
 }
 
 // applyOrder is PostgREST's fixed Preference-Applied ordering. timezone and
@@ -175,6 +184,17 @@ func (p *PreferSet) set(k, v string) bool {
 			return false
 		}
 		p.MaxAffected = &n
+	case "timezone":
+		// Validate against the Go tz database, the portable analog of
+		// pg_timezone_names. An empty or unknown name is an offender.
+		if v == "" {
+			return false
+		}
+		if _, err := time.LoadLocation(v); err != nil {
+			return false
+		}
+		tz := v
+		p.TimeZone = &tz
 	}
 	return true
 }
