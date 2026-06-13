@@ -92,6 +92,12 @@ type Dialect interface {
 	// to "col IS <BoolValue(v)>".
 	IsBool(col string, v bool) (string, bool)
 
+	// IsUnknown renders the three-valued "col IS UNKNOWN" test in the engine's
+	// syntax. PostgreSQL has the native operator and returns ok=true; engines
+	// without it return ok=false to fall back to "col IS NULL", which selects the
+	// same rows for a boolean column (its UNKNOWN state is its NULL).
+	IsUnknown(col string) (string, bool)
+
 	// ArrayOp renders an array containment/overlap operator expression, or
 	// reports ok=false when the engine does not support array types (MySQL, SQL
 	// Server) or when the column type does not support array semantics (SQLite

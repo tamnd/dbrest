@@ -89,6 +89,7 @@ func (stub) BoolValue(v bool) string {
 	return "FALSE"
 }
 func (stub) IsBool(string, bool) (string, bool) { return "", false }
+func (stub) IsUnknown(string) (string, bool)    { return "", false }
 
 func compile(t *testing.T, q *ir.Query) *Statement {
 	t.Helper()

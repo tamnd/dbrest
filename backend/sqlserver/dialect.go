@@ -249,6 +249,10 @@ func (Dialect) IsBool(col string, v bool) (string, bool) {
 	return col + " = " + Dialect{}.BoolValue(v), true
 }
 
+// IsUnknown falls back to "col IS NULL"; a BIT boolean column's UNKNOWN state is
+// its NULL, so the row set matches.
+func (Dialect) IsUnknown(string) (string, bool) { return "", false }
+
 // ILike uses plain LIKE; SQL Server's default collation is case-insensitive.
 func (Dialect) ILike(col, val string) (string, bool) { return col + " LIKE " + val, true }
 

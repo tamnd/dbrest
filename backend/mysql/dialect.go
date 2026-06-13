@@ -222,6 +222,10 @@ func (Dialect) IsBool(col string, v bool) (string, bool) {
 	return col + " = " + Dialect{}.BoolValue(v), true
 }
 
+// IsUnknown falls back to "col IS NULL"; a TINYINT(1) boolean column's UNKNOWN
+// state is its NULL, so the row set matches.
+func (Dialect) IsUnknown(string) (string, bool) { return "", false }
+
 // BoolValue renders a boolean as 1/0. MySQL's BOOL is an alias for TINYINT(1),
 // so there is no native boolean keyword.
 func (Dialect) BoolValue(v bool) string {

@@ -154,6 +154,16 @@ func TestParseIs(t *testing.T) {
 	}
 }
 
+// is.unknown is the three-valued boolean test; the parser must accept it
+// alongside null/true/false/not_null (item 07.4).
+func TestParseIsUnknown(t *testing.T) {
+	q := mustRead(t, "done=is.unknown")
+	c := (*q.Where).(Compare)
+	if c.Op != OpIs || c.Value.Text != "unknown" {
+		t.Errorf("op/val = %v/%q, want OpIs/unknown", c.Op, c.Value.Text)
+	}
+}
+
 func TestParseQuantifier(t *testing.T) {
 	q := mustRead(t, "tags=eq(any).{a}")
 	c := (*q.Where).(Compare)

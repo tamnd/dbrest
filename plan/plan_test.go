@@ -64,6 +64,34 @@ func TestReadUnknownColumnInOrder(t *testing.T) {
 	}
 }
 
+// The planner stamps an eq/neq filter with its column's canonical type so the
+// compiler can decide whether "true"/"false" binds as a boolean (item 07.4).
+func TestReadStampsColumnTypeOnEq(t *testing.T) {
+	m := schema.NewModel([]*schema.Relation{
+		{Name: "flags", Kind: schema.KindTable, Columns: []*schema.Column{
+			{Name: "id", Type: "integer", Position: 1},
+			{Name: "done", Type: "bool", Position: 2},
+			{Name: "label", Type: "text", Position: 3},
+		}},
+	})
+	where := ir.Cond(ir.And{Kids: []ir.Cond{
+		ir.Compare{Path: []string{"done"}, Op: ir.OpEq, Value: ir.Value{Text: "true"}},
+		ir.Compare{Path: []string{"label"}, Op: ir.OpNeq, Value: ir.Value{Text: "x"}},
+	}})
+	q := &ir.Query{Relation: ir.Ref{Name: "flags"}, Where: &where}
+	p, err := Read(m, q, nil, Options{})
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	kids := (*p.Query.Where).(ir.And).Kids
+	if ct := kids[0].(ir.Compare).ColumnType; ct != "bool" {
+		t.Errorf("done ColumnType = %q, want bool", ct)
+	}
+	if ct := kids[1].(ir.Compare).ColumnType; ct != "text" {
+		t.Errorf("label ColumnType = %q, want text", ct)
+	}
+}
+
 func TestReadNestedLogicalColumnChecked(t *testing.T) {
 	where := ir.Cond(ir.And{Kids: []ir.Cond{
 		ir.Compare{Path: []string{"year"}, Op: ir.OpGte, Value: ir.Value{Text: "2000"}},

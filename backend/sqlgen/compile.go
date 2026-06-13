@@ -9,6 +9,7 @@ import (
 
 	"github.com/tamnd/dbrest/ir"
 	"github.com/tamnd/dbrest/pgerr"
+	"github.com/tamnd/dbrest/pgtypes"
 )
 
 // CountColName is the synthetic column appended by CompileReadCounted to carry
@@ -649,11 +650,16 @@ func (b *builder) writeCompare(c ir.Compare) *pgerr.APIError {
 	case ir.OpEq, ir.OpNeq:
 		// Boolean literals "true"/"false" are rendered via BoolValue so engines
 		// without a native BOOL type (MySQL TINYINT) produce correct predicates
-		// (e.g. done = 1 rather than done = 'true' which MySQL coerces to 0).
-		switch c.Value.Text {
-		case "true":
+		// (e.g. done = 1 rather than done = 'true' which MySQL coerces to 0). The
+		// coercion is column-type-aware: against a non-boolean column (a text
+		// column literally holding the word "true") the words stay text, matching
+		// PostgreSQL's type-driven coercion (item 07.4). An unknown column type
+		// keeps the boolean rendering, the common ?col=is-not-the-point filter.
+		boolColumn := c.ColumnType == "" || pgtypes.ClassOf(c.ColumnType) == pgtypes.ClassBool
+		switch {
+		case c.Value.Text == "true" && boolColumn:
 			frag = col + " " + binaryOp(c.Op) + " " + b.d.BoolValue(true)
-		case "false":
+		case c.Value.Text == "false" && boolColumn:
 			frag = col + " " + binaryOp(c.Op) + " " + b.d.BoolValue(false)
 		default:
 			frag = col + " " + binaryOp(c.Op) + " " + b.bind(c.Value.Text)
@@ -828,6 +834,11 @@ func (b *builder) writeIs(col, text string) (string, *pgerr.APIError) {
 			return frag, nil
 		}
 		return col + " IS " + b.d.BoolValue(false), nil
+	case "unknown":
+		if frag, ok := b.d.IsUnknown(col); ok {
+			return frag, nil
+		}
+		return col + " IS NULL", nil
 	default:
 		return "", pgerr.ErrParse("unknown is value " + text)
 	}

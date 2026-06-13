@@ -677,6 +677,16 @@ func validateCond(rel *schema.Relation, c *ir.Cond) *pgerr.APIError {
 				*c = n
 			}
 		}
+		// eq/neq carry the column's canonical type so the compiler binds the
+		// literal "true"/"false" as a boolean only when the column is boolean;
+		// against a text column the words stay text, matching PostgreSQL's
+		// type-driven coercion (item 07.4).
+		if (n.Op == ir.OpEq || n.Op == ir.OpNeq) && len(n.Path) == 1 {
+			if col, ok := rel.Column(n.Path[0]); ok {
+				n.ColumnType = col.Type
+				*c = n
+			}
+		}
 	}
 	return nil
 }

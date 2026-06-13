@@ -202,6 +202,10 @@ func (dialect) ILike(col, val string) (string, bool) { return col + " LIKE " + v
 // a NULL-safe equality that works with any value.
 func (dialect) IsBool(string, bool) (string, bool) { return "", false }
 
+// IsUnknown has no SQLite spelling; the compiler falls back to "col IS NULL",
+// which selects the same rows for a boolean column.
+func (dialect) IsUnknown(string) (string, bool) { return "", false }
+
 // BoolValue renders a boolean as 1/0; SQLite has no native boolean.
 func (dialect) BoolValue(v bool) string {
 	if v {

@@ -241,6 +241,9 @@ func (Dialect) BoolValue(v bool) string {
 // supports IS <bool> natively.
 func (Dialect) IsBool(string, bool) (string, bool) { return "", false }
 
+// IsUnknown renders PostgreSQL's native three-valued "col IS UNKNOWN" test.
+func (Dialect) IsUnknown(col string) (string, bool) { return col + " IS UNKNOWN", true }
+
 // ArrayLiteral returns the PostgreSQL {a,b} array literal unchanged; PostgreSQL
 // accepts it natively.
 func (Dialect) ArrayLiteral(pgText string) string { return pgText }
