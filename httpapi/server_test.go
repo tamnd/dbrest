@@ -363,8 +363,9 @@ func TestPostBulkInsertNoLocation(t *testing.T) {
 	if loc := resp.Header.Get("Location"); loc != "" {
 		t.Errorf("bulk insert should not set Location, got %q", loc)
 	}
-	if cr := resp.Header.Get("Content-Range"); cr != "0-1/*" {
-		t.Errorf("Content-Range = %q, want 0-1/*", cr)
+	// A POST reports the total-only range, never a row span (02.8).
+	if cr := resp.Header.Get("Content-Range"); cr != "*/*" {
+		t.Errorf("Content-Range = %q, want */*", cr)
 	}
 	if len(decodeArray(t, resp)) != 2 {
 		t.Error("want 2 inserted rows")

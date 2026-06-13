@@ -138,30 +138,35 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 		}
 		// Strip the xmax column from the result and use it to decide insert/update status.
 		if isUpsert && xmaxIdx >= 0 && xmaxIdx < len(cols) {
-			allInsert := true
+			inserted := 0
 			cleaned := make([][]any, len(buf))
 			for i, row := range buf {
-				// Check if xmax indicates an update (non-zero value means the row
-				// existed before and was updated via ON CONFLICT DO UPDATE).
+				// A zero (or empty) xmax means the row had no prior version: it was
+				// newly inserted. A non-zero xmax means ON CONFLICT DO UPDATE replaced
+				// an existing row.
+				rowInserted := true
 				if xmaxIdx < len(row) {
 					switch xv := row[xmaxIdx].(type) {
 					case []byte:
 						if string(xv) != "0" && string(xv) != "" {
-							allInsert = false
+							rowInserted = false
 						}
 					case string:
 						if xv != "0" && xv != "" {
-							allInsert = false
+							rowInserted = false
 						}
 					case int64:
 						if xv != 0 {
-							allInsert = false
+							rowInserted = false
 						}
 					case uint32:
 						if xv != 0 {
-							allInsert = false
+							rowInserted = false
 						}
 					}
+				}
+				if rowInserted {
+					inserted++
 				}
 				// Remove the xmax column from the row.
 				r := make([]any, 0, len(row)-1)
@@ -175,7 +180,7 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 			buf = cleaned
 			cols = append(cols[:xmaxIdx], cols[xmaxIdx+1:]...)
 			res.controls.UpsertStatusKnown = true
-			res.controls.UpsertInsert = allInsert
+			res.controls.InsertedRows = inserted
 		}
 		res.cols, res.rows = cols, buf
 		res.affected, res.hasAff = int64(len(buf)), true

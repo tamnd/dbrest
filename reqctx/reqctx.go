@@ -132,13 +132,15 @@ type ResponseControls struct {
 	Status int
 	// Headers are extra response headers to merge in.
 	Headers map[string]string
-	// UpsertInsert is set by the backend when it can determine whether the upsert
-	// resulted in a pure INSERT (all rows were new, true) or hit existing rows
-	// (false). Only backends that support this detection (PostgreSQL via xmax)
-	// set UpsertStatusKnown = true; others leave it false, and the HTTP layer
-	// defaults to 201 for POST upserts.
+	// InsertedRows is the number of payload rows the upsert inserted as new (the
+	// rest replaced existing rows). The HTTP layer reads it to separate a
+	// zero-inserted merge from a mixed batch: a POST merge upsert is 200 only when
+	// it is zero, a PUT is 201 only when it is positive. A backend sets it together
+	// with UpsertStatusKnown = true when it can detect insert-vs-update (sqlite by a
+	// pre-write key probe, PostgreSQL via xmax); others leave the status unknown and
+	// the HTTP layer defaults to 201 for POST upserts.
 	UpsertStatusKnown bool
-	UpsertInsert      bool
+	InsertedRows      int
 }
 
 // Controls returns a pointer to the mutable response controls.

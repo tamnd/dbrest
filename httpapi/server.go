@@ -886,23 +886,27 @@ func (s *Server) writeWrite(w http.ResponseWriter, r *http.Request, q *ir.Query,
 	if applied := q.Prefer.AppliedHeader(); applied != "" {
 		w.Header().Set("Preference-Applied", applied)
 	}
-	// PostgREST v14 returns a Location header only for return=headers-only inserts/upserts.
-	// For return=representation or minimal, Location is omitted.
-	if (q.Kind == ir.Insert || q.Kind == ir.Upsert) && q.Write != nil && q.Write.Return == ir.ReturnHeadersOnly {
+	// A Location points at a newly created resource. PostgREST sets it only for a
+	// return=headers-only POST insert or upsert of a single row; a PUT never
+	// carries one (02.9).
+	if r.Method == http.MethodPost && (q.Kind == ir.Insert || q.Kind == ir.Upsert) &&
+		q.Write != nil && q.Write.Return == ir.ReturnHeadersOnly {
 		if loc := locationHeader(rel, q.Relation.Name, res); loc != "" {
 			w.Header().Set("Location", loc)
 		}
 	}
 
+	// Content-Range is present on every write except PUT, shaped by method (02.8):
+	// POST and DELETE report the total-only "*/*" form ("*/N" with count=exact),
+	// PATCH the affected-row range "0-(n-1)/...". It does not depend on the return
+	// mode, so a minimal write carries it too.
+	affected, hasAff := res.Affected()
+	if cr := writeContentRange(r.Method, affected, hasAff, q.Count); cr != "" {
+		w.Header().Set("Content-Range", cr)
+	}
+
 	representation := q.Write.Return == ir.ReturnRepresentation
 	if !representation {
-		// When count=exact was requested, include Content-Range: */<n> so the
-		// client knows how many rows were affected, matching PostgREST's wire.
-		if q.Count == ir.CountExact {
-			if n, ok := res.Affected(); ok {
-				w.Header().Set("Content-Range", fmt.Sprintf("*/%d", n))
-			}
-		}
 		w.WriteHeader(applyControls(w, ctrl, writeStatus(r.Method, q.Kind, false, ctrl)))
 		return
 	}
@@ -915,45 +919,55 @@ func (s *Server) writeWrite(w http.ResponseWriter, r *http.Request, q *ir.Query,
 	}
 	timerFrom(r.Context()).mark("response", respStart)
 	w.Header().Set("Content-Type", out.contentType)
-	if !q.Singular {
-		// For writes with count=exact, include the total in Content-Range.
-		if q.Count == ir.CountExact {
-			if n, ok := res.Affected(); ok {
-				w.Header().Set("Content-Range", contentRange(0, out.nRows, n, true))
-			} else {
-				w.Header().Set("Content-Range", contentRange(0, out.nRows, 0, false))
-			}
-		} else {
-			w.Header().Set("Content-Range", contentRange(0, out.nRows, 0, false))
-		}
-	}
 	w.WriteHeader(applyControls(w, ctrl, writeStatus(r.Method, q.Kind, true, ctrl)))
 	if r.Method != http.MethodHead {
 		w.Write(out.body)
 	}
 }
 
+// writeContentRange builds the Content-Range header for a write, shaped by the
+// HTTP method (02.8). A PUT carries none. POST and DELETE report the total-only
+// "*/*" form ("*/N" with count=exact); PATCH reports the affected-row range
+// "0-(n-1)/..." and falls back to "*/..." when no row matched.
+func writeContentRange(method string, affected int64, hasAff bool, count ir.CountKind) string {
+	if method == http.MethodPut {
+		return ""
+	}
+	total := "*"
+	if count == ir.CountExact && hasAff {
+		total = strconv.FormatInt(affected, 10)
+	}
+	if method == http.MethodPatch && hasAff && affected > 0 {
+		return fmt.Sprintf("0-%d/%s", affected-1, total)
+	}
+	return "*/" + total
+}
+
 // writeStatus is the status for a successful write.
 //   - POST insert: 201 Created.
-//   - POST upsert where ALL rows were new inserts: 201 Created.
-//   - POST upsert where at least one row was an ON CONFLICT update: 200 OK.
-//   - PUT upsert where the row is known to be a new insert: 201 Created.
-//   - PUT upsert where the row is known to be an update, or unknown: 200 OK.
-//   - PATCH/DELETE with representation: 200 OK.
-//   - PATCH/DELETE without representation: 204 No Content.
+//   - POST merge-duplicates upsert with zero rows inserted: 200 OK.
+//   - POST upsert otherwise (ignore-duplicates, mixed, all-insert, unknown): 201.
+//   - PUT without representation (minimal, headers-only, none): 204 No Content.
+//   - PUT representation with a row inserted: 201 Created; else 200 OK.
+//   - PATCH/DELETE with representation: 200 OK; without: 204 No Content.
 func writeStatus(method string, kind ir.QueryKind, representation bool, ctrl *reqctx.ResponseControls) int {
-	if method == http.MethodPost {
-		// 200 when the upsert hit at least one existing row (ON CONFLICT UPDATE fired).
-		// 201 otherwise (new row was inserted or unknown).
-		if kind == ir.Upsert && ctrl != nil && ctrl.UpsertStatusKnown && !ctrl.UpsertInsert {
+	switch method {
+	case http.MethodPost:
+		// A POST upsert is 200 only when the resolution is merge-duplicates and no
+		// row was newly inserted; ignore-duplicates and mixed batches stay 201. The
+		// backend reports a known insert count only for a merge upsert, so a known
+		// zero here already implies merge-duplicates.
+		if kind == ir.Upsert && ctrl != nil && ctrl.UpsertStatusKnown && ctrl.InsertedRows == 0 {
 			return http.StatusOK
 		}
 		return http.StatusCreated
-	}
-	if method == http.MethodPut && kind == ir.Upsert {
-		// PUT is semantically "create or replace"; default to 200.
-		// Only return 201 when the backend positively confirms a new insert.
-		if ctrl != nil && ctrl.UpsertStatusKnown && ctrl.UpsertInsert {
+	case http.MethodPut:
+		// A PUT answers 204 for every return mode except representation, which is
+		// 201 when a row was inserted and 200 when it replaced an existing one.
+		if !representation {
+			return http.StatusNoContent
+		}
+		if ctrl != nil && ctrl.UpsertStatusKnown && ctrl.InsertedRows > 0 {
 			return http.StatusCreated
 		}
 		return http.StatusOK

@@ -307,11 +307,11 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 	// write we check, in the same transaction, whether any payload row's
 	// conflict-target key already exists; if none does the upsert is all-insert.
 	if q.Kind == ir.Upsert {
-		if allInsert, ok, derr := detectUpsertInsert(ctx, tx, q, plan.Rel); derr != nil {
+		if inserted, ok, derr := detectUpsertInsert(ctx, tx, q, plan.Rel); derr != nil {
 			return nil, b.MapError(derr)
 		} else if ok {
 			res.controls.UpsertStatusKnown = true
-			res.controls.UpsertInsert = allInsert
+			res.controls.InsertedRows = inserted
 		}
 	}
 	if len(returning) > 0 {
@@ -351,15 +351,16 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 	return res, nil
 }
 
-// detectUpsertInsert reports whether an upsert is all-insert (no payload row's
-// conflict-target key already exists) so the HTTP layer can choose 201 over
-// 200. It runs inside the write transaction, before the upsert statement, and
-// returns ok=false when the target columns are unknown (no explicit on_conflict
-// and no primary key), leaving the status to the default. The conflict target
-// defaults to the relation's primary key, matching the upsert's own ON CONFLICT.
-func detectUpsertInsert(ctx context.Context, tx *sql.Tx, q *ir.Query, rel *schema.Relation) (allInsert, ok bool, err error) {
+// detectUpsertInsert counts how many of the payload rows the upsert will insert
+// as new (those whose conflict-target key does not already exist) so the HTTP
+// layer can choose 200 vs 201. It runs inside the write transaction, before the
+// upsert statement, and returns ok=false when the target columns are unknown (no
+// explicit on_conflict and no primary key), leaving the status to the default.
+// The conflict target defaults to the relation's primary key, matching the
+// upsert's own ON CONFLICT.
+func detectUpsertInsert(ctx context.Context, tx *sql.Tx, q *ir.Query, rel *schema.Relation) (inserted int, ok bool, err error) {
 	if q.Write == nil || len(q.Write.Rows) == 0 {
-		return false, false, nil
+		return 0, false, nil
 	}
 	// Only merge-duplicates can turn into an update; an ignore-duplicates upsert
 	// (ON CONFLICT DO NOTHING) is a no-op insert on a conflict, which PostgreSQL
@@ -367,14 +368,14 @@ func detectUpsertInsert(ctx context.Context, tx *sql.Tx, q *ir.Query, rel *schem
 	// PUT (no Conflict spec) and a merge upsert run detection; an ignore upsert
 	// keeps the 201 default.
 	if q.Write.Conflict != nil && q.Write.Conflict.Resolution == ir.ConflictIgnore {
-		return false, false, nil
+		return 0, false, nil
 	}
 	target := rel.PrimaryKey
 	if q.Write.Conflict != nil && len(q.Write.Conflict.Target) > 0 {
 		target = q.Write.Conflict.Target
 	}
 	if len(target) == 0 {
-		return false, false, nil
+		return 0, false, nil
 	}
 
 	d := dialect{}
@@ -401,20 +402,21 @@ func detectUpsertInsert(ctx context.Context, tx *sql.Tx, q *ir.Query, rel *schem
 			args[i] = sqlgen.WriteArg(d, v)
 		}
 		if args == nil {
+			inserted++
 			continue
 		}
 		var dummy int
 		switch scanErr := tx.QueryRowContext(ctx, query, args...).Scan(&dummy); scanErr {
 		case nil:
-			// At least one row matches an existing key: not an all-insert upsert.
-			return false, true, nil
+			// This row matches an existing key: an ON CONFLICT update, not an insert.
 		case sql.ErrNoRows:
-			// This row is an insert; keep checking the rest.
+			// No existing row: this one is a new insert.
+			inserted++
 		default:
-			return false, false, scanErr
+			return 0, false, scanErr
 		}
 	}
-	return true, true, nil
+	return inserted, true, nil
 }
 
 // compileWrite dispatches to the right compiler for the mutation kind.
