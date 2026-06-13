@@ -110,11 +110,6 @@ func TestUpsert(t *testing.T) {
 			`ON CONFLICT ("id") DO NOTHING`,
 		},
 		{
-			"merge no target",
-			sqlgen.UpsertSpec{Update: []string{`"title"`}},
-			`ON CONFLICT DO UPDATE SET "title" = excluded."title"`,
-		},
-		{
 			"empty update degrades to nothing",
 			sqlgen.UpsertSpec{Target: []string{`"id"`}},
 			`ON CONFLICT ("id") DO NOTHING`,
@@ -128,6 +123,13 @@ func TestUpsert(t *testing.T) {
 		if got != c.want {
 			t.Errorf("%s: = %q, want %q", c.name, got, c.want)
 		}
+	}
+
+	// A merge with no conflict target is rejected: ON CONFLICT DO UPDATE without an
+	// inference specification is invalid PostgreSQL. The compiler degrades this to a
+	// plain INSERT before reaching here, matching PostgREST, so this is a guard.
+	if _, err := d.Upsert(sqlgen.UpsertSpec{Update: []string{`"title"`}}); err == nil {
+		t.Error("merge with empty target should return an error, got nil")
 	}
 }
 

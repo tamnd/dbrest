@@ -16,6 +16,7 @@
 package postgres
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -86,6 +87,13 @@ func (Dialect) Returning(cols []string) (string, bool) {
 // row, so a merge sets each column to its excluded value. An empty update set or
 // an ignore request becomes DO NOTHING.
 func (Dialect) Upsert(spec sqlgen.UpsertSpec) (string, error) {
+	// DO UPDATE without a conflict target is not valid PostgreSQL ("ON CONFLICT DO
+	// UPDATE requires inference specification or constraint name"). The compiler
+	// already degrades a no-target upsert to a plain INSERT, so this guards against
+	// a future caller emitting the invalid form.
+	if !spec.Ignore && len(spec.Update) > 0 && len(spec.Target) == 0 {
+		return "", fmt.Errorf("merge upsert needs a conflict target")
+	}
 	var sb strings.Builder
 	sb.WriteString("ON CONFLICT")
 	if len(spec.Target) > 0 {

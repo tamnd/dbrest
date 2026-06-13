@@ -724,6 +724,62 @@ func TestIntegrationCountedReadConsistent(t *testing.T) {
 	}
 }
 
+// TestIntegrationUpsertNoConflictTarget proves a merge upsert against a table
+// with no primary key degrades to a plain INSERT instead of emitting an invalid
+// ON CONFLICT DO UPDATE. This matches PostgREST 14, where a merge-duplicates POST
+// to a key-less table inserts the rows and returns 201 (verified against a live
+// PostgREST). Two identical rows therefore both land. Finding P12.
+func TestIntegrationUpsertNoConflictTarget(t *testing.T) {
+	be := openBE(t)
+	ctx := context.Background()
+
+	if _, err := be.Pool().Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS _dbrest_test_nopk (a int, b text);
+		TRUNCATE _dbrest_test_nopk`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, "DROP TABLE IF EXISTS _dbrest_test_nopk")
+	})
+
+	model, err := be.Introspect(ctx)
+	if err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+	rel, ok := model.Lookup("_dbrest_test_nopk", []string{"public"})
+	if !ok {
+		t.Fatal("_dbrest_test_nopk not found")
+	}
+
+	plan := &ir.Plan{
+		Rel: rel,
+		Query: &ir.Query{
+			Kind:     ir.Upsert,
+			Relation: ir.Ref{Schema: "public", Name: "_dbrest_test_nopk"},
+			Write: &ir.WriteSpec{
+				Rows:     []map[string]ir.Value{{"a": {JSON: "1"}, "b": {JSON: "x"}}},
+				Columns:  []string{"a", "b"},
+				Return:   ir.ReturnMinimal,
+				Conflict: &ir.Conflict{Resolution: ir.ConflictMerge},
+			},
+		},
+	}
+	rc := &reqctx.Context{Method: "POST", Path: "/_dbrest_test_nopk"}
+
+	for i := 0; i < 2; i++ {
+		if _, err := be.Execute(ctx, plan, rc); err != nil {
+			t.Fatalf("Execute(merge upsert, no PK) #%d: %v", i, err)
+		}
+	}
+	var n int
+	if err := be.Pool().QueryRow(ctx, "SELECT count(*) FROM _dbrest_test_nopk WHERE a=1").Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("rows after two merge upserts = %d, want 2 (plain insert, no merge)", n)
+	}
+}
+
 func condPtr(c ir.Cond) *ir.Cond { return &c }
 func intPtr(n int) *int          { return &n }
 

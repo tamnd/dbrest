@@ -283,7 +283,12 @@ func CompileInsert(d Dialect, q *ir.Query, returning []string) (*Statement, *pge
 		}
 	}
 
-	if w.Conflict != nil {
+	// An upsert with no resolvable conflict target (a table or view without a
+	// primary key, no on_conflict given) has nothing to merge or ignore on, so it
+	// degrades to a plain INSERT, the same as PostgREST: a merge or ignore POST to
+	// a key-less table inserts the rows and returns 201. Emitting ON CONFLICT here
+	// would produce invalid SQL ("ON CONFLICT DO UPDATE requires inference").
+	if w.Conflict != nil && len(w.Conflict.Target) > 0 {
 		if err := b.writeConflict(w); err != nil {
 			return nil, err
 		}
