@@ -220,23 +220,13 @@ func renderRows(res backend.Result, singular bool, rawCols map[string]bool) (*re
 		if err != nil {
 			return nil, pgerr.ErrInternal(err.Error())
 		}
-		obj := make(map[string]any, len(cols))
-		for i, c := range cols {
-			if rawCols[c] {
-				obj[c] = rawJSON(vals[i])
-			} else {
-				obj[c] = vals[i]
-			}
-		}
 		// Encode each row independently so a large result streams in bounded
 		// memory once the engine-assembled path replaces this shaper.
-		var rb bytes.Buffer
-		re := json.NewEncoder(&rb)
-		re.SetEscapeHTML(false)
-		if err := re.Encode(obj); err != nil {
+		rb, err := encodeRowObject(cols, vals, rawCols)
+		if err != nil {
 			return nil, pgerr.ErrInternal(err.Error())
 		}
-		rows = append(rows, json.RawMessage(bytes.TrimRight(rb.Bytes(), "\n")))
+		rows = append(rows, json.RawMessage(rb))
 	}
 	if err := rs.Err(); err != nil {
 		return nil, pgerr.ErrInternal(err.Error())
@@ -261,6 +251,51 @@ func renderRows(res backend.Result, singular bool, rawCols map[string]bool) (*re
 	}
 	out.body = bytes.TrimRight(buf.Bytes(), "\n")
 	return out, nil
+}
+
+// encodeRowObject serializes one row as a JSON object whose keys appear in
+// projection (column) order, the way PostgREST preserves select order rather
+// than the alphabetical order a Go map would impose. A rawCols column carries
+// engine-assembled JSON emitted verbatim; every other value is encoded normally.
+func encodeRowObject(cols []string, vals []any, rawCols map[string]bool) ([]byte, error) {
+	var rb bytes.Buffer
+	rb.WriteByte('{')
+	for i, c := range cols {
+		if i > 0 {
+			rb.WriteByte(',')
+		}
+		key, err := jsonNoEscape(c)
+		if err != nil {
+			return nil, err
+		}
+		rb.Write(key)
+		rb.WriteByte(':')
+		var v any
+		if rawCols[c] {
+			v = rawJSON(vals[i])
+		} else {
+			v = vals[i]
+		}
+		val, err := jsonNoEscape(v)
+		if err != nil {
+			return nil, err
+		}
+		rb.Write(val)
+	}
+	rb.WriteByte('}')
+	return rb.Bytes(), nil
+}
+
+// jsonNoEscape encodes a value to JSON the way PostgREST does: HTML characters
+// stay unescaped and the encoder's trailing newline is trimmed.
+func jsonNoEscape(v any) ([]byte, error) {
+	var b bytes.Buffer
+	e := json.NewEncoder(&b)
+	e.SetEscapeHTML(false)
+	if err := e.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(b.Bytes(), "\n"), nil
 }
 
 // renderCSV writes a header row of column names followed by one RFC 4180 record
