@@ -18,20 +18,23 @@ import (
 // hatch) is honored rather than clobbered.
 func TestResolveExecMode(t *testing.T) {
 	cases := []struct {
-		name   string
-		dsn    string
-		parsed pgx.QueryExecMode
-		want   pgx.QueryExecMode
+		name     string
+		dsn      string
+		parsed   pgx.QueryExecMode
+		prepared bool
+		want     pgx.QueryExecMode
 	}{
-		{"omitted defaults to cache_describe", "postgres://u:p@h/db", pgx.QueryExecModeCacheStatement, pgx.QueryExecModeCacheDescribe},
-		{"simple_protocol honored", "postgres://u:p@h/db?default_query_exec_mode=simple_protocol", pgx.QueryExecModeSimpleProtocol, pgx.QueryExecModeSimpleProtocol},
-		{"exec honored", "postgres://u:p@h/db?default_query_exec_mode=exec", pgx.QueryExecModeExec, pgx.QueryExecModeExec},
-		{"explicit cache_statement honored", "postgres://u:p@h/db?default_query_exec_mode=cache_statement", pgx.QueryExecModeCacheStatement, pgx.QueryExecModeCacheStatement},
+		{"omitted, prepared on, defaults to cache_describe", "postgres://u:p@h/db", pgx.QueryExecModeCacheStatement, true, pgx.QueryExecModeCacheDescribe},
+		{"omitted, prepared off, uses exec", "postgres://u:p@h/db", pgx.QueryExecModeCacheStatement, false, pgx.QueryExecModeExec},
+		{"DSN choice wins over prepared off", "postgres://u:p@h/db?default_query_exec_mode=cache_statement", pgx.QueryExecModeCacheStatement, false, pgx.QueryExecModeCacheStatement},
+		{"simple_protocol honored", "postgres://u:p@h/db?default_query_exec_mode=simple_protocol", pgx.QueryExecModeSimpleProtocol, true, pgx.QueryExecModeSimpleProtocol},
+		{"exec honored", "postgres://u:p@h/db?default_query_exec_mode=exec", pgx.QueryExecModeExec, true, pgx.QueryExecModeExec},
+		{"explicit cache_statement honored", "postgres://u:p@h/db?default_query_exec_mode=cache_statement", pgx.QueryExecModeCacheStatement, true, pgx.QueryExecModeCacheStatement},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := resolveExecMode(tc.dsn, tc.parsed); got != tc.want {
-				t.Errorf("resolveExecMode(%q, %v) = %v, want %v", tc.dsn, tc.parsed, got, tc.want)
+			if got := resolveExecMode(tc.dsn, tc.parsed, tc.prepared); got != tc.want {
+				t.Errorf("resolveExecMode(%q, %v, %v) = %v, want %v", tc.dsn, tc.parsed, tc.prepared, got, tc.want)
 			}
 		})
 	}

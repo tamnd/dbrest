@@ -237,7 +237,8 @@ func probeAddr(host string, port int) string {
 // Each backend driver self-registers via its package init function; this file
 // imports them as blank imports so their init functions run.
 func openBackend(cfg *config.Config) (backend.Backend, error) {
-	be, err := backend.Open(cfg.Backend, cfg.DBURI)
+	prepared := cfg.DBPreparedStatements
+	be, err := backend.OpenWith(cfg.Backend, cfg.DBURI, backend.OpenOptions{PreparedStatements: &prepared})
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}

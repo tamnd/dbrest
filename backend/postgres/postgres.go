@@ -59,6 +59,23 @@ type Backend struct {
 // queries avoid a server-side parse on every execution. This is one of the key
 // throughput advantages over PostgREST.
 func Open(dsn string) (*Backend, error) {
+	return OpenWith(dsn, Options{PreparedStatements: true})
+}
+
+// Options carries the open-time settings the postgres backend can vary. The zero
+// value is not the default: callers use Open (prepared statements on) or pass an
+// explicit Options.
+type Options struct {
+	// PreparedStatements maps PostgREST's db-prepared-statements. On (the default),
+	// the pool uses cache_describe so each distinct query is parsed once per
+	// connection. Off selects the unprepared exec protocol, which parameterizes
+	// every query over the extended protocol without caching a statement, the
+	// pooler-safe equivalent of PostgREST's "parameterized but not prepared".
+	PreparedStatements bool
+}
+
+// OpenWith connects like Open but honors the supplied Options.
+func OpenWith(dsn string, opts Options) (*Backend, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, err
@@ -67,7 +84,7 @@ func Open(dsn string) (*Backend, error) {
 	if cfg.MaxConns < 1 {
 		cfg.MaxConns = defaultPoolMaxConns
 	}
-	cfg.ConnConfig.DefaultQueryExecMode = resolveExecMode(dsn, cfg.ConnConfig.DefaultQueryExecMode)
+	cfg.ConnConfig.DefaultQueryExecMode = resolveExecMode(dsn, cfg.ConnConfig.DefaultQueryExecMode, opts.PreparedStatements)
 	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
 	if err != nil {
 		return nil, err
@@ -96,18 +113,22 @@ func Open(dsn string) (*Backend, error) {
 	return &Backend{pool: pool, version: ParseVersion(ver), loc: loc}, nil
 }
 
-// resolveExecMode picks the pool's default query exec mode. dbrest defaults to
-// cache_describe so the server parses each distinct query once per connection
-// while keeping unnamed statements, which a transaction-mode pooler (PgBouncer)
-// tolerates. An operator can still override it in the DSN
-// (default_query_exec_mode=simple_protocol or exec, pgx's documented escape hatch
-// for poolers); honor that choice rather than clobbering it. pgx parses the param
-// into parsed, but an omitted value and an explicit cache_statement both decode to
-// the same zero value, so the presence test keys on the raw DSN string, where the
-// param name is unambiguous.
-func resolveExecMode(dsn string, parsed pgx.QueryExecMode) pgx.QueryExecMode {
+// resolveExecMode picks the pool's default query exec mode. An explicit DSN
+// choice wins (default_query_exec_mode=simple_protocol or exec, pgx's documented
+// escape hatch for poolers); honor it rather than clobbering it. pgx parses the
+// param into parsed, but an omitted value and an explicit cache_statement both
+// decode to the same zero value, so the presence test keys on the raw DSN string,
+// where the param name is unambiguous. With no DSN choice, db-prepared-statements
+// decides: on (the default) selects cache_describe, which parses each distinct
+// query once per connection while keeping unnamed statements a transaction-mode
+// pooler (PgBouncer) tolerates; off selects exec, which parameterizes every query
+// without preparing one, matching PostgREST's db-prepared-statements=false.
+func resolveExecMode(dsn string, parsed pgx.QueryExecMode, prepared bool) pgx.QueryExecMode {
 	if strings.Contains(dsn, "default_query_exec_mode") {
 		return parsed
+	}
+	if !prepared {
+		return pgx.QueryExecModeExec
 	}
 	return pgx.QueryExecModeCacheDescribe
 }
@@ -364,3 +385,14 @@ func init() { backend.Register("postgres", postgresDriver{}) }
 type postgresDriver struct{}
 
 func (postgresDriver) Open(dsn string) (backend.Backend, error) { return Open(dsn) }
+
+// OpenWithOptions implements backend.OptionsDriver so the server can thread
+// db-prepared-statements through the generic registry. PreparedStatements
+// defaults to on when the option is unset.
+func (postgresDriver) OpenWithOptions(dsn string, opts backend.OpenOptions) (backend.Backend, error) {
+	prepared := true
+	if opts.PreparedStatements != nil {
+		prepared = *opts.PreparedStatements
+	}
+	return OpenWith(dsn, Options{PreparedStatements: prepared})
+}
