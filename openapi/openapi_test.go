@@ -370,6 +370,32 @@ func TestForeignKeyNote(t *testing.T) {
 	}
 }
 
+// TestCompositeForeignKeyHasNoNote: v14 annotates only single-column foreign
+// keys, so a composite FK leaves its columns unannotated. A computed
+// relationship is a function with no local column, so it likewise never appears
+// in the document; both are covered by sourcing notes from real single-column FKs.
+func TestCompositeForeignKeyHasNoNote(t *testing.T) {
+	rel := &schema.Relation{
+		Name: "assignments",
+		Columns: []*schema.Column{
+			{Name: "org_id", Type: "integer"},
+			{Name: "user_id", Type: "integer"},
+			{Name: "role", Type: "text"},
+		},
+		ForeignKeys: []*schema.ForeignKey{
+			{Name: "assignments_member_fkey", Columns: []string{"org_id", "user_id"}, RefRelation: "members", RefColumns: []string{"org_id", "user_id"}},
+		},
+	}
+	doc := decode(t, schema.NewModel([]*schema.Relation{rel}), nil, sqliteCaps(), Options{})
+	props := doc["definitions"].(map[string]any)["assignments"].(map[string]any)["properties"].(map[string]any)
+	for _, c := range []string{"org_id", "user_id"} {
+		desc, _ := props[c].(map[string]any)["description"].(string)
+		if strings.Contains(desc, "Foreign Key") {
+			t.Errorf("%s description = %q, want no FK note for a composite key", c, desc)
+		}
+	}
+}
+
 // rowFilterDesc resolves a column's rowFilter parameter through the shared
 // parameters map, the way a client follows the $ref an operation carries.
 func rowFilterDesc(t *testing.T, doc map[string]any, table, col string) string {

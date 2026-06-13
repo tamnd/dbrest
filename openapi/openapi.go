@@ -477,19 +477,20 @@ func columnNote(name string, pk map[string]bool, fks []*schema.ForeignKey) strin
 		notes = append(notes, "Note:\nThis is a Primary Key.<pk/>")
 	}
 	for _, fk := range fks {
-		for i, c := range fk.Columns {
-			if c != name {
-				continue
-			}
-			ref := fk.RefRelation
-			col := ""
-			if i < len(fk.RefColumns) {
-				col = fk.RefColumns[i]
-				ref += "." + col
-			}
-			notes = append(notes,
-				"Note:\nThis is a Foreign Key to `"+ref+"`.<fk table='"+fk.RefRelation+"' column='"+col+"'/>")
+		// v14 only annotates a single-column foreign key: makeProperty matches a
+		// relationship whose local columns are exactly [this column], so a composite
+		// FK gets no note on any of its columns. Match that.
+		if len(fk.Columns) != 1 || fk.Columns[0] != name {
+			continue
 		}
+		ref := fk.RefRelation
+		col := ""
+		if len(fk.RefColumns) > 0 {
+			col = fk.RefColumns[0]
+			ref += "." + col
+		}
+		notes = append(notes,
+			"Note:\nThis is a Foreign Key to `"+ref+"`.<fk table='"+fk.RefRelation+"' column='"+col+"'/>")
 	}
 	return strings.Join(notes, "\n")
 }
