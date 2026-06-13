@@ -214,16 +214,21 @@ func TestFullText(t *testing.T) {
 		name    string
 		variant ir.FTSVariant
 		config  string
+		colType string
 		want    string
 	}{
-		{"plain no config", ir.FTSPlain, "", `to_tsvector("body") @@ to_tsquery(` + sqlgen.PatternMark + `)`},
-		{"plaintext", ir.FTSPlainText, "", `to_tsvector("body") @@ plainto_tsquery(` + sqlgen.PatternMark + `)`},
-		{"phrase", ir.FTSPhrase, "", `to_tsvector("body") @@ phraseto_tsquery(` + sqlgen.PatternMark + `)`},
-		{"web", ir.FTSWeb, "", `to_tsvector("body") @@ websearch_to_tsquery(` + sqlgen.PatternMark + `)`},
-		{"with config", ir.FTSPlain, "english", `to_tsvector('english', "body") @@ to_tsquery('english', ` + sqlgen.PatternMark + `)`},
+		{"plain no config", ir.FTSPlain, "", "text", `to_tsvector("body") @@ to_tsquery(` + sqlgen.PatternMark + `)`},
+		{"plaintext", ir.FTSPlainText, "", "text", `to_tsvector("body") @@ plainto_tsquery(` + sqlgen.PatternMark + `)`},
+		{"phrase", ir.FTSPhrase, "", "text", `to_tsvector("body") @@ phraseto_tsquery(` + sqlgen.PatternMark + `)`},
+		{"web", ir.FTSWeb, "", "text", `to_tsvector("body") @@ websearch_to_tsquery(` + sqlgen.PatternMark + `)`},
+		{"with config", ir.FTSPlain, "english", "text", `to_tsvector('english', "body") @@ to_tsquery('english', ` + sqlgen.PatternMark + `)`},
+		// A tsvector column is matched directly: PostgreSQL has no
+		// to_tsvector(tsvector) overload, so the wrap is skipped (PostgREST's rule).
+		{"tsvector column", ir.FTSPlain, "", "tsvector", `"body" @@ to_tsquery(` + sqlgen.PatternMark + `)`},
+		{"tsvector with config", ir.FTSPlain, "english", "tsvector", `"body" @@ to_tsquery('english', ` + sqlgen.PatternMark + `)`},
 	}
 	for _, c := range cases {
-		frag, bind, ok := d.FullText(`"body"`, nil, c.variant, c.config, "cat")
+		frag, bind, ok := d.FullText(`"body"`, c.colType, nil, c.variant, c.config, "cat")
 		if !ok {
 			t.Fatalf("%s: ok=false", c.name)
 		}

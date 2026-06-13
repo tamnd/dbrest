@@ -852,7 +852,7 @@ func (b *builder) writeFTS(c ir.Compare, col string) (string, *pgerr.APIError) {
 			RowidRef: b.colRef(rowid),
 		}
 	}
-	expr, bindVal, ok := b.d.FullText(col, ref, c.FTS, c.Config, c.Value.Text)
+	expr, bindVal, ok := b.d.FullText(col, c.ColumnType, ref, c.FTS, c.Config, c.Value.Text)
 	if !ok {
 		return "", pgerr.ErrFullTextUnavailable(c.Path[0], "sql")
 	}

@@ -774,6 +774,13 @@ func validateCond(rel *schema.Relation, c *ir.Cond) *pgerr.APIError {
 		// structure (SQLite's FTS5) raises PGRST127. See spec 21.
 		if n.Op == ir.OpFTS && len(n.Path) == 1 {
 			n.FullText = rel.FullTextIndexFor(n.Path[0])
+			// Carry the column's canonical type so the dialect can skip the
+			// to_tsvector wrap on a column that is already tsvector, the way
+			// PostgREST does (Plan.hs "Do not apply to_tsvector to tsvector
+			// types"). A wrap on a tsvector column raises 42883 in PostgreSQL.
+			if col, ok := rel.Column(n.Path[0]); ok {
+				n.ColumnType = col.Type
+			}
 			*c = n
 		}
 		// Array operators carry the column's canonical type so the dialect can

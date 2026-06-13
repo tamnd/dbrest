@@ -24,7 +24,7 @@ import (
 // names, not raw client input, and the Dialect interface carries a bound operand
 // only for the query value. An empty config omits the argument, letting the
 // server's default_text_search_config apply, which is the PostgREST default.
-func (Dialect) FullText(col string, _ *sqlgen.FullTextRef, variant ir.FTSVariant, config, value string) (string, string, bool) {
+func (Dialect) FullText(col, colType string, _ *sqlgen.FullTextRef, variant ir.FTSVariant, config, value string) (string, string, bool) {
 	ctor := map[ir.FTSVariant]string{
 		ir.FTSPlain:     "to_tsquery",
 		ir.FTSPlainText: "plainto_tsquery",
@@ -36,7 +36,15 @@ func (Dialect) FullText(col string, _ *sqlgen.FullTextRef, variant ir.FTSVariant
 	if config != "" {
 		cfg = sqlLiteral(config) + ", "
 	}
-	frag := "to_tsvector(" + cfg + col + ") @@ " + ctor + "(" + cfg + sqlgen.PatternMark + ")"
+	// A column already typed tsvector is matched directly: PostgreSQL has no
+	// to_tsvector(tsvector) overload, so wrapping it would raise 42883. This is
+	// PostgREST's "Do not apply to_tsvector to tsvector types" rule. Text and
+	// json/jsonb columns are wrapped so the server builds the vector on the fly.
+	lhs := "to_tsvector(" + cfg + col + ")"
+	if colType == "tsvector" {
+		lhs = col
+	}
+	frag := lhs + " @@ " + ctor + "(" + cfg + sqlgen.PatternMark + ")"
 	// The value carries the variant's grammar (boolean operators, quoted phrases,
 	// a web-style string), which PostgreSQL parses itself, so it is bound verbatim
 	// rather than pre-translated the way the FTS5 dialect must translate it.

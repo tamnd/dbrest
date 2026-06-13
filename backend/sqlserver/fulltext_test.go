@@ -9,12 +9,12 @@ import (
 // ftsFrag and fts return the predicate wrapper and the translated query value a
 // variant lowers to.
 func ftsFrag(v ir.FTSVariant) string {
-	frag, _, _ := Dialect{}.FullText("[c]", nil, v, "", "x")
+	frag, _, _ := Dialect{}.FullText("[c]", "", nil, v, "", "x")
 	return frag
 }
 
 func fts(v ir.FTSVariant, value string) string {
-	_, q, _ := Dialect{}.FullText("[c]", nil, v, "", value)
+	_, q, _ := Dialect{}.FullText("[c]", "", nil, v, "", value)
 	return q
 }
 

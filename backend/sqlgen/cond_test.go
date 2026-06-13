@@ -112,7 +112,7 @@ func TestCompileLikeAll(t *testing.T) {
 // when the planner attached none.
 type indexFTSDialect struct{ stub }
 
-func (indexFTSDialect) FullText(col string, idx *FullTextRef, _ ir.FTSVariant, _, _ string) (string, string, bool) {
+func (indexFTSDialect) FullText(col, _ string, idx *FullTextRef, _ ir.FTSVariant, _, _ string) (string, string, bool) {
 	if idx == nil {
 		return "", "", false
 	}

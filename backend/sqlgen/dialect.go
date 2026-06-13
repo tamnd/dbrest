@@ -61,13 +61,16 @@ type Dialect interface {
 	RegexFeatureGap(pattern string) string
 
 	// FullText lowers a full-text predicate. col is the quoted column reference
-	// (PostgreSQL builds to_tsvector over it); idx is the resolved covering index,
-	// or nil when the schema has none (an engine that requires one reports ok=false
-	// and the compiler raises PGRST127). variant is the fts/plfts/phfts/wfts
-	// grammar; config is the language argument (may be empty); value is the raw
-	// query text. The returned fragment carries PatternMark where the bound,
-	// engine-translated query value goes, and bind is that value. See spec 21.
-	FullText(col string, idx *FullTextRef, variant ir.FTSVariant, config, value string) (frag, bind string, ok bool)
+	// (PostgreSQL builds to_tsvector over it); colType is the column's canonical
+	// type, so a dialect can skip the to_tsvector wrap when the column is already
+	// tsvector (it may be empty when the type is unknown); idx is the resolved
+	// covering index, or nil when the schema has none (an engine that requires one
+	// reports ok=false and the compiler raises PGRST127). variant is the
+	// fts/plfts/phfts/wfts grammar; config is the language argument (may be empty);
+	// value is the raw query text. The returned fragment carries PatternMark where
+	// the bound, engine-translated query value goes, and bind is that value. See
+	// spec 21.
+	FullText(col, colType string, idx *FullTextRef, variant ir.FTSVariant, config, value string) (frag, bind string, ok bool)
 
 	// SessionRead reads a request-context value (the GUC analog).
 	SessionRead(key string) string

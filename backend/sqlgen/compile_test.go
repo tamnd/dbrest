@@ -67,7 +67,7 @@ func (stub) RegexFeatureGap(string) string             { return "" }
 
 // FullText models a PostgreSQL-flavored, column-agnostic full text: the index is
 // ignored (tsvector works on any column), so a nil idx is fine.
-func (stub) FullText(col string, _ *FullTextRef, v ir.FTSVariant, _, _ string) (string, string, bool) {
+func (stub) FullText(col, _ string, _ *FullTextRef, v ir.FTSVariant, _, _ string) (string, string, bool) {
 	ctor := map[ir.FTSVariant]string{
 		ir.FTSPlain: "to_tsquery", ir.FTSPlainText: "plainto_tsquery",
 		ir.FTSPhrase: "phraseto_tsquery", ir.FTSWeb: "websearch_to_tsquery",

@@ -10,12 +10,12 @@ import (
 // wrapper is fixed and snapshotted in compile_test; these cases pin the grammar
 // translation, the part that carries the per-variant divergence.
 func fts(v ir.FTSVariant, value string) string {
-	_, q, _ := Dialect{}.FullText("`c`", nil, v, "", value)
+	_, q, _ := Dialect{}.FullText("`c`", "", nil, v, "", value)
 	return q
 }
 
 func TestFullTextWrapper(t *testing.T) {
-	frag, _, ok := Dialect{}.FullText("`c`", nil, ir.FTSPlain, "", "x")
+	frag, _, ok := Dialect{}.FullText("`c`", "", nil, ir.FTSPlain, "", "x")
 	if !ok || frag != "MATCH(`c`) AGAINST($PAT$ IN BOOLEAN MODE)" {
 		t.Errorf("frag = %q, ok = %v", frag, ok)
 	}

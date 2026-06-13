@@ -44,7 +44,7 @@ func TestFTS5QuoteEscapes(t *testing.T) {
 
 func TestFullTextLowering(t *testing.T) {
 	ref := &sqlgen.FullTextRef{Table: `"films_fts"`, RowidRef: `"films"."id"`}
-	frag, bind, ok := dialect{}.FullText("", ref, ir.FTSPlain, "english", "cat")
+	frag, bind, ok := dialect{}.FullText("", "", ref, ir.FTSPlain, "english", "cat")
 	if !ok {
 		t.Fatal("FullText ok = false, want true with an index")
 	}
@@ -60,7 +60,7 @@ func TestFullTextLowering(t *testing.T) {
 // TestFullTextNoIndex is the missing-structure case: with no covering FTS5 table
 // the dialect reports ok=false so the compiler raises PGRST127 instead of scanning.
 func TestFullTextNoIndex(t *testing.T) {
-	if _, _, ok := (dialect{}).FullText("col", nil, ir.FTSPlain, "", "cat"); ok {
+	if _, _, ok := (dialect{}).FullText("col", "", nil, ir.FTSPlain, "", "cat"); ok {
 		t.Error("FullText with a nil index ok = true, want false")
 	}
 }

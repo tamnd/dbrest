@@ -453,6 +453,74 @@ func TestIntegrationTemporalRendering(t *testing.T) {
 	}
 }
 
+// TestIntegrationFullTextTSVector proves an fts filter on a real tsvector column
+// returns rows instead of failing. PostgreSQL has no to_tsvector(tsvector)
+// overload, so wrapping the column raised 42883 (surfaced as 404). With the
+// column type threaded through, the dialect matches the column directly
+// (col @@ to_tsquery(...)), the way PostgREST does. Finding 01-P01.
+func TestIntegrationFullTextTSVector(t *testing.T) {
+	be := openBE(t)
+	ctx := context.Background()
+
+	if _, err := be.Pool().Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS _dbrest_test_fts (
+			id  serial PRIMARY KEY,
+			doc tsvector NOT NULL
+		);
+		TRUNCATE _dbrest_test_fts;
+		INSERT INTO _dbrest_test_fts (doc) VALUES
+			(to_tsvector('english', 'the quick brown fox')),
+			(to_tsvector('english', 'a lazy dog sleeps'))`); err != nil {
+		t.Fatalf("seed tsvector table: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, "DROP TABLE IF EXISTS _dbrest_test_fts")
+	})
+
+	model, err := be.Introspect(ctx)
+	if err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+	rel, ok := model.Lookup("_dbrest_test_fts", []string{"public"})
+	if !ok {
+		t.Fatal("_dbrest_test_fts not found")
+	}
+
+	// fts on the tsvector column: ?doc=fts.fox should match only the first row.
+	// ColumnType is "tsvector" as the planner resolves it from the schema.
+	plan := &ir.Plan{Rel: rel, Query: &ir.Query{
+		Kind:     ir.Read,
+		Relation: ir.Ref{Schema: "public", Name: "_dbrest_test_fts"},
+		Select:   []ir.SelectItem{ir.Column{Path: []string{"id"}}},
+		Where: condPtr(ir.Compare{
+			Path:       []string{"doc"},
+			Op:         ir.OpFTS,
+			FTS:        ir.FTSPlain,
+			Value:      ir.Value{Text: "fox"},
+			ColumnType: "tsvector",
+		}),
+	}}
+	res, err := be.Execute(ctx, plan, &reqctx.Context{Method: "GET", Path: "/_dbrest_test_fts"})
+	if err != nil {
+		t.Fatalf("Execute(fts on tsvector): %v", err)
+	}
+	rs := res.Rows()
+	defer rs.Close()
+	rows := 0
+	for rs.Next() {
+		if _, err := rs.Values(); err != nil {
+			t.Fatalf("Values: %v", err)
+		}
+		rows++
+	}
+	if err := rs.Err(); err != nil {
+		t.Fatalf("row error: %v", err)
+	}
+	if rows != 1 {
+		t.Errorf("fts.fox matched %d rows, want 1", rows)
+	}
+}
+
 func condPtr(c ir.Cond) *ir.Cond { return &c }
 func intPtr(n int) *int          { return &n }
 
