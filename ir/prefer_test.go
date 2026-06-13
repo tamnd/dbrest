@@ -69,6 +69,41 @@ func TestStrictErrorRejectsOffenders(t *testing.T) {
 	}
 }
 
+// TestParsePreferMaxAffectedStrictOnly checks max-affected=N is parsed and
+// echoed only under handling=strict; under lenient PostgREST ignores it, so both
+// the value and the echo are dropped.
+func TestParsePreferMaxAffectedStrictOnly(t *testing.T) {
+	strict := ParsePrefer([]string{"handling=strict, max-affected=5"})
+	if strict.MaxAffected == nil || *strict.MaxAffected != 5 {
+		t.Fatalf("strict MaxAffected = %v, want 5", strict.MaxAffected)
+	}
+	if got, want := strict.AppliedHeader(), "handling=strict, max-affected=5"; got != want {
+		t.Errorf("strict AppliedHeader = %q, want %q", got, want)
+	}
+
+	lenient := ParsePrefer([]string{"max-affected=5"})
+	if lenient.MaxAffected != nil {
+		t.Errorf("lenient MaxAffected = %v, want nil (ignored)", *lenient.MaxAffected)
+	}
+	if got := lenient.AppliedHeader(); got != "" {
+		t.Errorf("lenient AppliedHeader = %q, want empty", got)
+	}
+}
+
+// TestParsePreferMaxAffectedBadValue checks a non-integer or negative
+// max-affected is an offender (PGRST122 under strict) and leaves the bound unset.
+func TestParsePreferMaxAffectedBadValue(t *testing.T) {
+	for _, v := range []string{"abc", "-1", "1.5", ""} {
+		p := ParsePrefer([]string{"handling=strict, max-affected=" + v})
+		if p.MaxAffected != nil {
+			t.Errorf("max-affected=%q set MaxAffected = %v, want nil", v, *p.MaxAffected)
+		}
+		if p.StrictError() == nil {
+			t.Errorf("max-affected=%q under strict should be a PGRST122 offender", v)
+		}
+	}
+}
+
 func TestAppliedHeaderSkipsUnknownAndEmpty(t *testing.T) {
 	p := ParsePrefer([]string{"return=bogus, frobnicate=yes, count=exact"})
 	if got, want := p.AppliedHeader(), "count=exact"; got != want {

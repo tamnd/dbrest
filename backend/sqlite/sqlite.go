@@ -340,6 +340,11 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 		res.affected, res.hasAff = n, true
 	}
 
+	// Prefer: max-affected rolls an over-broad write back instead of committing.
+	if apiErr := backend.EnforceMaxAffected(q.Write, res.affected, res.hasAff); apiErr != nil {
+		return nil, apiErr
+	}
+
 	// Prefer: tx=rollback returns the computed representation but discards the
 	// work; leaving the transaction for the deferred rollback does exactly that.
 	if q.Write != nil && q.Write.Tx == ir.TxRollback {

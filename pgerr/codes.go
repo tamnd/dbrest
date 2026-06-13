@@ -41,6 +41,7 @@ const (
 	CodeJWTRequired        = "PGRST302" // 401 no token sent and the anonymous role is disabled
 	CodeJWTClaims          = "PGRST303" // 401 JWT claims validation or parsing failed
 	CodeAggregatesOff      = "PGRST123" // 400 aggregate functions used while db-aggregates-enabled is off
+	CodeMaxAffected        = "PGRST124" // 400 mutation/RPC affected more rows than Prefer: max-affected
 	CodeUnsupported        = "PGRST127" // 400 feature not implemented on this backend
 	CodeInternal           = "PGRSTX00" // 500 internal error (upstream group X has only X00)
 	CodeBodyTooLarge       = "PGRSTX13" // 413 request body exceeds the configured max-request-body
@@ -297,6 +298,17 @@ func ErrUnsupported(feature, backend string) *APIError {
 	e := New(http.StatusBadRequest, CodeUnsupported, "Feature not implemented")
 	e = e.WithDetails(fmt.Sprintf("%s is not supported by the %s backend", feature, backend))
 	return e.WithHint("see the capability matrix for supported features on this backend")
+}
+
+// ErrMaxAffected is PGRST124 (400): a write or RPC under Prefer:
+// handling=strict, max-affected=N affected more than N rows, so dbrest rolls the
+// transaction back rather than committing the over-broad change. The message is
+// upstream's; the actual affected count rides as details so the client sees how
+// far over the bound the query reached.
+func ErrMaxAffected(affected int64) *APIError {
+	e := New(http.StatusBadRequest, CodeMaxAffected,
+		"Query result exceeds max-affected preference constraint")
+	return e.WithDetails(fmt.Sprintf("The query affects %d rows", affected))
 }
 
 // ErrAggregatesDisabled is PGRST123, raised when a request uses an aggregate

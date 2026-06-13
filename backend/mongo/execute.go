@@ -100,6 +100,13 @@ func (b *Backend) executeInsert(ctx context.Context, plan *ir.Plan, rc *reqctx.C
 		return res, nil
 	}
 
+	// Prefer: max-affected. MongoDB writes here are not transactional, so the
+	// guard refuses an over-broad insert before any document is written rather
+	// than rolling one back; the would-insert count is known up front.
+	if apiErr := backend.EnforceMaxAffected(q.Write, int64(len(docs)), true); apiErr != nil {
+		return nil, apiErr
+	}
+
 	if len(docs) == 1 {
 		_, err := coll.InsertOne(ctx, docs[0])
 		if err != nil {
@@ -143,6 +150,19 @@ func (b *Backend) executeUpdate(ctx context.Context, plan *ir.Plan, rc *reqctx.C
 	filter := filterDoc(q.Where, colTypes)
 	setDoc := writePayloadToSetDoc(q.Write, plan.Rel)
 
+	// Prefer: max-affected. Without a transaction to roll back, count the
+	// would-update documents first and refuse before touching any when the match
+	// exceeds the bound.
+	if q.Write != nil && q.Write.MaxRows != nil {
+		n, err := coll.CountDocuments(ctx, filter)
+		if err != nil {
+			return nil, b.MapError(err)
+		}
+		if apiErr := backend.EnforceMaxAffected(q.Write, n, true); apiErr != nil {
+			return nil, apiErr
+		}
+	}
+
 	out, err := coll.UpdateMany(ctx, filter, bson.D{{Key: "$set", Value: setDoc}})
 	if err != nil {
 		return nil, b.MapError(err)
@@ -167,6 +187,19 @@ func (b *Backend) executeDelete(ctx context.Context, plan *ir.Plan, rc *reqctx.C
 	res := &bodyResult{controls: rc.Controls(), rows: newDocRowStream(nil)}
 
 	filter := filterDoc(q.Where, colTypes)
+
+	// Prefer: max-affected. Count the would-delete documents and refuse before
+	// removing any when the match exceeds the bound, since the delete cannot be
+	// rolled back.
+	if q.Write != nil && q.Write.MaxRows != nil {
+		n, err := coll.CountDocuments(ctx, filter)
+		if err != nil {
+			return nil, b.MapError(err)
+		}
+		if apiErr := backend.EnforceMaxAffected(q.Write, n, true); apiErr != nil {
+			return nil, apiErr
+		}
+	}
 
 	if q.Write != nil && q.Write.Return == ir.ReturnRepresentation {
 		// Capture rows before deleting.

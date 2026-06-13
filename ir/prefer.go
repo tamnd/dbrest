@@ -1,6 +1,7 @@
 package ir
 
 import (
+	"strconv"
 	"strings"
 
 	"github.com/tamnd/dbrest/pgerr"
@@ -26,6 +27,11 @@ type PreferSet struct {
 	Tx         *TxMode
 	Handling   Handling
 
+	// MaxAffected caps the rows a mutation (or RPC) may affect. It is honored only
+	// under handling=strict; ParsePrefer clears it under lenient so a backend can
+	// enforce on a non-nil pointer alone without consulting Handling.
+	MaxAffected *int64
+
 	// applied maps a preference key to its honored "key=value" token. The header
 	// is emitted in PostgREST's canonical order, not encounter order.
 	applied map[string]string
@@ -38,7 +44,7 @@ type PreferSet struct {
 // here is an unknown preference, an offender under handling=strict.
 var preferKeys = map[string]bool{
 	"return": true, "count": true, "resolution": true,
-	"missing": true, "tx": true, "handling": true,
+	"missing": true, "tx": true, "handling": true, "max-affected": true,
 }
 
 // applyOrder is PostgREST's fixed Preference-Applied ordering. timezone and
@@ -77,6 +83,13 @@ func ParsePrefer(headers []string) PreferSet {
 				p.invalid = append(p.invalid, tok)
 			}
 		}
+	}
+	// max-affected takes effect, and is echoed, only under handling=strict; under
+	// lenient PostgREST ignores it entirely. Clearing both here lets every later
+	// reader treat a non-nil MaxAffected as "enforce this" with no handling check.
+	if p.Handling != HandlingStrict {
+		delete(p.applied, "max-affected")
+		p.MaxAffected = nil
 	}
 	return p
 }
@@ -156,6 +169,12 @@ func (p *PreferSet) set(k, v string) bool {
 		default:
 			return false
 		}
+	case "max-affected":
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 0 {
+			return false
+		}
+		p.MaxAffected = &n
 	}
 	return true
 }

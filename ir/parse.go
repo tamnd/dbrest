@@ -178,6 +178,9 @@ func ParseWrite(kind QueryKind, relation, rawQuery string, preferHeaders []strin
 	if q.Prefer.Tx != nil {
 		w.Tx = *q.Prefer.Tx
 	}
+	// max-affected (strict-only; ParsePrefer cleared it under lenient) bounds the
+	// affected-row count the backend will tolerate before rolling back.
+	w.MaxRows = q.Prefer.MaxAffected
 
 	// PostgREST performs an upsert only for PUT or for a POST carrying a
 	// Prefer: resolution= preference. on_conflict alone leaves a POST a plain

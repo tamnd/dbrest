@@ -84,3 +84,21 @@ type RowStream interface {
 	// Close releases the cursor.
 	Close() error
 }
+
+// EnforceMaxAffected is the Prefer: max-affected contract every write backend
+// shares. WriteSpec.MaxRows is set only under handling=strict (ir.ParsePrefer
+// clears it under lenient), so a non-nil bound always means "enforce". When the
+// mutation affected more rows than the bound, it returns PGRST124; the backend
+// then returns before commit and its deferred rollback discards the over-broad
+// write. It returns nil when no bound is set, the affected count is unknown, or
+// the count is within the bound. Callers must invoke it after the affected count
+// is known and before commit.
+func EnforceMaxAffected(w *ir.WriteSpec, affected int64, hasAffected bool) *pgerr.APIError {
+	if w == nil || w.MaxRows == nil || !hasAffected {
+		return nil
+	}
+	if affected > *w.MaxRows {
+		return pgerr.ErrMaxAffected(affected)
+	}
+	return nil
+}

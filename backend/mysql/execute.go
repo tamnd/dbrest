@@ -123,6 +123,11 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 		return nil, b.MapError(err)
 	}
 
+	// Prefer: max-affected rolls an over-broad write back instead of committing.
+	if apiErr := backend.EnforceMaxAffected(q.Write, res.affected, res.hasAff); apiErr != nil {
+		return nil, apiErr
+	}
+
 	if q.Write != nil && q.Write.Tx == ir.TxRollback {
 		return res, nil
 	}
