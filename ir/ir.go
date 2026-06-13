@@ -51,17 +51,17 @@ type Root struct {
 
 // Query is a /<table> request.
 type Query struct {
-	Kind      QueryKind
-	Relation  Ref
-	Select    []SelectItem
-	Where     *Cond
-	Order     []OrderTerm
-	Limit     *int
-	Offset    *int
-	Embeds    []Embed
-	Write     *WriteSpec // non-nil for Insert/Update/Upsert/Delete
-	Singular  bool
-	Count     CountKind
+	Kind     QueryKind
+	Relation Ref
+	Select   []SelectItem
+	Where    *Cond
+	Order    []OrderTerm
+	Limit    *int
+	Offset   *int
+	Embeds   []Embed
+	Write    *WriteSpec // non-nil for Insert/Update/Upsert/Delete
+	Singular bool
+	Count    CountKind
 	// CountMax is the db-max-rows threshold an estimated count crosses over at: a
 	// backend that supports estimation runs the exact count while the result stays
 	// at or below it and falls back to the planner estimate above it. Zero means no
@@ -82,6 +82,11 @@ type Call struct {
 	Order    []OrderTerm
 	Limit    *int
 	Offset   *int
+	// Embeds are the embedded resources requested on a function returning rows of
+	// a known relation (/rpc/f?select=id,client(*)). They resolve against the
+	// function's result relation exactly as a table read's embeds do; a call over
+	// a function with no relation return carries none.
+	Embeds   []Embed
 	Singular bool
 	Count    CountKind
 	Prefer   PreferSet

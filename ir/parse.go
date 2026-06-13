@@ -313,6 +313,7 @@ func ParseCall(fn, rawQuery string, preferHeaders []string, isGet bool, contentT
 	}
 
 	c.Select, c.Where, c.Order, c.Limit, c.Offset = pq.Select, pq.Where, pq.Order, pq.Limit, pq.Offset
+	c.Embeds = pq.Embeds
 	c.Args = args
 	return c, nil
 }

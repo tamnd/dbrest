@@ -304,7 +304,7 @@ func jsonScalarText(v any) string {
 // volatile function is 405), and validates a post-filter select/where/order
 // against a table return's declared columns. The resolved function and the
 // read-only decision travel on the plan for the backend to lower. See spec 12.
-func Call(reg rpc.Registry, c *ir.Call, isGet bool, searchPath []string) (*ir.Plan, *pgerr.APIError) {
+func Call(reg rpc.Registry, model *schema.Model, c *ir.Call, isGet bool, searchPath []string) (*ir.Plan, *pgerr.APIError) {
 	// On GET the argument-versus-filter split needs the function's parameter
 	// names, which the registry knows by function name (the union across every
 	// overload). A query key naming a parameter is an argument; the rest are
@@ -363,8 +363,68 @@ func Call(reg rpc.Registry, c *ir.Call, isGet bool, searchPath []string) (*ir.Pl
 		return nil, err
 	}
 
+	// A function returning rows of a known relation supports embeds on its result,
+	// resolved the same way a table read's embeds are. A call with embeds over a
+	// function whose result is not a relation has nothing to embed against.
+	if len(c.Embeds) > 0 {
+		if err := resolveCallEmbeds(model, fn, c, searchPath); err != nil {
+			return nil, err
+		}
+	}
+
 	c.ReadOnly = fn.Volatility.ReadOnly()
 	return &ir.Plan{Call: c, Func: fn, ReadOnly: c.ReadOnly}, nil
+}
+
+// returnRelation resolves the relation whose rows a function returns, when its
+// return type names one (returns setof clients, returns clients). A scalar,
+// setof-scalar, anonymous table(...), or void return names no relation, so its
+// result has no relationships to embed against.
+func returnRelation(model *schema.Model, fn *rpc.Function, searchPath []string) (*schema.Relation, bool) {
+	if model == nil {
+		return nil, false
+	}
+	switch fn.Returns.Kind {
+	case rpc.ReturnSetOf, rpc.ReturnScalar:
+		if fn.Returns.Type == "" {
+			return nil, false
+		}
+		return model.Lookup(fn.Returns.Type, searchPath)
+	default:
+		return nil, false
+	}
+}
+
+// resolveCallEmbeds binds an RPC call's embeds against the function's result
+// relation. It mirrors the read path by projecting the call's select/where/order
+// onto a synthetic query over that relation, so resolveEmbeds, the embed-filter
+// reclassification, and related-order validation all apply unchanged. The
+// resolved embeds and any reclassified filter tree are carried back onto the
+// call. A function whose result is not a relation cannot be embedded on, which is
+// the read path's PGRST200.
+func resolveCallEmbeds(model *schema.Model, fn *rpc.Function, c *ir.Call, searchPath []string) *pgerr.APIError {
+	retRel, ok := returnRelation(model, fn, searchPath)
+	if !ok {
+		return pgerr.ErrNoRelationship(fn.Name, c.Embeds[0].Target.Name)
+	}
+	q := &ir.Query{
+		Kind:     ir.Read,
+		Relation: ir.Ref{Schema: retRel.Schema, Name: retRel.Name},
+		Select:   c.Select,
+		Where:    c.Where,
+		Order:    c.Order,
+		Embeds:   c.Embeds,
+	}
+	reclassifyEmbedFilters(q)
+	if err := resolveEmbeds(model, retRel, q, searchPath, false); err != nil {
+		return err
+	}
+	if err := validateRelatedOrder(retRel, q); err != nil {
+		return err
+	}
+	c.Where = q.Where
+	c.Embeds = q.Embeds
+	return nil
 }
 
 // sortedArgNames returns the call's argument names in a stable order, the list

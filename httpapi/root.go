@@ -110,7 +110,7 @@ func (s *Server) serveRootSpec(w http.ResponseWriter, r *http.Request, id identi
 	if s.backend.Capabilities().NativeRPC {
 		planned = &ir.Plan{Call: call, ReadOnly: true}
 	} else {
-		planned, apiErr = plan.Call(s.backend.Functions(), call, true, []string{activeSchema})
+		planned, apiErr = plan.Call(s.backend.Functions(), s.Model(), call, true, []string{activeSchema})
 		if apiErr != nil {
 			writeError(w, apiErr)
 			return

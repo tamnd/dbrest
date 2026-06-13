@@ -29,7 +29,6 @@ import (
 // singularMediaType is the Accept value that asks for a single object.
 const singularMediaType = "application/vnd.pgrst.object+json"
 
-
 // Server holds the resolved schema model and the backend, and serves the API. A
 // verifier, when set, resolves the request role from the JWT; with none, every
 // request runs as the static default role.
@@ -51,8 +50,8 @@ type Server struct {
 	aggregatesOn    bool     // db-aggregates-enabled; aggregates are off by default
 	preRequest      string   // db-pre-request, carried to the backend per request
 	appSettings     map[string]string
-	logQuery        bool // log-query, carried to the backend per request
-	timingEnabled   bool // server-timing-enabled; the Server-Timing header is off by default
+	logQuery        bool     // log-query, carried to the backend per request
+	timingEnabled   bool     // server-timing-enabled; the Server-Timing header is off by default
 	txEnd           ir.TxEnd // db-tx-end; governs whether Prefer: tx= is honored
 }
 
@@ -633,7 +632,7 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 		// read-only transaction fails with SQLSTATE 25006, which maps to 405.
 		planned = &ir.Plan{Call: call, ReadOnly: isGet}
 	} else {
-		planned, apiErr = plan.Call(s.backend.Functions(), call, isGet, []string{activeSchema})
+		planned, apiErr = plan.Call(s.backend.Functions(), s.Model(), call, isGet, []string{activeSchema})
 		if apiErr != nil {
 			writeError(w, apiErr)
 			return
@@ -665,7 +664,15 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 	t.mark("transaction", txStart)
 
 	respStart := time.Now()
-	out, apiErr := renderCall(media, res, planned.Func, fn)
+	var out *rendered
+	if len(call.Embeds) > 0 {
+		// An embedded call returns parent rows with nested resources, the same
+		// row-object shape a table read produces, so the read renderer drives it
+		// with the call's embed columns marked raw.
+		out, apiErr = renderFor(media, res, embedKeysFor(call.Embeds, call.Select))
+	} else {
+		out, apiErr = renderCall(media, res, planned.Func, fn)
+	}
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
@@ -1101,6 +1108,13 @@ func locationHeader(rel *schema.Relation, relation string, res backend.Result) s
 // quoting their text. Nested embeds are already inside their parent's JSON blob,
 // so only the top level matters here.
 func embedKeys(q *ir.Query) map[string]bool {
+	return embedKeysFor(q.Embeds, q.Select)
+}
+
+// embedKeysFor computes the raw-JSON column set from an embed list and select,
+// shared by the table-read path (ir.Query) and the embedded-RPC path (ir.Call),
+// which carry the same two pieces.
+func embedKeysFor(embeds []ir.Embed, sel []ir.SelectItem) map[string]bool {
 	var keys map[string]bool
 	add := func(k string) {
 		if keys == nil {
@@ -1108,8 +1122,8 @@ func embedKeys(q *ir.Query) map[string]bool {
 		}
 		keys[k] = true
 	}
-	for i := range q.Embeds {
-		emb := &q.Embeds[i]
+	for i := range embeds {
+		emb := &embeds[i]
 		// A spread embed lifts its columns flat rather than nesting under a key.
 		// A to-many spread lifts each column as a JSON array, so those lifted
 		// names must render raw; a to-one spread lifts plain scalars that render
@@ -1126,7 +1140,7 @@ func embedKeys(q *ir.Query) map[string]bool {
 	}
 	// A projection ending in -> (data->meta) yields JSON the renderer must splice
 	// verbatim, the same as an embed; a final ->> is text and renders normally.
-	for _, it := range q.Select {
+	for _, it := range sel {
 		if c, ok := it.(ir.Column); ok && c.Last == ir.JSONArrow {
 			add(c.Name())
 		}

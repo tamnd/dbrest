@@ -28,6 +28,19 @@ import (
 // aliased t1, t2, ... as they are emitted, in a stable left-to-right order.
 func compileReadEmbedded(d Dialect, q *ir.Query) (*Statement, *pgerr.APIError) {
 	b := newBuilder(d)
+	return b.writeEmbeddedQuery(q, func() *pgerr.APIError {
+		b.sb.WriteString(b.qualify(q.Relation))
+		return nil
+	})
+}
+
+// writeEmbeddedQuery emits an embedded read: the parent projection (plain columns
+// plus one JSON subquery per embed), a parent source written by writeSource (a
+// base relation for a table read, the wrapped function result for an RPC call),
+// the parent WHERE with one EXISTS per !inner embed, and the order/window. The
+// projection is written before the source so its embed-subquery placeholders bind
+// ahead of the source's, keeping positional arguments in textual order.
+func (b *builder) writeEmbeddedQuery(q *ir.Query, writeSource func() *pgerr.APIError) (*Statement, *pgerr.APIError) {
 	const parentAlias = "t0"
 
 	b.sb.WriteString("SELECT ")
@@ -36,7 +49,9 @@ func compileReadEmbedded(d Dialect, q *ir.Query) (*Statement, *pgerr.APIError) {
 	}
 
 	b.sb.WriteString(" FROM ")
-	b.sb.WriteString(b.qualify(q.Relation))
+	if err := writeSource(); err != nil {
+		return nil, err
+	}
 	b.sb.WriteString(" ")
 	b.sb.WriteString(parentAlias)
 

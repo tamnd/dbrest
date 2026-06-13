@@ -29,6 +29,23 @@ func CompileCall(d Dialect, c *ir.Call, fn *rpc.Function, ctxArgs map[string]any
 	b := newBuilder(d)
 	b.ctxArgs = ctxArgs
 
+	// A call with embeds projects the function's rows as a parent resource and
+	// nests each embedded relation, exactly as a table read does. The function
+	// result is the parent source; bindNamed runs inside the source writer so its
+	// placeholders bind after the projection's, keeping arguments in textual order.
+	if len(c.Embeds) > 0 {
+		return b.writeEmbeddedQuery(callQuery(c), func() *pgerr.APIError {
+			inner, err := b.bindNamed(fn, c.Args)
+			if err != nil {
+				return err
+			}
+			b.sb.WriteString("(")
+			b.sb.WriteString(inner)
+			b.sb.WriteString(")")
+			return nil
+		})
+	}
+
 	inner, err := b.bindNamed(fn, c.Args)
 	if err != nil {
 		return nil, err
@@ -97,9 +114,45 @@ func CompileCallCount(d Dialect, c *ir.Call, fn *rpc.Function, ctxArgs map[strin
 	if err != nil {
 		return nil, err
 	}
+	const alias = "_rpc"
 	b.sb.WriteString("SELECT count(*) FROM (")
 	b.sb.WriteString(inner)
-	b.sb.WriteString(") _rpc")
+	b.sb.WriteString(") ")
+	b.sb.WriteString(alias)
+
+	// A count over an embedded call carries the same parent restriction the row
+	// query does: the post-filter WHERE plus one EXISTS per !inner embed, so the
+	// reported total matches the rows returned.
+	if len(c.Embeds) > 0 {
+		b.qual = alias
+		b.parentRef = alias
+		b.embeds = c.Embeds
+		wrote := false
+		if c.Where != nil {
+			b.sb.WriteString(" WHERE ")
+			if err := b.writeCond(*c.Where); err != nil {
+				return nil, err
+			}
+			wrote = true
+		}
+		for i := range c.Embeds {
+			emb := &c.Embeds[i]
+			if emb.Join != ir.JoinInner {
+				continue
+			}
+			if wrote {
+				b.sb.WriteString(" AND ")
+			} else {
+				b.sb.WriteString(" WHERE ")
+				wrote = true
+			}
+			if err := b.writeEmbedExists(emb, alias); err != nil {
+				return nil, err
+			}
+		}
+		return &Statement{SQL: b.sb.String(), Args: b.args}, nil
+	}
+
 	if fn.Returns.Kind == rpc.ReturnTable && c.Where != nil {
 		b.sb.WriteString(" WHERE ")
 		if err := b.writeCond(*c.Where); err != nil {
@@ -107,6 +160,23 @@ func CompileCallCount(d Dialect, c *ir.Call, fn *rpc.Function, ctxArgs map[strin
 		}
 	}
 	return &Statement{SQL: b.sb.String(), Args: b.args}, nil
+}
+
+// callQuery projects an RPC call's read shape onto an ir.Query so the embedded
+// read writer (shared with table reads) drives the parent projection, filters,
+// ordering, and window. The relation is the function's resolved result relation,
+// already bound onto each embed by the planner; the embedded writer reads the
+// embeds, not q.Relation, so a bare Ref naming the result relation is enough.
+func callQuery(c *ir.Call) *ir.Query {
+	return &ir.Query{
+		Kind:   ir.Read,
+		Select: c.Select,
+		Where:  c.Where,
+		Order:  c.Order,
+		Limit:  c.Limit,
+		Offset: c.Offset,
+		Embeds: c.Embeds,
+	}
 }
 
 // callHasPostFilter reports whether a call carries any clause that wraps the

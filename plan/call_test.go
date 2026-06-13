@@ -26,7 +26,7 @@ func TestCallResolvesFunction(t *testing.T) {
 	c := &ir.Call{Function: ir.Ref{Name: "add_them"}, Args: map[string]ir.Value{
 		"a": {Text: "2"}, "b": {Text: "3"},
 	}}
-	p, err := Call(reg(addThem()), c, true, nil)
+	p, err := Call(reg(addThem()), nil, c, true, nil)
 	if err != nil {
 		t.Fatalf("Call: %v", err)
 	}
@@ -40,7 +40,7 @@ func TestCallResolvesFunction(t *testing.T) {
 
 func TestCallNoFunctionIs404(t *testing.T) {
 	c := &ir.Call{Function: ir.Ref{Name: "nope"}}
-	_, err := Call(reg(addThem()), c, true, nil)
+	_, err := Call(reg(addThem()), nil, c, true, nil)
 	if err == nil || err.Code != "PGRST202" {
 		t.Fatalf("want PGRST202, got %v", err)
 	}
@@ -49,7 +49,7 @@ func TestCallNoFunctionIs404(t *testing.T) {
 func TestCallArgMismatchIs404(t *testing.T) {
 	// add_them needs a and b; only a is supplied.
 	c := &ir.Call{Function: ir.Ref{Name: "add_them"}, Args: map[string]ir.Value{"a": {Text: "2"}}}
-	_, err := Call(reg(addThem()), c, true, nil)
+	_, err := Call(reg(addThem()), nil, c, true, nil)
 	if err == nil || err.Code != "PGRST202" {
 		t.Fatalf("want PGRST202, got %v", err)
 	}
@@ -75,7 +75,7 @@ func TestCallAmbiguousOverloadIs300(t *testing.T) {
 		Query:      &rpc.PortableQuery{SQL: "SELECT 1"},
 	}
 	c := &ir.Call{Function: ir.Ref{Name: "f"}}
-	_, err := Call(reg(left, right), c, true, nil)
+	_, err := Call(reg(left, right), nil, c, true, nil)
 	if err == nil || err.Code != "PGRST203" {
 		t.Fatalf("want PGRST203, got %v", err)
 	}
@@ -92,7 +92,7 @@ func TestCallNoFunctionMessageQualifiedWithHint(t *testing.T) {
 	c := &ir.Call{Function: ir.Ref{Name: "add_them"}, Args: map[string]ir.Value{
 		"a": {Text: "1"}, "c": {Text: "2"},
 	}}
-	_, err := Call(reg(addThem()), c, true, []string{"api"})
+	_, err := Call(reg(addThem()), nil, c, true, []string{"api"})
 	if err == nil || err.Code != "PGRST202" {
 		t.Fatalf("want PGRST202, got %v", err)
 	}
@@ -111,7 +111,7 @@ func TestCallNoFunctionMessageQualifiedWithHint(t *testing.T) {
 // call names a function with no arguments and none is registered.
 func TestCallNoParameterlessMessage(t *testing.T) {
 	c := &ir.Call{Function: ir.Ref{Name: "ghost"}}
-	_, err := Call(reg(addThem()), c, true, []string{"api"})
+	_, err := Call(reg(addThem()), nil, c, true, []string{"api"})
 	if err == nil || err.Code != "PGRST202" {
 		t.Fatalf("want PGRST202, got %v", err)
 	}
@@ -133,7 +133,7 @@ func TestCallGetPartitionsArgsFromFilters(t *testing.T) {
 			"title": {"eq.Arrival"},
 		},
 	}
-	p, err := Call(reg(filmsAfter()), c, true, nil)
+	p, err := Call(reg(filmsAfter()), nil, c, true, nil)
 	if err != nil {
 		t.Fatalf("Call: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestCallGetFilterUnknownColumnRejected(t *testing.T) {
 			"ghost": {"eq.1"},
 		},
 	}
-	_, err := Call(reg(filmsAfter()), c, true, nil)
+	_, err := Call(reg(filmsAfter()), nil, c, true, nil)
 	if err == nil || err.Code != "PGRST204" {
 		t.Fatalf("want PGRST204, got %v", err)
 	}
@@ -184,7 +184,7 @@ func TestCallGetArgTypeCoercion(t *testing.T) {
 		Args:     map[string]ir.Value{"a": {Text: "notanint"}, "b": {Text: "3"}},
 		RawGet:   map[string][]string{"a": {"notanint"}, "b": {"3"}},
 	}
-	_, err := Call(reg(addThem()), c, true, nil)
+	_, err := Call(reg(addThem()), nil, c, true, nil)
 	if err == nil || err.HTTPStatus != 400 {
 		t.Fatalf("want a 400 coercion error, got %v", err)
 	}
@@ -198,7 +198,7 @@ func TestCallGetOnVolatileIs405(t *testing.T) {
 		Query:      &rpc.PortableQuery{SQL: "SELECT 1"},
 	}
 	c := &ir.Call{Function: ir.Ref{Name: "do_thing"}}
-	_, err := Call(reg(vol), c, true, nil)
+	_, err := Call(reg(vol), nil, c, true, nil)
 	if err == nil || err.Code != "PGRST101" {
 		t.Fatalf("want PGRST101, got %v", err)
 	}
@@ -215,7 +215,7 @@ func TestCallPostOnVolatileIsAllowed(t *testing.T) {
 		Query:      &rpc.PortableQuery{SQL: "SELECT 1"},
 	}
 	c := &ir.Call{Function: ir.Ref{Name: "do_thing"}}
-	p, err := Call(reg(vol), c, false, nil)
+	p, err := Call(reg(vol), nil, c, false, nil)
 	if err != nil {
 		t.Fatalf("Call: %v", err)
 	}
@@ -237,7 +237,7 @@ func TestCallPostFilterUnknownColumn(t *testing.T) {
 		Args:     map[string]ir.Value{"y": {Text: "2000"}},
 		Select:   []ir.SelectItem{ir.Column{Path: []string{"bogus"}}},
 	}
-	_, err := Call(reg(tab), c, true, nil)
+	_, err := Call(reg(tab), nil, c, true, nil)
 	if err == nil || err.Code != "PGRST204" {
 		t.Fatalf("want PGRST204, got %v", err)
 	}
@@ -256,7 +256,7 @@ func TestCallPostFilterKnownColumnOK(t *testing.T) {
 		Args:     map[string]ir.Value{"y": {Text: "2000"}},
 		Select:   []ir.SelectItem{ir.Column{Path: []string{"title"}}},
 	}
-	if _, err := Call(reg(tab), c, true, nil); err != nil {
+	if _, err := Call(reg(tab), nil, c, true, nil); err != nil {
 		t.Fatalf("Call: %v", err)
 	}
 }
@@ -292,7 +292,7 @@ func TestCallPostFilterWhereTreeKnownColumns(t *testing.T) {
 			ir.Not{Kid: ir.Compare{Path: []string{"id"}, Op: ir.OpEq, Value: ir.Value{Text: "0"}}},
 		}},
 	}})
-	if _, err := Call(reg(filmsAfter()), callWith(where), true, nil); err != nil {
+	if _, err := Call(reg(filmsAfter()), nil, callWith(where), true, nil); err != nil {
 		t.Fatalf("Call with a valid filter tree: %v", err)
 	}
 }
@@ -312,7 +312,7 @@ func TestCallPostFilterWhereTreeUnknownColumn(t *testing.T) {
 	}
 	for name, where := range cases {
 		t.Run(name, func(t *testing.T) {
-			_, err := Call(reg(filmsAfter()), callWith(where), true, nil)
+			_, err := Call(reg(filmsAfter()), nil, callWith(where), true, nil)
 			if err == nil || err.Code != "PGRST204" {
 				t.Fatalf("want PGRST204, got %v", err)
 			}
@@ -327,7 +327,7 @@ func TestCallPostFilterOrderUnknownColumn(t *testing.T) {
 		Args:     map[string]ir.Value{"y": {Text: "2000"}},
 		Order:    []ir.OrderTerm{{Path: []string{"ghost"}}},
 	}
-	_, err := Call(reg(filmsAfter()), c, true, nil)
+	_, err := Call(reg(filmsAfter()), nil, c, true, nil)
 	if err == nil || err.Code != "PGRST204" {
 		t.Fatalf("want PGRST204, got %v", err)
 	}
@@ -342,7 +342,7 @@ func TestCallScalarReturnSkipsFilterValidation(t *testing.T) {
 		Args:     map[string]ir.Value{"a": {Text: "1"}, "b": {Text: "2"}},
 		Where:    &where,
 	}
-	if _, err := Call(reg(addThem()), c, true, nil); err != nil {
+	if _, err := Call(reg(addThem()), nil, c, true, nil); err != nil {
 		t.Fatalf("scalar return should not validate post-filter columns: %v", err)
 	}
 }
