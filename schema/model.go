@@ -86,8 +86,25 @@ type Relation struct {
 	// from the FTS5 virtual tables that shadow a base table; an engine with
 	// column-agnostic full-text (PostgreSQL's tsvector) leaves it empty.
 	FullText []*FullTextIndex
+	// ViewColumns maps this view's output columns to the base-relation columns
+	// they project, when the relation is a view whose definition the introspector
+	// resolved to simple base-column references. It is empty for tables and for
+	// views the introspector does not project (UNIONs, expression columns). The
+	// model projects base-table foreign keys onto the view through it, so a view
+	// embeds the way the base table does (spec 09).
+	ViewColumns []ViewColumn
 
 	byName map[string]*Column
+}
+
+// ViewColumn records that a view's output column projects one base-relation
+// column. The introspector emits these by parsing the view definition; the model
+// uses them to carry base-table foreign keys onto the view.
+type ViewColumn struct {
+	Name         string // the view's output column name
+	BaseSchema   string
+	BaseRelation string
+	BaseColumn   string
 }
 
 // Column is one attribute of a relation.
@@ -146,6 +163,7 @@ func NewModel(rels []*Relation) *Model {
 		}
 		m.relations[key] = r
 	}
+	m.projectViews()
 	return m
 }
 

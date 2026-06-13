@@ -30,6 +30,22 @@ type ForeignKey struct {
 	RefSchema   string
 	RefRelation string
 	RefColumns  []string
+	// SourceRelation, when set, is the base relation this foreign key was
+	// projected from onto a view. It makes the base table name an extra
+	// disambiguation hint for the view's relationship, the third hint kind
+	// PostgREST documents for view-sourced edges (spec 09).
+	SourceRelation string
+}
+
+// hintNames is the set of disambiguation names a derived edge over this foreign
+// key exposes: the constraint name, each participating column, and, for a foreign
+// key projected onto a view, the base table name.
+func (fk *ForeignKey) hintNames() []string {
+	hints := append([]string{fk.Name}, fk.Columns...)
+	if fk.SourceRelation != "" {
+		hints = append(hints, fk.SourceRelation)
+	}
+	return hints
 }
 
 // references reports whether this foreign key points at the given relation.
@@ -86,7 +102,7 @@ func (m *Model) Relationships(parent *Relation, targetName string, searchPath []
 				Target:  target,
 				Local:   fk.Columns,
 				Foreign: fk.RefColumns,
-				hints:   append([]string{fk.Name}, fk.Columns...),
+				hints:   fk.hintNames(),
 			})
 		}
 	}
@@ -107,7 +123,7 @@ func (m *Model) Relationships(parent *Relation, targetName string, searchPath []
 				Target:  target,
 				Local:   fk.RefColumns,
 				Foreign: fk.Columns,
-				hints:   append([]string{fk.Name}, fk.Columns...),
+				hints:   fk.hintNames(),
 			})
 		}
 	}

@@ -25,6 +25,8 @@ func (b *Backend) Introspect(ctx context.Context) (*schema.Model, error) {
 	ftsByContent, excluded := classifyFTS(rels)
 
 	out := make([]*schema.Relation, 0, len(rels))
+	colsByName := make(map[string][]*schema.Column, len(rels))
+	ddlByName := make(map[string]string, len(rels))
 	for _, r := range rels {
 		if excluded[r.name] {
 			continue
@@ -41,6 +43,8 @@ func (b *Backend) Introspect(ctx context.Context) (*schema.Model, error) {
 		if err != nil {
 			return nil, err
 		}
+		colsByName[r.name] = cols
+		ddlByName[r.name] = r.sql
 		out = append(out, &schema.Relation{
 			Name:        r.name,
 			Kind:        r.kind,
@@ -50,6 +54,28 @@ func (b *Backend) Introspect(ctx context.Context) (*schema.Model, error) {
 			ForeignKeys: fks,
 			FullText:    ftsByContent[r.name],
 		})
+	}
+	// Second pass: parse each view's definition into the base-column mapping the
+	// model projects foreign keys through (spec 09). It runs after the first pass
+	// so a view referencing a base table defined later in the catalog still
+	// resolves. The parser is conservative: it maps only the views it can trace to
+	// plain base columns and leaves the rest empty, so the model inherits nothing
+	// where provenance is uncertain, the same as PostgREST skips a UNION.
+	baseCols := func(name string) ([]string, bool) {
+		cols, ok := colsByName[name]
+		if !ok {
+			return nil, false
+		}
+		names := make([]string, len(cols))
+		for i, c := range cols {
+			names[i] = c.Name
+		}
+		return names, true
+	}
+	for _, r := range out {
+		if r.Kind == schema.KindView {
+			r.ViewColumns = parseViewColumns(ddlByName[r.Name], baseCols)
+		}
 	}
 	return schema.NewModel(out), nil
 }
