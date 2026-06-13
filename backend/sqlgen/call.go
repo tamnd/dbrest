@@ -164,7 +164,7 @@ func (b *builder) argValue(fn *rpc.Function, name string, args map[string]ir.Val
 	}
 	// A required parameter with no argument cannot happen: Lookup only returns an
 	// overload whose required parameters are all present. Guard anyway.
-	return "", pgerr.ErrNoFunction(fn.Name)
+	return "", pgerr.ErrInternal("rpc call is missing required parameter :" + name)
 }
 
 // singleObjectArgs implements the single-unnamed-argument form: a function whose

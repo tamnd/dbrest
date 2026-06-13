@@ -440,7 +440,7 @@ func rpcName(path string) (string, bool) {
 // method is not allowed on a function. See spec 12-rpc.
 func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id identity, activeSchema string) {
 	if fn == "" || strings.Contains(fn, "/") {
-		writeError(w, pgerr.ErrNoFunction(fn))
+		writeError(w, pgerr.ErrNoFunction(activeSchema, fn, nil, ""))
 		return
 	}
 

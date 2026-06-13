@@ -132,8 +132,28 @@ type Registry interface {
 	// set present in the request. The bool is false when no overload matches; the
 	// caller raises PGRST202.
 	Lookup(name string, args ArgSet) (*Function, bool)
+	// Resolve is Lookup that also reports ambiguity: it returns the chosen overload
+	// (ok true), or ok false with the competing signatures when two overloads are
+	// equally good (the caller raises PGRST203), or ok false with no signatures
+	// when none match (PGRST202). Lookup is Resolve collapsed to (fn, ok).
+	Resolve(name string, args ArgSet) (fn *Function, ambiguous []string, ok bool)
 	// List enumerates the exposed functions in a stable order, for OpenAPI.
 	List() []*Function
+}
+
+// Signature renders the function as PostgREST spells it in a PGRST202/PGRST203
+// message: name(param => type, ...), or name() when it takes no parameters. The
+// schema, when given, qualifies the name (api.add(...)).
+func (f *Function) Signature(schemaName string) string {
+	name := f.Name
+	if schemaName != "" {
+		name = schemaName + "." + name
+	}
+	parts := make([]string, len(f.Params))
+	for i, p := range f.Params {
+		parts[i] = p.Name + " => " + p.Type
+	}
+	return name + "(" + strings.Join(parts, ", ") + ")"
 }
 
 // StaticRegistry is a portable registry built in memory: one or more overloads
@@ -165,12 +185,23 @@ func NewStaticRegistry(fns []*Function) *StaticRegistry {
 // declare. Among satisfiable overloads it prefers an exact parameter-set match,
 // then the most specific (largest required set), deterministically.
 func (r *StaticRegistry) Lookup(name string, args ArgSet) (*Function, bool) {
+	fn, _, ok := r.Resolve(name, args)
+	return fn, ok
+}
+
+// Resolve selects the overload for an argument set and reports ambiguity. It
+// scores every satisfiable overload (an exact parameter-set match wins outright,
+// then the largest required set), and when two overloads tie at the top score it
+// returns them as competing signatures instead of silently picking one, so the
+// caller raises PGRST203 the way PostgREST does for unresolvable overloads.
+func (r *StaticRegistry) Resolve(name string, args ArgSet) (*Function, []string, bool) {
 	cands := r.byName[name]
 	if len(cands) == 0 {
-		return nil, false
+		return nil, nil, false
 	}
 	var best *Function
 	bestScore := -1
+	var tied []*Function
 	for _, f := range cands {
 		if !satisfiable(f, args) {
 			continue
@@ -179,14 +210,25 @@ func (r *StaticRegistry) Lookup(name string, args ArgSet) (*Function, bool) {
 		if exactMatch(f, args) {
 			score += 1000 // an exact parameter-set match wins outright
 		}
-		if score > bestScore {
-			best, bestScore = f, score
+		switch {
+		case score > bestScore:
+			best, bestScore, tied = f, score, []*Function{f}
+		case score == bestScore:
+			tied = append(tied, f)
 		}
 	}
 	if best == nil {
-		return nil, false
+		return nil, nil, false
 	}
-	return best, true
+	if len(tied) > 1 {
+		sigs := make([]string, len(tied))
+		for i, f := range tied {
+			sigs[i] = f.Signature("")
+		}
+		sort.Strings(sigs)
+		return nil, sigs, false
+	}
+	return best, nil, true
 }
 
 // List returns the functions in stable name order (overloads in declared order).
@@ -329,6 +371,11 @@ type EmptyRegistry struct{}
 
 // Lookup always misses: an empty registry has no functions.
 func (EmptyRegistry) Lookup(string, ArgSet) (*Function, bool) { return nil, false }
+
+// Resolve always misses with no ambiguity: an empty registry has no functions.
+func (EmptyRegistry) Resolve(string, ArgSet) (*Function, []string, bool) {
+	return nil, nil, false
+}
 
 // List returns no functions.
 func (EmptyRegistry) List() []*Function { return nil }

@@ -139,10 +139,27 @@ func ErrAmbiguousEmbed(parent, target string) *APIError {
 		fmt.Sprintf("Could not embed because more than one relationship was found for '%s' and '%s'", parent, target))
 }
 
-// ErrNoFunction is raised when no function matches the name and argument set.
-func ErrNoFunction(name string) *APIError {
-	return New(http.StatusNotFound, CodeNoFunction,
-		fmt.Sprintf("Could not find the function '%s' in the schema cache", name))
+// ErrNoFunction is raised when no function matches the name and argument set. It
+// names the function schema-qualified with the argument list that was searched
+// for ("public.add(a, b)"), or the "without parameters" form when the call
+// supplied none, the way PostgREST spells PGRST202. A non-empty hint (the nearest
+// registered signature) is attached so the caller sees the closest match.
+func ErrNoFunction(schemaName, name string, argNames []string, hint string) *APIError {
+	qualified := name
+	if schemaName != "" {
+		qualified = schemaName + "." + name
+	}
+	var msg string
+	if len(argNames) == 0 {
+		msg = fmt.Sprintf("Could not find the function %s without parameters in the schema cache", qualified)
+	} else {
+		msg = fmt.Sprintf("Could not find the function %s(%s) in the schema cache", qualified, strings.Join(argNames, ", "))
+	}
+	e := New(http.StatusNotFound, CodeNoFunction, msg)
+	if hint != "" {
+		e = e.WithHint(hint)
+	}
+	return e
 }
 
 // ErrAmbiguousFunction is raised when more than one overload of a function

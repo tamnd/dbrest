@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 
 	"github.com/tamnd/dbrest/ir"
@@ -298,9 +299,17 @@ func Call(reg rpc.Registry, c *ir.Call, isGet bool, searchPath []string) (*ir.Pl
 	for name := range c.Args {
 		args[name] = true
 	}
-	fn, ok := reg.Lookup(c.Function.Name, args)
+	activeSchema := ""
+	if len(searchPath) > 0 {
+		activeSchema = searchPath[0]
+	}
+	fn, ambiguous, ok := reg.Resolve(c.Function.Name, args)
 	if !ok {
-		return nil, pgerr.ErrNoFunction(c.Function.Name)
+		if len(ambiguous) > 0 {
+			return nil, pgerr.ErrAmbiguousFunction(ambiguous)
+		}
+		argNames := sortedArgNames(c.Args)
+		return nil, pgerr.ErrNoFunction(activeSchema, c.Function.Name, argNames, nearestSignature(reg, activeSchema, c.Function.Name, args))
 	}
 
 	// A read method may only call a read-only function; a write-capable function
@@ -320,6 +329,46 @@ func Call(reg rpc.Registry, c *ir.Call, isGet bool, searchPath []string) (*ir.Pl
 
 	c.ReadOnly = fn.Volatility.ReadOnly()
 	return &ir.Plan{Call: c, Func: fn, ReadOnly: c.ReadOnly}, nil
+}
+
+// sortedArgNames returns the call's argument names in a stable order, the list
+// PostgREST echoes in a PGRST202 message.
+func sortedArgNames(args map[string]ir.Value) []string {
+	out := make([]string, 0, len(args))
+	for name := range args {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// nearestSignature returns the registered overload of the same name whose
+// parameter set is closest to the requested arguments, rendered as a "Perhaps you
+// meant to call ..." hint. It returns an empty string when nothing of that name
+// is registered, so the caller attaches no hint.
+func nearestSignature(reg rpc.Registry, schemaName, name string, args rpc.ArgSet) string {
+	var best *rpc.Function
+	bestScore := -1
+	for _, f := range reg.List() {
+		if f.Name != name {
+			continue
+		}
+		score := 0
+		for _, p := range f.Params {
+			if args[p.Name] {
+				score++
+			} else {
+				score-- // a parameter the call did not supply is a small mismatch
+			}
+		}
+		if score > bestScore {
+			best, bestScore = f, score
+		}
+	}
+	if best == nil {
+		return ""
+	}
+	return "Perhaps you meant to call the function " + best.Signature(schemaName)
 }
 
 // validateCallFilters checks an RPC call's post-filter columns against a table

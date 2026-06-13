@@ -116,6 +116,69 @@ func TestEmptyRegistry(t *testing.T) {
 	}
 }
 
+// TestResolveAmbiguousOverloads checks that two overloads tying at the top score
+// resolve to PGRST203 input: ok false with both competing signatures, rather than
+// silently picking one. Two single-optional-parameter overloads called with no
+// arguments are each satisfiable with the same (zero required) score.
+func TestResolveAmbiguousOverloads(t *testing.T) {
+	left := &Function{Name: "f", Params: []Param{{Name: "a", Optional: true}}}
+	right := &Function{Name: "f", Params: []Param{{Name: "b", Optional: true}}}
+	reg := NewStaticRegistry([]*Function{left, right})
+
+	fn, ambiguous, ok := reg.Resolve("f", ArgSet{})
+	if ok || fn != nil {
+		t.Fatalf("Resolve f() = %v, ok %v, want ambiguous miss", fn, ok)
+	}
+	want := []string{"f(a => )", "f(b => )"}
+	if !reflect.DeepEqual(ambiguous, want) {
+		t.Errorf("ambiguous = %v, want %v", ambiguous, want)
+	}
+}
+
+// TestResolveExactWinsOverAmbiguous checks that an exact parameter-set match
+// breaks a tie outright: f(a,b) and f(a,c) both take two arguments, but calling
+// with exactly {a,b} names f(a,b)'s parameters and no other's.
+func TestResolveExactWinsOverAmbiguous(t *testing.T) {
+	ab := &Function{Name: "f", Params: []Param{{Name: "a"}, {Name: "b"}}}
+	ac := &Function{Name: "f", Params: []Param{{Name: "a"}, {Name: "c"}}}
+	reg := NewStaticRegistry([]*Function{ab, ac})
+
+	fn, ambiguous, ok := reg.Resolve("f", ArgSet{"a": true, "b": true})
+	if !ok || fn != ab || ambiguous != nil {
+		t.Fatalf("Resolve f(a,b) = %v, ambiguous %v, ok %v", fn, ambiguous, ok)
+	}
+}
+
+// TestResolveUnknownName checks an unknown name misses cleanly (PGRST202 input):
+// ok false with no competing signatures.
+func TestResolveUnknownName(t *testing.T) {
+	reg := NewStaticRegistry(nil)
+	fn, ambiguous, ok := reg.Resolve("nope", nil)
+	if ok || fn != nil || ambiguous != nil {
+		t.Errorf("Resolve(nope) = %v, %v, %v", fn, ambiguous, ok)
+	}
+}
+
+// TestSignature checks the PostgREST-style rendering used in PGRST202/PGRST203
+// messages: schema-qualified name with each parameter as "name => type", and the
+// parameterless form collapsing to name().
+func TestSignature(t *testing.T) {
+	f := &Function{Name: "add", Params: []Param{
+		{Name: "a", Type: "int4"},
+		{Name: "b", Type: "int4"},
+	}}
+	if got := f.Signature("api"); got != "api.add(a => int4, b => int4)" {
+		t.Errorf("Signature = %q", got)
+	}
+	if got := f.Signature(""); got != "add(a => int4, b => int4)" {
+		t.Errorf("unqualified Signature = %q", got)
+	}
+	none := &Function{Name: "now"}
+	if got := none.Signature("api"); got != "api.now()" {
+		t.Errorf("parameterless Signature = %q", got)
+	}
+}
+
 // TestParseRegistryComment checks a declaration's comment field rides into the
 // Function, where the OpenAPI generator reads it.
 func TestParseRegistryComment(t *testing.T) {

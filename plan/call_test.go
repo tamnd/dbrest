@@ -1,6 +1,7 @@
 package plan
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/tamnd/dbrest/ir"
@@ -51,6 +52,71 @@ func TestCallArgMismatchIs404(t *testing.T) {
 	_, err := Call(reg(addThem()), c, true, nil)
 	if err == nil || err.Code != "PGRST202" {
 		t.Fatalf("want PGRST202, got %v", err)
+	}
+}
+
+// TestCallAmbiguousOverloadIs300 checks that two overloads tying at the top score
+// surface as PGRST203 (a 300) carrying both competing signatures, rather than the
+// planner silently picking one. Two single-optional-parameter overloads called
+// with no arguments are equally good.
+func TestCallAmbiguousOverloadIs300(t *testing.T) {
+	left := &rpc.Function{
+		Name:       "f",
+		Params:     []rpc.Param{{Name: "a", Type: "integer", Optional: true}},
+		Returns:    rpc.ReturnShape{Kind: rpc.ReturnScalar},
+		Volatility: rpc.Immutable,
+		Query:      &rpc.PortableQuery{SQL: "SELECT 1"},
+	}
+	right := &rpc.Function{
+		Name:       "f",
+		Params:     []rpc.Param{{Name: "b", Type: "integer", Optional: true}},
+		Returns:    rpc.ReturnShape{Kind: rpc.ReturnScalar},
+		Volatility: rpc.Immutable,
+		Query:      &rpc.PortableQuery{SQL: "SELECT 1"},
+	}
+	c := &ir.Call{Function: ir.Ref{Name: "f"}}
+	_, err := Call(reg(left, right), c, true, nil)
+	if err == nil || err.Code != "PGRST203" {
+		t.Fatalf("want PGRST203, got %v", err)
+	}
+	if err.HTTPStatus != 300 {
+		t.Errorf("status = %d, want 300", err.HTTPStatus)
+	}
+}
+
+// TestCallNoFunctionMessageQualifiedWithHint checks the PGRST202 message names the
+// function schema-qualified with the searched argument list, and that an overload
+// of the same name rides along as the nearest-signature hint.
+func TestCallNoFunctionMessageQualifiedWithHint(t *testing.T) {
+	// add_them(a, b) exists; the call supplies (a, c), matching neither overload.
+	c := &ir.Call{Function: ir.Ref{Name: "add_them"}, Args: map[string]ir.Value{
+		"a": {Text: "1"}, "c": {Text: "2"},
+	}}
+	_, err := Call(reg(addThem()), c, true, []string{"api"})
+	if err == nil || err.Code != "PGRST202" {
+		t.Fatalf("want PGRST202, got %v", err)
+	}
+	if want := "api.add_them(a, c)"; !strings.Contains(err.Message, want) {
+		t.Errorf("message = %q, want it to mention %q", err.Message, want)
+	}
+	if err.Hint == nil {
+		t.Fatal("PGRST202 should carry a nearest-signature hint")
+	}
+	if want := "add_them(a => integer, b => integer)"; !strings.Contains(*err.Hint, want) {
+		t.Errorf("hint = %q, want it to mention %q", *err.Hint, want)
+	}
+}
+
+// TestCallNoParameterlessMessage checks the "without parameters" phrasing when the
+// call names a function with no arguments and none is registered.
+func TestCallNoParameterlessMessage(t *testing.T) {
+	c := &ir.Call{Function: ir.Ref{Name: "ghost"}}
+	_, err := Call(reg(addThem()), c, true, []string{"api"})
+	if err == nil || err.Code != "PGRST202" {
+		t.Fatalf("want PGRST202, got %v", err)
+	}
+	if want := "api.ghost without parameters"; !strings.Contains(err.Message, want) {
+		t.Errorf("message = %q, want it to mention %q", err.Message, want)
 	}
 }
 

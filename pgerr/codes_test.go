@@ -30,7 +30,7 @@ func TestConstructorStatusAndCode(t *testing.T) {
 		{"undefined-column", ErrUndefinedColumn("todos.nope"), http.StatusBadRequest, CodeUndefinedColumn},
 		{"no-relationship", ErrNoRelationship("films", "actors"), http.StatusBadRequest, CodeNoRelationship},
 		{"ambiguous-embed", ErrAmbiguousEmbed("films", "actors"), http.StatusMultipleChoices, CodeAmbiguousEmbed},
-		{"no-function", ErrNoFunction("add"), http.StatusNotFound, CodeNoFunction},
+		{"no-function", ErrNoFunction("public", "add", []string{"a", "b"}, ""), http.StatusNotFound, CodeNoFunction},
 		{"ambiguous-function", ErrAmbiguousFunction([]string{"api.add(a => integer)", "api.add(a => text)"}), http.StatusMultipleChoices, CodeAmbiguousFunc},
 		{"invalid-path", ErrInvalidPath(), http.StatusNotFound, CodeInvalidPath},
 		{"guc-headers", ErrInvalidResponseHeaders(), http.StatusInternalServerError, CodeGucHeaders},
