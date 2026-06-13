@@ -50,7 +50,18 @@ func (b *Backend) Execute(ctx context.Context, plan *ir.Plan, rc *reqctx.Context
 // completes its batch before the main query is issued, so Parse runs as the
 // request role, which has the required privileges.
 func (b *Backend) executeRead(ctx context.Context, plan *ir.Plan, rc *reqctx.Context) (backend.Result, error) {
-	tx, err := b.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	txOpts := pgx.TxOptions{AccessMode: pgx.ReadOnly}
+	// A counted read runs the count and the page as two statements. At READ
+	// COMMITTED each takes its own snapshot, so a concurrent write between them can
+	// make the Content-Range total disagree with the rows returned. PostgREST
+	// reads both from one statement, hence one snapshot; pinning the transaction to
+	// REPEATABLE READ gives the two statements that same single snapshot. A
+	// read-only REPEATABLE READ transaction never raises a serialization error, so
+	// this only fixes consistency without adding a failure mode.
+	if plan.Query.Count != ir.CountNone {
+		txOpts.IsoLevel = pgx.RepeatableRead
+	}
+	tx, err := b.pool.BeginTx(ctx, txOpts)
 	if err != nil {
 		return nil, b.MapError(err)
 	}

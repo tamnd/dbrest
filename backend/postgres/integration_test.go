@@ -660,6 +660,70 @@ func TestIntegrationWideEmbed(t *testing.T) {
 	}
 }
 
+// TestIntegrationCountedReadConsistent exercises the counted-read path, which
+// runs the count and the page as two statements. The fix pins that transaction
+// to REPEATABLE READ so both statements read one snapshot, the way PostgREST's
+// single statement does. The test seeds a known set, reads it with a page
+// smaller than the total, and proves the exact count reports the whole set while
+// the page honours the limit. Finding P11.
+func TestIntegrationCountedReadConsistent(t *testing.T) {
+	be := openBE(t)
+	ctx := context.Background()
+
+	if _, err := be.Pool().Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS _dbrest_test_counted (id serial PRIMARY KEY);
+		TRUNCATE _dbrest_test_counted;
+		INSERT INTO _dbrest_test_counted SELECT generate_series(1, 7)`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, "DROP TABLE IF EXISTS _dbrest_test_counted")
+	})
+
+	model, err := be.Introspect(ctx)
+	if err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+	rel, ok := model.Lookup("_dbrest_test_counted", []string{"public"})
+	if !ok {
+		t.Fatal("_dbrest_test_counted not found")
+	}
+
+	plan := &ir.Plan{
+		Rel: rel,
+		Query: &ir.Query{
+			Kind:     ir.Read,
+			Relation: ir.Ref{Schema: "public", Name: "_dbrest_test_counted"},
+			Select:   []ir.SelectItem{ir.Column{Path: []string{"id"}}},
+			Limit:    intPtr(3),
+			Count:    ir.CountExact,
+		},
+	}
+
+	res, err := be.Execute(ctx, plan, &reqctx.Context{Method: "GET", Path: "/_dbrest_test_counted"})
+	if err != nil {
+		t.Fatalf("Execute(counted read): %v", err)
+	}
+	if c, ok := res.Count(); !ok || c != 7 {
+		t.Errorf("Count = (%d, %v), want (7, true) over the whole set", c, ok)
+	}
+	rs := res.Rows()
+	defer rs.Close()
+	page := 0
+	for rs.Next() {
+		if _, err := rs.Values(); err != nil {
+			t.Fatalf("Values: %v", err)
+		}
+		page++
+	}
+	if err := rs.Err(); err != nil {
+		t.Fatalf("row error: %v", err)
+	}
+	if page != 3 {
+		t.Errorf("page returned %d rows, want 3 (the limit)", page)
+	}
+}
+
 func condPtr(c ir.Cond) *ir.Cond { return &c }
 func intPtr(n int) *int          { return &n }
 
