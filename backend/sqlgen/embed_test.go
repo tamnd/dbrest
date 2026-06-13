@@ -387,6 +387,60 @@ func TestEmbedStarProjectsAllColumns(t *testing.T) {
 	}
 }
 
+// An empty-parenthesis embed, director(), joins for filtering but is not
+// projected: the parent select carries no key for it, the opposite of an absent
+// or star projection which takes every column (item 07.8).
+func TestEmbedEmptySelectHidesKey(t *testing.T) {
+	m := embedModel()
+	q := &ir.Query{
+		Relation: ir.Ref{Schema: "public", Name: "films"},
+		Select: []ir.SelectItem{
+			ir.Column{Path: []string{"title"}},
+			ir.EmbedRef{Index: 0},
+		},
+		Embeds: []ir.Embed{{
+			OutKey:      "director",
+			EmptySelect: true,
+			Target:      ir.Ref{Schema: "public", Name: "directors"},
+			Rel:         relate(t, m, "films", "directors"),
+		}},
+	}
+	got := compileEmbed(t, q).SQL
+	if strings.Contains(got, `"director"`) {
+		t.Errorf("empty-paren embed should project no key, got %q", got)
+	}
+	if !strings.HasPrefix(got, `SELECT t0."title" FROM`) {
+		t.Errorf("parent should project only its own columns, got %q", got)
+	}
+}
+
+// An empty-parenthesis embed marked !inner still restricts the parent through
+// EXISTS even though it projects nothing: the filter-without-fetch idiom.
+func TestEmbedEmptySelectInnerStillFilters(t *testing.T) {
+	m := embedModel()
+	q := &ir.Query{
+		Relation: ir.Ref{Schema: "public", Name: "films"},
+		Select: []ir.SelectItem{
+			ir.Column{Path: []string{"title"}},
+			ir.EmbedRef{Index: 0},
+		},
+		Embeds: []ir.Embed{{
+			OutKey:      "director",
+			EmptySelect: true,
+			Join:        ir.JoinInner,
+			Target:      ir.Ref{Schema: "public", Name: "directors"},
+			Rel:         relate(t, m, "films", "directors"),
+		}},
+	}
+	got := compileEmbed(t, q).SQL
+	if strings.Contains(got, `"director"`) {
+		t.Errorf("empty-paren embed should project no key, got %q", got)
+	}
+	if !strings.Contains(got, `WHERE EXISTS (SELECT 1 FROM "public"."directors"`) {
+		t.Errorf("!inner empty-paren embed should still filter the parent, got %q", got)
+	}
+}
+
 // A spread embed is not yet lowered to SQL; it must report PGRST127 rather than
 // emit something wrong.
 func TestEmbedSpreadUnsupported(t *testing.T) {

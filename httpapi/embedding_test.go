@@ -318,6 +318,51 @@ func TestRelatedOrderToManyHTTP(t *testing.T) {
 	}
 }
 
+// An empty-parenthesis embed hides the key from the response while still joining
+// the relation: director() returns films without a director field, the opposite
+// of director(*) (item 07.8).
+func TestRelatedEmptySelectHidesKey(t *testing.T) {
+	srv := newEmbedServer(t)
+	resp := do(t, srv, http.MethodGet, "/films?select=title,director:directors()&id=eq.1", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	rows := decodeArray(t, resp)
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	if _, has := rows[0]["director"]; has {
+		t.Errorf("director() should hide the key, got %#v", rows[0])
+	}
+	if rows[0]["title"] != "Metropolis" {
+		t.Errorf("title = %v, want Metropolis", rows[0]["title"])
+	}
+}
+
+// An !inner empty-parenthesis embed prunes parents with no related row while
+// still projecting nothing: the directorless film drops out, and no director key
+// appears on those that remain.
+func TestRelatedEmptySelectInnerFilters(t *testing.T) {
+	srv := newEmbedServer(t)
+	resp := do(t, srv, http.MethodGet, "/films?select=title,directors!inner()&order=id", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	rows := decodeArray(t, resp)
+	// Four films, but only three have a director; the inner join drops Untitled.
+	if len(rows) != 3 {
+		t.Fatalf("got %d rows, want 3 (directorless film dropped)", len(rows))
+	}
+	for _, r := range rows {
+		if _, has := r["directors"]; has {
+			t.Errorf("empty-paren embed should hide its key, got %#v", r)
+		}
+		if r["title"] == "Untitled" {
+			t.Errorf("Untitled has no director and should have been filtered out")
+		}
+	}
+}
+
 func BenchmarkEmbedToMany(b *testing.B) {
 	srv := newEmbedServer(b)
 	req := httptest.NewRequest(http.MethodGet, "/directors?select=name,films(title)&order=id", nil)
