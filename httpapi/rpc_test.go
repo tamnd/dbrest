@@ -3,6 +3,7 @@ package httpapi_test
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -322,6 +323,52 @@ func TestRPCScalarJSONReturnsRaw(t *testing.T) {
 	}
 	if doc["a"] != float64(1) {
 		t.Errorf("body = %v", doc)
+	}
+}
+
+// TestRPCVoidReturns200Null pins the void contract: PostgREST answers a
+// void-returning function with 200 and a null JSON body, never 204. The function
+// runs its side effect (an INSERT here) and the response carries null.
+func TestRPCVoidReturns200Null(t *testing.T) {
+	dsn := "file:" + strings.ReplaceAll(t.Name(), "/", "_") + "?mode=memory&cache=shared"
+	be, err := sqlite.Open(dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { be.Close() })
+	if _, err := be.DB().Exec(`
+		CREATE TABLE films (id INTEGER PRIMARY KEY, title TEXT NOT NULL, year INTEGER);
+	`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	be.Register(rpc.NewStaticRegistry([]*rpc.Function{{
+		Name:       "touch_film",
+		Returns:    rpc.ReturnShape{Kind: rpc.ReturnVoid},
+		Volatility: rpc.Volatile,
+		Query:      &rpc.PortableQuery{SQL: `INSERT INTO films(id, title, year) VALUES (999, 'Void', 2000)`},
+	}}))
+	model, err := be.Introspect(context.Background())
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+	srv := httpapi.NewServer(be, model, nil)
+	srv.SetDefaultRole("anon")
+
+	resp := send(t, srv, http.MethodPost, "/rpc/touch_film", `{}`, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if got := strings.TrimSpace(string(body)); got != "null" {
+		t.Errorf("body = %q, want null", got)
+	}
+	// The side effect ran: the row is present.
+	var n int
+	if err := be.DB().QueryRow(`SELECT count(*) FROM films WHERE id = 999`).Scan(&n); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("void function side effect did not persist: count = %d", n)
 	}
 }
 

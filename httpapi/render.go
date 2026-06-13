@@ -72,6 +72,8 @@ func renderCall(media string, res backend.Result, fn *rpc.Function, fnName strin
 		}
 	} else if fn.Returns.Kind == rpc.ReturnTable {
 		return renderFor(media, res, nil)
+	} else if fn.Returns.Kind == rpc.ReturnVoid {
+		return renderVoid(res)
 	}
 	switch media {
 	case mediaCSV:
@@ -144,6 +146,27 @@ func renderCall(media string, res backend.Result, fn *rpc.Function, fnName strin
 	}
 	out.body = body
 	return out, nil
+}
+
+// renderVoid shapes a void-returning function: PostgREST answers 200 with a null
+// JSON body, never 204, so dbrest pins the same contract across backends rather
+// than letting a portable scalar-with-no-rows or a native 204 special case decide
+// it. The result is drained so the statement runs to completion, then discarded.
+func renderVoid(res backend.Result) (*rendered, *pgerr.APIError) {
+	rs := res.Rows()
+	defer rs.Close()
+	for rs.Next() {
+		if _, err := rs.Values(); err != nil {
+			return nil, pgerr.ErrInternal(err.Error())
+		}
+	}
+	if err := rs.Err(); err != nil {
+		return nil, pgerr.ErrInternal(err.Error())
+	}
+	return &rendered{
+		body:        []byte("null"),
+		contentType: "application/json; charset=utf-8",
+	}, nil
 }
 
 // rawJSONValue embeds a json-declared scalar verbatim. An engine expression

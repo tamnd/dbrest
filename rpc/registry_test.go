@@ -179,6 +179,26 @@ func TestSignature(t *testing.T) {
 	}
 }
 
+// TestParseRegistryVoidKind checks a "void" return declaration decodes to the
+// void kind, which the renderer answers with 200 and a null body.
+func TestParseRegistryVoidKind(t *testing.T) {
+	reg, err := ParseRegistry(`[{
+		"name": "touch",
+		"sql": "insert into log default values",
+		"returns": {"kind": "void"}
+	}]`)
+	if err != nil {
+		t.Fatalf("ParseRegistry: %v", err)
+	}
+	f, ok := reg.Lookup("touch", ArgSet{})
+	if !ok {
+		t.Fatal("touch not found")
+	}
+	if f.Returns.Kind != ReturnVoid {
+		t.Errorf("return kind = %v, want ReturnVoid", f.Returns.Kind)
+	}
+}
+
 // TestParseRegistryComment checks a declaration's comment field rides into the
 // Function, where the OpenAPI generator reads it.
 func TestParseRegistryComment(t *testing.T) {

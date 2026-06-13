@@ -49,6 +49,7 @@ const (
 	ReturnScalar ReturnKind = iota // returns <type>      -> a single value
 	ReturnSetOf                    // returns setof <type> -> an array of values
 	ReturnTable                    // returns table(...)   -> an array of objects
+	ReturnVoid                     // returns void        -> 200 with a null body
 )
 
 // ReturnShape is a function's declared result. Type is the canonical type of a
@@ -340,6 +341,8 @@ func ParseRegistry(rawJSON string) (*StaticRegistry, error) {
 		}
 		var ret ReturnShape
 		switch strings.ToLower(d.Returns.Kind) {
+		case "void":
+			ret.Kind = ReturnVoid
 		case "setof":
 			ret.Kind = ReturnSetOf
 		case "table":
