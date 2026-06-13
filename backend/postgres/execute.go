@@ -266,7 +266,15 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 		return nil, apiErr
 	}
 
-	if plan.ReadOnly {
+	// On the native path the access mode follows volatility, not only the method:
+	// PostgREST runs a STABLE or IMMUTABLE function read-only even on POST, and
+	// only a VOLATILE function read-write. The registry path already set plan.ReadOnly
+	// from volatility (plan.Func != nil), so only the native path needs the check.
+	readOnly := plan.ReadOnly
+	if plan.Func == nil {
+		readOnly = b.nativeCallReadOnly(plan, rc)
+	}
+	if readOnly {
 		return b.executeCallRead(ctx, plan, rc, st)
 	}
 

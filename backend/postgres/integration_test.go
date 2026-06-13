@@ -955,6 +955,91 @@ func TestIntegrationSearchPathReachesExtra(t *testing.T) {
 	}
 }
 
+// TestIntegrationNativeCallVolatilityAccessMode proves the native RPC access mode
+// follows the function's volatility, not only the HTTP method: a POST to a STABLE
+// or IMMUTABLE function runs in a read-only transaction, while a VOLATILE function
+// runs read-write, matching PostgREST's access-mode table. Each function reports
+// current_setting('transaction_read_only') so the transaction mode is observed
+// directly, and a volatile insert proves the read-write path still commits.
+// Finding 02-P06. Verified against PostgREST 14.12.
+func TestIntegrationNativeCallVolatilityAccessMode(t *testing.T) {
+	be := openBE(t)
+	ctx := context.Background()
+
+	if _, err := be.Pool().Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS _dbrest_test_vol (n int);
+		TRUNCATE _dbrest_test_vol;
+		CREATE OR REPLACE FUNCTION public._dbrest_txmode_v() RETURNS text
+			LANGUAGE sql VOLATILE AS $$ SELECT current_setting('transaction_read_only') $$;
+		CREATE OR REPLACE FUNCTION public._dbrest_txmode_s() RETURNS text
+			LANGUAGE sql STABLE AS $$ SELECT current_setting('transaction_read_only') $$;
+		CREATE OR REPLACE FUNCTION public._dbrest_vol_insert(x int) RETURNS int
+			LANGUAGE sql VOLATILE AS $$ INSERT INTO _dbrest_test_vol VALUES (x) RETURNING n $$`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, `DROP FUNCTION IF EXISTS public._dbrest_txmode_v();
+			DROP FUNCTION IF EXISTS public._dbrest_txmode_s();
+			DROP FUNCTION IF EXISTS public._dbrest_vol_insert(int);
+			DROP TABLE IF EXISTS _dbrest_test_vol`)
+	})
+
+	// Refresh the catalog so the new functions' volatility is loaded.
+	if _, err := be.Introspect(ctx); err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+
+	txmode := func(fn, method string) string {
+		t.Helper()
+		plan := &ir.Plan{
+			ReadOnly: method == "GET",
+			Call:     &ir.Call{Function: ir.Ref{Name: fn}, Args: map[string]ir.Value{}},
+		}
+		res, err := be.Execute(ctx, plan, &reqctx.Context{Method: method, Path: "/rpc/" + fn})
+		if err != nil {
+			t.Fatalf("Execute(%s %s): %v", method, fn, err)
+		}
+		rs := res.Rows()
+		defer rs.Close()
+		if !rs.Next() {
+			t.Fatalf("Execute(%s %s): no rows", method, fn)
+		}
+		vals, err := rs.Values()
+		if err != nil {
+			t.Fatalf("Values(%s %s): %v", method, fn, err)
+		}
+		return vals[0].(string)
+	}
+
+	// POST to a VOLATILE function runs read-write; POST to a STABLE function runs
+	// read-only (the fix); GET to either is read-only.
+	if got := txmode("_dbrest_txmode_v", "POST"); got != "off" {
+		t.Errorf("volatile POST transaction_read_only = %q, want off", got)
+	}
+	if got := txmode("_dbrest_txmode_s", "POST"); got != "on" {
+		t.Errorf("stable POST transaction_read_only = %q, want on (read-only)", got)
+	}
+	if got := txmode("_dbrest_txmode_s", "GET"); got != "on" {
+		t.Errorf("stable GET transaction_read_only = %q, want on", got)
+	}
+
+	// The read-write path still commits: a volatile insert via POST persists.
+	volPlan := &ir.Plan{Call: &ir.Call{
+		Function: ir.Ref{Name: "_dbrest_vol_insert"},
+		Args:     map[string]ir.Value{"x": {Text: "7"}},
+	}}
+	if _, err := be.Execute(ctx, volPlan, &reqctx.Context{Method: "POST", Path: "/rpc/_dbrest_vol_insert"}); err != nil {
+		t.Fatalf("volatile insert POST: %v", err)
+	}
+	var n int
+	if err := be.Pool().QueryRow(ctx, "SELECT count(*) FROM _dbrest_test_vol").Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("after volatile insert POST rows = %d, want 1", n)
+	}
+}
+
 func condPtr(c ir.Cond) *ir.Cond { return &c }
 func intPtr(n int) *int          { return &n }
 

@@ -38,6 +38,7 @@ type Backend struct {
 	searchPath      []string
 	extraSearchPath []string       // db-extra-search-path, appended after the active schema
 	loc             *time.Location // server TimeZone, for rendering timestamptz like PostgREST
+	funcVol         map[string]rpc.Volatility // "schema.name" -> volatility, for native RPC access mode
 }
 
 // Open connects to PostgreSQL by connection string (a libpq URI or keyword/value

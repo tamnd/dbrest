@@ -29,6 +29,15 @@ func (b *Backend) Introspect(ctx context.Context) (*schema.Model, error) {
 	}
 	fksByRel := groupFKs(fks)
 
+	// Function volatility drives the native RPC transaction access mode (a STABLE
+	// or IMMUTABLE function runs read-only even on POST), so it is loaded here with
+	// the rest of the catalog and refreshed whenever the model is rebuilt.
+	vol, err := b.loadFunctionVolatility(ctx, schemas)
+	if err != nil {
+		return nil, err
+	}
+	b.funcVol = vol
+
 	var out []*schema.Relation
 	for _, r := range rels {
 		cols, pk, err := b.columns(ctx, r.oid)
