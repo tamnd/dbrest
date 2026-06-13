@@ -869,6 +869,9 @@ func parseColumnItem(raw string) (Column, *pgerr.APIError) {
 		if col.Cast == "" {
 			return Column{}, pgerr.ErrParse("empty cast target")
 		}
+		if !validCastType(col.Cast) {
+			return Column{}, pgerr.ErrParse("invalid cast target " + col.Cast)
+		}
 	}
 	// alias: leading name before a single ':' (not '::', already stripped). The
 	// split is quote-aware so an aliased or target name may itself contain a colon
@@ -884,6 +887,32 @@ func parseColumnItem(raw string) (Column, *pgerr.APIError) {
 	col.Path = path
 	col.Last = last
 	return col, nil
+}
+
+// validCastType reports whether a ::cast target is a safe type name. PostgREST
+// does not whitelist cast targets; it lets PostgreSQL resolve the name (money,
+// interval, an enum, a domain, an array type), so the backend passes the type
+// through verbatim. Because the type is spliced into SQL rather than bound, the
+// grammar is restricted to what a real type spelling needs so nothing breaks out
+// of the cast: letters, digits, underscore, spaces (double precision, time
+// without time zone), a dot for schema qualification, parentheses and commas for
+// precision/scale (numeric(10,2)), and brackets for arrays (int[]). The first
+// character must begin an identifier. Anything else (a quote, a semicolon, an
+// operator) is a parse error rather than a silent rewrite.
+func validCastType(s string) bool {
+	for i, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r == '_':
+			// always allowed
+		case r >= '0' && r <= '9', r == ' ', r == '.', r == '(', r == ')', r == ',', r == '[', r == ']':
+			if i == 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // parsePath splits a column reference with optional JSON arrows into hops.

@@ -130,15 +130,18 @@ func (Dialect) JSONAgg(elem, orderBy string) string {
 
 // Cast translates a canonical type to a PostgreSQL ::type cast, the form PG
 // itself uses. The expression is parenthesized so the cast binds to the whole
-// expression, not just its tail. An unknown canonical type falls back to text,
-// which is the safe rendering for an opaque value.
+// expression, not just its tail. The type name is passed through to PostgreSQL
+// after the parser has validated it against a safe grammar (ir.validCastType),
+// so casts to money, interval, an enum, a domain, or an array type resolve the
+// same way they do under PostgREST rather than degrading to text.
 func (Dialect) Cast(expr, canonicalType string) string {
 	return "(" + expr + ")::" + pgType(canonicalType)
 }
 
-// pgType maps a canonical type name to its PostgreSQL spelling. The canonical
-// names are the PG type names already in most cases, so the map mostly
-// normalizes aliases (int->int4, bool->boolean stays bool) to one spelling.
+// pgType normalizes a handful of canonical aliases to one PostgreSQL spelling
+// (int->int4 and friends) and passes every other type name through unchanged.
+// The name has already been validated as a safe type spelling by the parser, so
+// PostgreSQL resolves it directly the way PostgREST relies on.
 func pgType(canonical string) string {
 	switch canonical {
 	case "int", "integer", "int4":
@@ -172,7 +175,7 @@ func pgType(canonical string) string {
 	case "jsonb":
 		return "jsonb"
 	default:
-		return "text"
+		return canonical
 	}
 }
 

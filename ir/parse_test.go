@@ -37,6 +37,34 @@ func TestParseSelectAliasAndCast(t *testing.T) {
 	}
 }
 
+// A cast target is spliced into SQL, not bound, so the parser validates it
+// against a safe type grammar: real type spellings pass, anything that could
+// break out of the cast is a PGRST100 parse error. PostgREST itself does not
+// whitelist the type name, so every well-formed spelling must survive.
+func TestParseSelectCastValidation(t *testing.T) {
+	ok := []string{
+		"price::money", "d::interval", "raw::bytea", "ip::inet",
+		"m::mood", "n::numeric(10,2)", "tags::int[]", "c::public.color",
+		"t::double precision",
+	}
+	for _, item := range ok {
+		if _, err := ParseRead("films", "select="+item, nil); err != nil {
+			t.Errorf("select=%s: unexpected error %v", item, err)
+		}
+	}
+	bad := []string{
+		"x::te'xt", "x::text;drop", "x::text--", "x::int*2", "x::1nt", "x::ta\\b",
+	}
+	for _, item := range bad {
+		_, err := ParseRead("films", "select="+item, nil)
+		if err == nil {
+			t.Errorf("select=%s: want parse error, got none", item)
+		} else if err.Code != "PGRST100" {
+			t.Errorf("select=%s: code = %s, want PGRST100", item, err.Code)
+		}
+	}
+}
+
 func TestParseSelectJSONPath(t *testing.T) {
 	q := mustRead(t, "select=data->meta->>id")
 	c := q.Select[0].(Column)
