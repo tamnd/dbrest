@@ -75,6 +75,16 @@ func (b *Backend) executeRead(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 
 	res := &streamResult{ctx: ctx, tx: tx, controls: rc.Controls(), loc: b.loc}
 
+	// db-pre-request runs inside applySession and may have set response.status or
+	// response.headers (PostgREST lets the pre-request hook steer any response,
+	// including a plain GET). Those headers must be read before the body streams, so
+	// read them now: the GUCs are already set, and a table SELECT does not set them
+	// itself, so reading here captures the same value PostgREST would.
+	if err := readResponseControls(ctx, tx, res.controls); err != nil {
+		rollback()
+		return nil, b.MapError(err)
+	}
+
 	if plan.Query.Count != ir.CountNone {
 		total, err := b.computeCount(ctx, tx, plan.Query)
 		if err != nil {
@@ -332,19 +342,25 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 
 // executeCallRead handles a stable/immutable function in a read-only transaction.
 // An optional count runs as a separate statement before the function call itself.
+//
+// Unlike a table read, the rows are buffered rather than streamed: a function
+// invoked through GET can still set response.status or response.headers (the
+// documented Cache-Control and 418 patterns), and those GUCs must be read back
+// before the response is sent. Buffering lets readResponseControls run after the
+// rows are drained and before the transaction commits, the same shape the write
+// and volatile-call paths use; RPC results are small, so this costs little.
 func (b *Backend) executeCallRead(ctx context.Context, plan *ir.Plan, rc *reqctx.Context, st *sqlgen.Statement) (backend.Result, error) {
 	tx, err := b.pool.BeginTx(ctx, b.txOptions(rc, pgx.ReadOnly))
 	if err != nil {
 		return nil, b.MapError(err)
 	}
-	rollback := func() { _ = tx.Rollback(ctx) }
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	if err := applySession(ctx, tx, b, rc); err != nil {
-		rollback()
 		return nil, b.MapError(err)
 	}
 
-	res := &streamResult{ctx: ctx, tx: tx, controls: rc.Controls(), loc: b.loc}
+	res := &bufResult{controls: rc.Controls()}
 
 	if plan.Call.Count != ir.CountNone {
 		var (
@@ -357,11 +373,9 @@ func (b *Backend) executeCallRead(ctx context.Context, plan *ir.Plan, rc *reqctx
 			cst, apiErr = b.compileNativeCallCount(plan.Call, b.callSchema(rc))
 		}
 		if apiErr != nil {
-			rollback()
 			return nil, apiErr
 		}
 		if err := tx.QueryRow(ctx, cst.SQL, cst.Args...).Scan(&res.count); err != nil {
-			rollback()
 			return nil, b.MapError(err)
 		}
 		res.hasCount = true
@@ -369,11 +383,34 @@ func (b *Backend) executeCallRead(ctx context.Context, plan *ir.Plan, rc *reqctx
 
 	rows, err := tx.Query(ctx, st.SQL, st.Args...)
 	if err != nil {
-		rollback()
 		return nil, b.MapError(err)
 	}
-	res.rows = rows
-	res.cols = fieldNames(rows)
+	isVoid := isVoidResult(rows)
+	cols := fieldNames(rows)
+	buf, err := drainRows(rows, b.loc)
+	if err != nil {
+		return nil, b.MapError(err)
+	}
+	res.cols, res.rows = cols, buf
+
+	// Read response.status / response.headers a stable function may have set, then
+	// lift any portable-registry reserved control columns, matching the volatile
+	// and write paths so a GET to a function steers its response the same way.
+	if err := readResponseControls(ctx, tx, res.controls); err != nil {
+		return nil, b.MapError(err)
+	}
+	var ctrlErr *pgerr.APIError
+	res.cols, res.rows, ctrlErr = backend.LiftResponseControls(res.cols, res.rows, res.controls)
+	if ctrlErr != nil {
+		return nil, ctrlErr
+	}
+	if isVoid && res.controls.Status == 0 {
+		res.controls.Status = 204
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, b.MapError(err)
+	}
 	return res, nil
 }
 

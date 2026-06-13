@@ -1128,6 +1128,127 @@ func TestIntegrationImpersonatedRoleSettings(t *testing.T) {
 	}
 }
 
+// TestIntegrationReadCallResponseControls proves a STABLE function reached over GET
+// can still steer its response: response.status and response.headers it sets are
+// read back and folded into the response controls. Before the fix the read-call
+// path streamed straight from the cursor and never called readResponseControls, so
+// the GUCs a function set on a GET were silently dropped. Finding 02-P05.
+func TestIntegrationReadCallResponseControls(t *testing.T) {
+	be := openBE(t)
+	ctx := context.Background()
+
+	// A STABLE function (so the call runs read-only, the path under test) that sets a
+	// status override and a Cache-Control response header the PostgREST way: a JSON
+	// array of single-key name->value objects in response.headers.
+	if _, err := be.Pool().Exec(ctx, `
+		CREATE OR REPLACE FUNCTION public._dbrest_resp_ctl() RETURNS text
+			LANGUAGE plpgsql STABLE AS $$
+		BEGIN
+			PERFORM set_config('response.status', '205', true);
+			PERFORM set_config('response.headers', '[{"Cache-Control": "max-age=60"}]', true);
+			RETURN 'ok';
+		END $$`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, `DROP FUNCTION IF EXISTS public._dbrest_resp_ctl()`)
+	})
+
+	if _, err := be.Introspect(ctx); err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+
+	plan := &ir.Plan{ReadOnly: true, Call: &ir.Call{
+		Function: ir.Ref{Name: "_dbrest_resp_ctl"},
+		Args:     map[string]ir.Value{},
+	}}
+	rc := &reqctx.Context{Method: "GET", Path: "/rpc/_dbrest_resp_ctl"}
+	res, err := be.Execute(ctx, plan, rc)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	ctrl := res.ResponseControls()
+	if ctrl.Status != 205 {
+		t.Errorf("response status override = %d, want 205", ctrl.Status)
+	}
+	if got := ctrl.Headers["Cache-Control"]; got != "max-age=60" {
+		t.Errorf("Cache-Control header = %q, want max-age=60", got)
+	}
+
+	// The body still carries the function's return value.
+	rs := res.Rows()
+	defer rs.Close()
+	if !rs.Next() {
+		t.Fatal("Execute: no rows")
+	}
+	vals, err := rs.Values()
+	if err != nil {
+		t.Fatalf("Values: %v", err)
+	}
+	if vals[0].(string) != "ok" {
+		t.Errorf("body = %q, want ok", vals[0].(string))
+	}
+}
+
+// TestIntegrationReadTablePreRequestControls proves a db-pre-request function can
+// steer the response of a plain GET table read: a header it sets via
+// response.headers is read back before the body streams. Before the fix the
+// table-read path streamed from the cursor and never read the response GUCs, so a
+// pre-request that set a header on a GET was silently dropped. Finding 02-P05.
+func TestIntegrationReadTablePreRequestControls(t *testing.T) {
+	be := openBE(t)
+	ctx := context.Background()
+
+	if _, err := be.Pool().Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS _dbrest_test_pr (id serial PRIMARY KEY, val text);
+		TRUNCATE _dbrest_test_pr;
+		INSERT INTO _dbrest_test_pr (val) VALUES ('a');
+		CREATE OR REPLACE FUNCTION public._dbrest_pre() RETURNS void
+			LANGUAGE plpgsql AS $$
+		BEGIN
+			PERFORM set_config('response.headers', '[{"X-Pre": "ran"}]', true);
+		END $$`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, `DROP FUNCTION IF EXISTS public._dbrest_pre();
+			DROP TABLE IF EXISTS _dbrest_test_pr`)
+	})
+
+	model, err := be.Introspect(ctx)
+	if err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+	rel, ok := model.Lookup("_dbrest_test_pr", []string{"public"})
+	if !ok {
+		t.Fatal("_dbrest_test_pr not found")
+	}
+
+	rc := &reqctx.Context{Method: "GET", Path: "/_dbrest_test_pr", PreRequest: "_dbrest_pre"}
+	readPlan := &ir.Plan{
+		Rel: rel,
+		Query: &ir.Query{
+			Kind:     ir.Read,
+			Relation: ir.Ref{Schema: "public", Name: "_dbrest_test_pr"},
+			Select:   []ir.SelectItem{ir.Column{Path: []string{"val"}}},
+		},
+	}
+	res, err := be.Execute(ctx, readPlan, rc)
+	if err != nil {
+		t.Fatalf("Execute(read): %v", err)
+	}
+	if got := res.ResponseControls().Headers["X-Pre"]; got != "ran" {
+		t.Errorf("X-Pre header = %q, want ran (pre-request header dropped on table read)", got)
+	}
+	// The body still streams the row.
+	rs := res.Rows()
+	defer rs.Close()
+	if !rs.Next() {
+		t.Fatal("read returned no rows")
+	}
+}
+
 func condPtr(c ir.Cond) *ir.Cond { return &c }
 func intPtr(n int) *int          { return &n }
 
