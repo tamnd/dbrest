@@ -300,3 +300,127 @@ func TestRelationshipsSelfJunctionTwoKeys(t *testing.T) {
 		t.Errorf("friend_id hint matched %d edges, want 1", matched)
 	}
 }
+
+// TestDeclaredRelationshipAddsEdge covers 01.10: a declared relationship makes an
+// edge embeddable where no foreign key derives one. Here directors and actors
+// share no key, but a declared edge connects them as the planner would resolve it.
+func TestDeclaredRelationshipAddsEdge(t *testing.T) {
+	m := buildEmbedModel()
+	m.AddDeclaredRelationship(DeclaredRel{
+		Name:         "favorite_actor",
+		ParentSchema: "public", ParentName: "directors",
+		TargetSchema: "public", TargetName: "actors",
+		Card:    CardToOne,
+		Local:   []string{"id"},
+		Foreign: []string{"id"},
+	})
+	cands, _ := m.Relationships(rel(t, m, "directors"), "actors", []string{"public"})
+	if len(cands) != 1 {
+		t.Fatalf("got %d candidates, want 1", len(cands))
+	}
+	if cands[0].Name != "favorite_actor" || cands[0].Card != CardToOne {
+		t.Errorf("edge = %q %v, want favorite_actor to-one", cands[0].Name, cands[0].Card)
+	}
+}
+
+// TestDeclaredRelationshipOverridesDerived covers the 01.10 override rule: a
+// computed/declared edge whose name equals a derived edge replaces it, so the
+// derived cardinality and join give way to the declared one.
+func TestDeclaredRelationshipOverridesDerived(t *testing.T) {
+	m := buildEmbedModel()
+	// The derived forward edge films->directors is named films_director_id_fkey
+	// and is to-one. Override it with a declared edge of the same name.
+	m.AddDeclaredRelationship(DeclaredRel{
+		Name:         "films_director_id_fkey",
+		ParentSchema: "public", ParentName: "films",
+		TargetSchema: "public", TargetName: "directors",
+		Card:    CardToMany, // deliberately different from the derived to-one
+		Local:   []string{"director_id"},
+		Foreign: []string{"id"},
+	})
+	cands, _ := m.Relationships(rel(t, m, "films"), "directors", []string{"public"})
+	if len(cands) != 1 {
+		t.Fatalf("got %d candidates, want 1 (override, not addition)", len(cands))
+	}
+	if cands[0].Card != CardToMany {
+		t.Errorf("Card = %v, want to-many (declared edge overrides derived)", cands[0].Card)
+	}
+}
+
+// TestDeclaredRelationshipDisambiguatesSelfFK covers the recursive-embed escape
+// hatch from 01.10: a self-referential foreign key derives forward and backward
+// edges that share a hint set, so a declared edge with its own name is the only
+// way to name one direction unambiguously.
+func TestDeclaredRelationshipDisambiguatesSelfFK(t *testing.T) {
+	comments := &Relation{
+		Schema:     "public",
+		Name:       "comments",
+		Columns:    cols("id", "parent_id", "body"),
+		PrimaryKey: []string{"id"},
+		ForeignKeys: []*ForeignKey{{
+			Name: "comments_parent_id_fkey", Columns: []string{"parent_id"},
+			RefSchema: "public", RefRelation: "comments", RefColumns: []string{"id"},
+		}},
+	}
+	m := NewModel([]*Relation{comments})
+	// Without a declared edge the self FK yields two edges (parent and children
+	// views) that a hint cannot separate.
+	base, _ := m.Relationships(rel(t, m, "comments"), "comments", []string{"public"})
+	if len(base) != 2 {
+		t.Fatalf("self FK derived %d edges, want 2 (the ambiguous pair)", len(base))
+	}
+
+	m.AddDeclaredRelationship(DeclaredRel{
+		Name:         "children",
+		ParentSchema: "public", ParentName: "comments",
+		TargetSchema: "public", TargetName: "comments",
+		Card:    CardToMany,
+		Local:   []string{"id"},
+		Foreign: []string{"parent_id"},
+	})
+	cands, _ := m.Relationships(rel(t, m, "comments"), "comments", []string{"public"})
+	matched := cands[:0:0]
+	for _, c := range cands {
+		if c.MatchesHint("children") {
+			matched = append(matched, c)
+		}
+	}
+	if len(matched) != 1 {
+		t.Fatalf("children hint matched %d edges, want 1", len(matched))
+	}
+	if matched[0].Card != CardToMany {
+		t.Errorf("Card = %v, want to-many", matched[0].Card)
+	}
+}
+
+// TestDeclaredManyToManyJunction covers a declared edge that crosses a junction,
+// the FK-less backend's path to a many-to-many embed (spec 09).
+func TestDeclaredManyToManyJunction(t *testing.T) {
+	authors := &Relation{Schema: "public", Name: "authors", Columns: cols("id", "name")}
+	books := &Relation{Schema: "public", Name: "books", Columns: cols("id", "title")}
+	authorship := &Relation{Schema: "public", Name: "authorship", Columns: cols("author_id", "book_id")}
+	m := NewModel([]*Relation{authors, books, authorship})
+	m.AddDeclaredRelationship(DeclaredRel{
+		Name:         "books",
+		ParentSchema: "public", ParentName: "authors",
+		TargetSchema: "public", TargetName: "books",
+		Card:           CardToMany,
+		Local:          []string{"id"},
+		Foreign:        []string{"id"},
+		JunctionSchema: "public",
+		JunctionName:   "authorship",
+		JLocal:         []string{"author_id"},
+		JForeign:       []string{"book_id"},
+	})
+	cands, _ := m.Relationships(rel(t, m, "authors"), "books", []string{"public"})
+	if len(cands) != 1 {
+		t.Fatalf("got %d candidates, want 1", len(cands))
+	}
+	c := cands[0]
+	if c.Junction == nil || c.Junction.Name != "authorship" {
+		t.Fatalf("Junction = %v, want authorship", c.Junction)
+	}
+	if c.JLocal[0] != "author_id" || c.JForeign[0] != "book_id" {
+		t.Errorf("junction hops = %v / %v, want author_id / book_id", c.JLocal, c.JForeign)
+	}
+}

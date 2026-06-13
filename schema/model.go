@@ -30,6 +30,21 @@ type Model struct {
 	// schemaComments holds the database comment on each exposed schema, the
 	// source of the OpenAPI info title and description (first line and rest).
 	schemaComments map[string]string
+	// declared holds relationships supplied outside the catalog: config-declared
+	// edges on an FK-less backend (MongoDB) and emulated computed relationships.
+	// The planner treats them like derived edges; a declared edge whose name
+	// equals a derived one overrides it (spec 09). Empty on a pure catalog model.
+	declared []DeclaredRel
+}
+
+// AddDeclaredRelationship registers a relationship that does not come from a
+// foreign key: a config-declared edge or an emulated computed relationship. It
+// is called during introspection or config load, before the model is published.
+// The planner resolves it alongside catalog edges, and it overrides a derived
+// edge of the same name, the way a computed relationship overrides an
+// auto-detected one in PostgREST (spec 09).
+func (m *Model) AddDeclaredRelationship(d DeclaredRel) {
+	m.declared = append(m.declared, d)
 }
 
 // SetSchemaComment records a schema's database comment. It is called during

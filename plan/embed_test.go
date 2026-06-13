@@ -93,3 +93,66 @@ func TestEmbedUnknownColumnInEmbedIsRejected(t *testing.T) {
 		t.Fatalf("want PGRST204, got %v", err)
 	}
 }
+
+// commentsModel is a self-referential thread: comments.parent_id references
+// comments.id, so the derived forward (parent) and backward (children) edges
+// share a hint set and a bare or hinted embed is ambiguous (PGRST201).
+func commentsModel() *schema.Model {
+	comments := &schema.Relation{
+		Name: "comments",
+		Columns: []*schema.Column{
+			{Name: "id", Type: "integer", Position: 1},
+			{Name: "parent_id", Type: "integer", Position: 2},
+			{Name: "body", Type: "text", Position: 3},
+		},
+		PrimaryKey: []string{"id"},
+		ForeignKeys: []*schema.ForeignKey{
+			{Name: "comments_parent_id_fkey", Columns: []string{"parent_id"}, RefRelation: "comments", RefColumns: []string{"id"}},
+		},
+	}
+	return schema.NewModel([]*schema.Relation{comments})
+}
+
+// TestEmbedSelfReferentialIsAmbiguous covers 01.10: a self FK alone leaves the
+// recursive embed ambiguous, with no hint able to pick a direction.
+func TestEmbedSelfReferentialIsAmbiguous(t *testing.T) {
+	m := commentsModel()
+	q, perr := ir.ParseRead("comments", "select=body,comments(body)", nil)
+	if perr != nil {
+		t.Fatalf("ParseRead: %v", perr)
+	}
+	_, err := Read(m, q, nil, Options{})
+	if err == nil || err.Code != "PGRST201" {
+		t.Fatalf("want PGRST201, got %v", err)
+	}
+}
+
+// TestEmbedDeclaredEdgeResolvesRecursive covers the 01.10 escape hatch: a
+// declared computed relationship names one direction of the self FK, so the
+// recursive embed resolves and binds with the declared cardinality.
+func TestEmbedDeclaredEdgeResolvesRecursive(t *testing.T) {
+	m := commentsModel()
+	m.AddDeclaredRelationship(schema.DeclaredRel{
+		Name:         "children",
+		ParentSchema: "", ParentName: "comments",
+		TargetSchema: "", TargetName: "comments",
+		Card:    schema.CardToMany,
+		Local:   []string{"id"},
+		Foreign: []string{"parent_id"},
+	})
+	q, perr := ir.ParseRead("comments", "select=body,children:comments!children(body)", nil)
+	if perr != nil {
+		t.Fatalf("ParseRead: %v", perr)
+	}
+	pl, err := Read(m, q, nil, Options{})
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	emb := pl.Query.Embeds[0]
+	if emb.Rel == nil || emb.Rel.Name != "children" {
+		t.Fatalf("embed edge = %v, want children", emb.Rel)
+	}
+	if emb.Cardinality != ir.CardToMany {
+		t.Errorf("cardinality = %v, want to-many", emb.Cardinality)
+	}
+}

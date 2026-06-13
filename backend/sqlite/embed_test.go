@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -293,4 +294,66 @@ func execReadResolved(t *testing.T, b *Backend, q *ir.Query) []map[string]any {
 		t.Fatalf("Execute: %v", err)
 	}
 	return readAll(t, res)
+}
+
+// TestExecuteDeclaredRecursiveEmbed covers 01.10 end-to-end: a declared computed
+// relationship names one direction of a self-referential foreign key, so the
+// recursive embed compiles and executes, returning each comment's children.
+func TestExecuteDeclaredRecursiveEmbed(t *testing.T) {
+	dsn := "file:" + strings.ReplaceAll(t.Name(), "/", "_") + "?mode=memory&cache=shared"
+	b, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { b.Close() })
+
+	_, err = b.DB().Exec(`
+		CREATE TABLE comments (
+			id INTEGER PRIMARY KEY,
+			parent_id INTEGER REFERENCES comments(id),
+			body TEXT NOT NULL
+		);
+		INSERT INTO comments (id, parent_id, body) VALUES
+			(1, NULL, 'root'), (2, 1, 'first reply'), (3, 1, 'second reply');
+	`)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	model, err := b.Introspect(context.Background())
+	if err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+	model.AddDeclaredRelationship(schema.DeclaredRel{
+		Name:         "children",
+		ParentSchema: "", ParentName: "comments",
+		TargetSchema: "", TargetName: "comments",
+		Card:    schema.CardToMany,
+		Local:   []string{"id"},
+		Foreign: []string{"parent_id"},
+	})
+
+	q, perr := ir.ParseRead("comments", "select=body,children:comments!children(body)&id=eq.1", nil)
+	if perr != nil {
+		t.Fatalf("ParseRead: %v", perr)
+	}
+	pl, perr := plan.Read(model, q, nil, plan.Options{})
+	if perr != nil {
+		t.Fatalf("plan.Read: %v", perr)
+	}
+	rows := execReadResolved(t, b, pl.Query)
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	raw, ok := asString(rows[0]["children"])
+	if !ok {
+		t.Fatalf("children = %T, want JSON array text", rows[0]["children"])
+	}
+	var kids []map[string]any
+	if err := json.Unmarshal([]byte(raw), &kids); err != nil {
+		t.Fatalf("children is not a JSON array: %v (%q)", err, raw)
+	}
+	if len(kids) != 2 {
+		t.Errorf("got %d children, want 2", len(kids))
+	}
 }

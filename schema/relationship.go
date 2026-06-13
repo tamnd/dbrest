@@ -140,7 +140,94 @@ func (m *Model) Relationships(parent *Relation, targetName string, searchPath []
 		}
 	}
 
+	// Declared and computed edges: relationships supplied outside the catalog. A
+	// declared edge whose name equals a derived one overrides it, so a computed
+	// relationship can replace an auto-detected edge and a config-declared edge can
+	// disambiguate a self-referential FK that derivation leaves ambiguous (spec 09).
+	declared := m.declaredEdges(parent, target)
+	if len(declared) > 0 {
+		overridden := make(map[string]bool, len(declared))
+		for _, d := range declared {
+			overridden[d.Name] = true
+		}
+		kept := out[:0:0]
+		for _, e := range out {
+			if !overridden[e.Name] {
+				kept = append(kept, e)
+			}
+		}
+		out = append(kept, declared...)
+	}
+
 	return out, true
+}
+
+// declaredEdges returns the registered declared and computed relationships from
+// parent to target as resolved Relationship values, resolving each junction
+// relation against the model. An entry whose target or junction is not in the
+// model is skipped rather than failing the whole resolution.
+func (m *Model) declaredEdges(parent, target *Relation) []Relationship {
+	var out []Relationship
+	for _, d := range m.declared {
+		if d.ParentName != parent.Name || d.ParentSchema != parent.Schema {
+			continue
+		}
+		if d.TargetName != target.Name || d.TargetSchema != target.Schema {
+			continue
+		}
+		rel := Relationship{
+			Name:    d.Name,
+			Card:    d.Card,
+			Target:  target,
+			Local:   d.Local,
+			Foreign: d.Foreign,
+			hints:   append([]string{d.Name}, d.Hints...),
+		}
+		if d.JunctionName != "" {
+			j, ok := m.Lookup(d.JunctionName, junctionPath(d.JunctionSchema))
+			if !ok {
+				continue
+			}
+			rel.Junction = j
+			rel.JLocal = d.JLocal
+			rel.JForeign = d.JForeign
+		}
+		out = append(out, rel)
+	}
+	return out
+}
+
+// junctionPath turns a declared junction schema into a one-element search path,
+// or an empty path (direct key match) when the schema is unset.
+func junctionPath(schemaName string) []string {
+	if schemaName == "" {
+		return nil
+	}
+	return []string{schemaName}
+}
+
+// DeclaredRel is a relationship supplied outside the catalog: a config-declared
+// edge on an FK-less backend, or an emulated computed relationship. The planner
+// resolves it exactly like a derived edge, and it overrides a derived edge of the
+// same name (spec 09). Local and Foreign are the parent and target join columns;
+// for a many-to-many declared edge JunctionName names the junction relation and
+// JLocal/JForeign are its columns on the parent and target sides.
+type DeclaredRel struct {
+	Name           string
+	ParentSchema   string
+	ParentName     string
+	TargetSchema   string
+	TargetName     string
+	Card           Card
+	Local          []string
+	Foreign        []string
+	JunctionSchema string
+	JunctionName   string
+	JLocal         []string
+	JForeign       []string
+	// Hints are extra names a disambiguation hint may match, beyond the edge name
+	// (the participating column names a computed relationship wants hintable).
+	Hints []string
 }
 
 // isUnique reports whether cols (as a set) is the relation's primary key or one
