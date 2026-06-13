@@ -11,7 +11,8 @@ import (
 //	PGRST1xx  query-string syntax
 //	PGRST2xx  schema-cache and resolution
 //	PGRST3xx  JWT and auth
-//	PGRST127  the one dbrest-specific code: feature unsupported on this backend
+//	PGRST127  upstream's "Feature not implemented"; dbrest emits it for a feature
+//	          a backend cannot do faithfully, far more often than upstream does
 //
 // Each constructor returns a fully-formed *APIError with the spec-mandated
 // status. Callers add details/hint with WithDetails / WithHint.
