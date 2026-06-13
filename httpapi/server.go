@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/tamnd/dbrest/auth"
 	"github.com/tamnd/dbrest/authz"
@@ -51,6 +52,7 @@ type Server struct {
 	preRequest      string   // db-pre-request, carried to the backend per request
 	appSettings     map[string]string
 	logQuery        bool // log-query, carried to the backend per request
+	timingEnabled   bool // server-timing-enabled; the Server-Timing header is off by default
 }
 
 // NewServer builds a Server over a backend, its introspected model, and the
@@ -181,6 +183,12 @@ func (s *Server) SetAppSettings(settings map[string]string) { s.appSettings = se
 // SetLogQuery asks backends to echo the statements they execute, the
 // log-query option.
 func (s *Server) SetLogQuery(on bool) { s.logQuery = on }
+
+// SetServerTimingEnabled applies the server-timing-enabled option. When on,
+// every response carries a Server-Timing header with the jwt/parse/plan/
+// transaction/response phase durations; the default is off, matching
+// PostgREST, so the wire is unchanged until an operator opts in.
+func (s *Server) SetServerTimingEnabled(on bool) { s.timingEnabled = on }
 
 // SetVerifier attaches a JWT verifier. Once set, the role and claims of each
 // request come from its bearer token (spec 13), and a bad token is rejected
@@ -335,7 +343,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleOptions(w, r)
 		return
 	}
+	// server-timing-enabled wraps the response so every exit path emits the
+	// Server-Timing header, and carries a phaseTimer to the handlers through the
+	// request context. The jwt phase is the only one measured here; the rest are
+	// recorded inside the handlers.
+	var timer *phaseTimer
+	if s.timingEnabled {
+		timer = &phaseTimer{}
+		w = &timingWriter{ResponseWriter: w, timer: timer}
+		r = r.WithContext(withTimer(r.Context(), timer))
+	}
+	jwtStart := time.Now()
 	id, apiErr := s.authenticate(r)
+	timer.mark("jwt", jwtStart)
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
@@ -550,15 +570,20 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 		rawBodyParam, rawBodyType = singleRawBodyParam(s.backend.Functions(), fn)
 	}
 
+	t := timerFrom(r.Context())
+
+	parseStart := time.Now()
 	call, apiErr := ir.ParseCall(fn, r.URL.RawQuery, r.Header.Values("Prefer"), isGet, r.Header.Get("Content-Type"), body, rawBodyParam, rawBodyType)
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
 	}
+	t.mark("parse", parseStart)
 	call.Singular = media == mediaObject
 	// db-max-rows caps an RPC response like a read (an implicit LIMIT).
 	call.Limit = s.capLimit(call.Limit)
 
+	planStart := time.Now()
 	var planned *ir.Plan
 	if s.backend.Capabilities().NativeRPC {
 		// PostgreSQL (and any other NativeRPC backend) discovers and executes
@@ -575,19 +600,24 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 			return
 		}
 	}
+	t.mark("plan", planStart)
 
 	rc := s.buildContext(r, id, activeSchema)
+	txStart := time.Now()
 	res, err := s.backend.Execute(r.Context(), planned, rc)
 	if err != nil {
 		writeError(w, mapExecError(s.backend, err, id.anonymous))
 		return
 	}
+	t.mark("transaction", txStart)
 
+	respStart := time.Now()
 	out, apiErr := renderCall(media, res, planned.Func, fn)
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
 	}
+	t.mark("response", respStart)
 
 	s.writeCall(w, r, call, out, res.ResponseControls())
 }
@@ -645,6 +675,8 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity,
 		return
 	}
 
+	t := timerFrom(r.Context())
+
 	acceptHdrs := r.Header.Values("Accept")
 	media, ok := negotiate(acceptHdrs)
 	if !ok {
@@ -652,11 +684,13 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity,
 		return
 	}
 
+	parseStart := time.Now()
 	q, apiErr := ir.ParseRead(relation, r.URL.RawQuery, r.Header.Values("Prefer"))
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
 	}
+	t.mark("parse", parseStart)
 	q.Singular = media == mediaObject
 
 	// Range: header overrides ?limit=&offset= and marks the request as a
@@ -688,11 +722,13 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity,
 	// write path.
 	q.Limit = s.capLimit(q.Limit)
 
+	planStart := time.Now()
 	planned, apiErr := plan.Read(s.Model(), q, []string{activeSchema}, plan.Options{AggregatesEnabled: s.aggregatesOn})
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
 	}
+	t.mark("plan", planStart)
 
 	rc := s.buildContext(r, id, activeSchema)
 
@@ -725,17 +761,21 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity,
 		return
 	}
 
+	txStart := time.Now()
 	res, err := s.backend.Execute(r.Context(), planned, rc)
 	if err != nil {
 		writeError(w, mapExecError(s.backend, err, id.anonymous))
 		return
 	}
+	t.mark("transaction", txStart)
 
+	respStart := time.Now()
 	out, apiErr := renderFor(media, res, embedKeys(q))
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
 	}
+	t.mark("response", respStart)
 
 	s.writeRead(w, r, q, out, res.ResponseControls())
 }
@@ -763,29 +803,37 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.Que
 		body = b
 	}
 
+	t := timerFrom(r.Context())
+
+	parseStart := time.Now()
 	q, apiErr := ir.ParseWrite(kind, relation, r.URL.RawQuery, r.Header.Values("Prefer"), r.Header.Get("Content-Type"), body)
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
 	}
+	t.mark("parse", parseStart)
 	q.Singular = media == mediaObject
 
+	planStart := time.Now()
 	planned, apiErr := plan.Write(s.Model(), q, []string{activeSchema})
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
 	}
+	t.mark("plan", planStart)
 
 	rc := s.buildContext(r, id, activeSchema)
 	if apiErr := s.authorize(rc, planned); apiErr != nil {
 		writeError(w, apiErr)
 		return
 	}
+	txStart := time.Now()
 	res, err := s.backend.Execute(r.Context(), planned, rc)
 	if err != nil {
 		writeError(w, mapExecError(s.backend, err, id.anonymous))
 		return
 	}
+	t.mark("transaction", txStart)
 
 	s.writeWrite(w, r, q, media, planned.Rel, res)
 }
@@ -820,11 +868,13 @@ func (s *Server) writeWrite(w http.ResponseWriter, r *http.Request, q *ir.Query,
 		return
 	}
 
+	respStart := time.Now()
 	out, apiErr := renderFor(media, res, embedKeys(q))
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
 	}
+	timerFrom(r.Context()).mark("response", respStart)
 	w.Header().Set("Content-Type", out.contentType)
 	if !q.Singular {
 		// For writes with count=exact, include the total in Content-Range.
