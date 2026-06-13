@@ -30,6 +30,8 @@ const (
 	CodeGucStatus          = "PGRST112" // 500 invalid response.status from a function
 	CodeSingularZeroMany   = "PGRST116" // 406 singular requested, zero or many rows
 	CodeInvalidPath        = "PGRST125" // 404 invalid path in request URL
+	CodeRelatedOrderNotToOne    = "PGRST118" // 400 order=rel(col) on a non-to-one embed
+	CodeRelatedOrderNotEmbedded = "PGRST108" // 400 order=rel(col) on a resource not in select
 	CodeNoRelationship     = "PGRST200" // 400 relationship not found
 	CodeAmbiguousEmbed     = "PGRST201" // 300 embedding ambiguous
 	CodeNoFunction         = "PGRST202" // 404 no function matches name/args
@@ -150,6 +152,25 @@ func ErrNoRelationship(parent, target string) *APIError {
 func ErrAmbiguousEmbed(parent, target string) *APIError {
 	return New(http.StatusMultipleChoices, CodeAmbiguousEmbed,
 		fmt.Sprintf("Could not embed because more than one relationship was found for '%s' and '%s'", parent, target))
+}
+
+// ErrRelatedOrderNotEmbedded is raised when an order=rel(col) term names a
+// relation that the request did not embed in select. It is PostgREST's PGRST108
+// with a 400; the hint points the caller at the select parameter.
+func ErrRelatedOrderNotEmbedded(rel string) *APIError {
+	return New(http.StatusBadRequest, CodeRelatedOrderNotEmbedded,
+		fmt.Sprintf("'%s' is not an embedded resource in this request", rel)).
+		WithHint(fmt.Sprintf("Verify that '%s' is included in the 'select' query parameter.", rel))
+}
+
+// ErrRelatedOrderNotToOne is raised when an order=rel(col) term names an embedded
+// relation that is to-many rather than many-to-one or one-to-one: a parent row
+// would map to many related rows, so the related column is not a single sort key.
+// It is PostgREST's PGRST118 with a 400.
+func ErrRelatedOrderNotToOne(parent, rel string) *APIError {
+	return New(http.StatusBadRequest, CodeRelatedOrderNotToOne,
+		fmt.Sprintf("A related order on '%s' is not possible", rel)).
+		WithDetails(fmt.Sprintf("'%s' and '%s' do not form a many-to-one or one-to-one relationship", parent, rel))
 }
 
 // ErrNoFunction is raised when no function matches the name and argument set. It

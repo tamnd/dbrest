@@ -386,6 +386,14 @@ type OrderTerm struct {
 	Last       JSONStep // final JSON hop kind when Path carries a -> / ->> sub-path
 	Desc       bool
 	NullsFirst *bool // nil = PG default (NULLS LAST asc, NULLS FIRST desc)
+
+	// Rel names an embedded resource when the term is order=rel(col): the parent
+	// is ordered by a column of a to-one embed, with Path/Last addressing the
+	// column inside that relation. Empty for an ordinary parent-column term. The
+	// name is the embed's written spelling or alias (client in client(name));
+	// the planner resolves it to a relationship and the compiler lowers it as a
+	// correlated scalar subquery.
+	Rel string
 }
 
 // WriteSpec carries the mutation payload and options (spec 11).

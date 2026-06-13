@@ -908,15 +908,28 @@ func (b *builder) writeIs(col, text string) (string, *pgerr.APIError) {
 
 // writeOrder emits the ORDER BY, delegating NULLs placement to the dialect.
 func (b *builder) writeOrder(terms []ir.OrderTerm) *pgerr.APIError {
+	// The parent reference for a related-order subquery is the qualifier in force
+	// as the ORDER BY is written (t0 in an embedded read, the bare table name in a
+	// count).
+	parentAlias := b.qual
 	var sortKeys, orderTerms []string
 	for _, t := range terms {
-		col := b.colRef(t.Path[0])
-		if len(t.Path) > 1 {
-			frag, err := b.jsonPathExpr(col, t.Path[1:], t.Last)
+		var col string
+		if t.Rel != "" {
+			frag, err := b.relatedOrderExpr(t, parentAlias)
 			if err != nil {
 				return err
 			}
 			col = frag
+		} else {
+			col = b.colRef(t.Path[0])
+			if len(t.Path) > 1 {
+				frag, err := b.jsonPathExpr(col, t.Path[1:], t.Last)
+				if err != nil {
+					return err
+				}
+				col = frag
+			}
 		}
 		dir := "ASC"
 		if t.Desc {
@@ -933,6 +946,57 @@ func (b *builder) writeOrder(terms []ir.OrderTerm) *pgerr.APIError {
 	all = append(all, sortKeys...)
 	all = append(all, orderTerms...)
 	b.sb.WriteString(strings.Join(all, ", "))
+	return nil
+}
+
+// relatedOrderExpr lowers an order=rel(col) term to a correlated scalar subquery
+// selecting the embed's column for the matching to-one row: a parent with no
+// related row yields NULL, which the dialect's NULLs placement then orders. The
+// embed is matched by the same written name the planner validated, and its
+// to-one join condition correlates the subquery back to the parent (item 07.6).
+func (b *builder) relatedOrderExpr(t ir.OrderTerm, parentAlias string) (string, *pgerr.APIError) {
+	emb := b.findEmbed(t.Rel)
+	if emb == nil {
+		// The planner validates the relation is embedded; reaching here is a bug.
+		return "", pgerr.ErrInternal("related order names an unresolved embed: " + t.Rel)
+	}
+	rel := emb.Rel
+	b.aliasN++
+	alias := "o" + strconv.Itoa(b.aliasN)
+
+	saved := b.qual
+	b.qual = alias
+	col := b.colRef(t.Path[0])
+	if len(t.Path) > 1 {
+		frag, err := b.jsonPathExpr(col, t.Path[1:], t.Last)
+		if err != nil {
+			b.qual = saved
+			return "", err
+		}
+		col = frag
+	}
+	b.qual = saved
+
+	from := b.qualify(ir.Ref{Schema: rel.Target.Schema, Name: rel.Target.Name}) + " " + alias
+	cond := b.joinCond(alias, rel.Foreign, parentAlias, rel.Local)
+	return "(SELECT " + col + " FROM " + from + " WHERE " + cond + ")", nil
+}
+
+// findEmbed returns the embed an order=rel(col) term refers to, matched by the
+// embed's alias or, when it has none, its written target name. It mirrors the
+// planner's findEmbedByName so the compiler resolves the same relation the
+// planner validated.
+func (b *builder) findEmbed(name string) *ir.Embed {
+	for i := range b.embeds {
+		emb := &b.embeds[i]
+		written := emb.Alias
+		if written == "" {
+			written = emb.Target.Name
+		}
+		if written == name {
+			return emb
+		}
+	}
 	return nil
 }
 

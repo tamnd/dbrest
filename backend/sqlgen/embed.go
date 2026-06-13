@@ -72,6 +72,9 @@ func compileReadEmbedded(d Dialect, q *ir.Query) (*Statement, *pgerr.APIError) {
 	hasOrder := len(q.Order) > 0
 	if hasOrder {
 		b.qual = parentAlias
+		// A related-order term (order=rel(col)) resolves its relation against the
+		// parent's embeds, so they must be in scope even when no WHERE set them.
+		b.embeds = q.Embeds
 		if err := b.writeOrder(q.Order); err != nil {
 			return nil, err
 		}
@@ -222,12 +225,18 @@ func (b *builder) writeEmbed(emb *ir.Embed, parentAlias string) *pgerr.APIError 
 	hasOrder := len(emb.Query.Order) > 0
 	if hasOrder {
 		saved := b.qual
+		savedEmbeds := b.embeds
 		b.qual = alias
+		// A related-order term inside this embed resolves against the embed's own
+		// nested embeds, so scope them in for the duration of its ORDER BY.
+		b.embeds = emb.Query.Embeds
 		if err := b.writeOrder(emb.Query.Order); err != nil {
 			b.qual = saved
+			b.embeds = savedEmbeds
 			return err
 		}
 		b.qual = saved
+		b.embeds = savedEmbeds
 	}
 	if clause := b.d.LimitOffset(emb.Query.Limit, emb.Query.Offset, hasOrder); clause != "" {
 		b.sb.WriteString(" ")

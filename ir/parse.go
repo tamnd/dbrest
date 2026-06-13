@@ -955,6 +955,14 @@ func parseOrder(s string) ([]OrderTerm, *pgerr.APIError) {
 		// before the modifier list is split (item 01.2).
 		colPart, modPart, hasMods := cutIdentAware(p, '.')
 		var t OrderTerm
+		// An order term may name an embedded to-one resource's column:
+		// order=client(name) sorts the parent by the embed's column (item 07.6).
+		// The relation rides on Rel; the inner text is the column path, which may
+		// itself carry a JSON sub-path (trash_details(jsonb_col->key)).
+		if rel, inner, ok := cutRelOrder(colPart); ok {
+			t.Rel = rel
+			colPart = inner
+		}
 		path, last, perr := parsePath(colPart)
 		if perr != nil {
 			return nil, perr
@@ -991,6 +999,24 @@ func parseOrder(s string) ([]OrderTerm, *pgerr.APIError) {
 		terms = append(terms, t)
 	}
 	return terms, nil
+}
+
+// cutRelOrder splits an order column of the form rel(col) into the relation name
+// and the inner column text. It returns ok=false for a plain column (no
+// parenthesis) so the caller treats it as a parent column. The relation name must
+// be non-empty and the parentheses must wrap the rest of the term; a stray or
+// unbalanced parenthesis is left to parsePath, which reports it.
+func cutRelOrder(s string) (rel, inner string, ok bool) {
+	open := strings.IndexByte(s, '(')
+	if open <= 0 || !strings.HasSuffix(s, ")") {
+		return "", "", false
+	}
+	rel = strings.TrimSpace(s[:open])
+	inner = strings.TrimSpace(s[open+1 : len(s)-1])
+	if rel == "" || inner == "" {
+		return "", "", false
+	}
+	return rel, inner, true
 }
 
 // parseFilters builds the top-level filter tree from column filters plus and=/or=.

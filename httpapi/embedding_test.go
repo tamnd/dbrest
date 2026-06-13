@@ -250,6 +250,74 @@ func TestEmbedColumnInCSV(t *testing.T) {
 	}
 }
 
+// order=rel(col) sorts the parent by a to-one embed's column. Films sort by
+// their director's name; the film with no director (a NULL key) lands last under
+// the requested nullslast (item 07.6).
+func TestRelatedOrderSortsParent(t *testing.T) {
+	srv := newEmbedServer(t)
+	resp := do(t, srv, http.MethodGet,
+		"/films?select=title,director:directors(name)&order=director(name).asc.nullslast", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	rows := decodeArray(t, resp)
+	got := make([]string, len(rows))
+	for i, r := range rows {
+		got[i], _ = r["title"].(string)
+	}
+	// Lang < Scott < Villeneuve by name; Untitled has no director, so NULL last.
+	want := []string{"Metropolis", "Blade Runner", "Arrival", "Untitled"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d rows %v, want %d", len(got), got, len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("row %d title = %q, want %q (order %v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+// The same order, nullsfirst, floats the directorless film to the top.
+func TestRelatedOrderNullsFirst(t *testing.T) {
+	srv := newEmbedServer(t)
+	resp := do(t, srv, http.MethodGet,
+		"/films?select=title,director:directors(name)&order=director(name).asc.nullsfirst", nil)
+	rows := decodeArray(t, resp)
+	if len(rows) == 0 {
+		t.Fatal("no rows")
+	}
+	if title, _ := rows[0]["title"].(string); title != "Untitled" {
+		t.Errorf("first title = %q, want Untitled (NULL director sorts first)", title)
+	}
+}
+
+// Ordering by a relation the select never embedded is PGRST108.
+func TestRelatedOrderNotEmbeddedHTTP(t *testing.T) {
+	srv := newEmbedServer(t)
+	resp := do(t, srv, http.MethodGet, "/films?select=title&order=director(name).asc", nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	env := decodeEnvelope(t, resp)
+	if env["code"] != "PGRST108" {
+		t.Errorf("code = %v, want PGRST108", env["code"])
+	}
+}
+
+// Ordering by a to-many embed is PGRST118: a director has many films, so it has
+// no single film title to sort by.
+func TestRelatedOrderToManyHTTP(t *testing.T) {
+	srv := newEmbedServer(t)
+	resp := do(t, srv, http.MethodGet, "/directors?select=name,films(title)&order=films(title).asc", nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	env := decodeEnvelope(t, resp)
+	if env["code"] != "PGRST118" {
+		t.Errorf("code = %v, want PGRST118", env["code"])
+	}
+}
+
 func BenchmarkEmbedToMany(b *testing.B) {
 	srv := newEmbedServer(b)
 	req := httptest.NewRequest(http.MethodGet, "/directors?select=name,films(title)&order=id", nil)

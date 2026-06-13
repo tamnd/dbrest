@@ -63,6 +63,11 @@ func Read(model *schema.Model, q *ir.Query, searchPath []string, opts Options) (
 	if err := resolveEmbeds(model, rel, q, searchPath, opts.AggregatesEnabled); err != nil {
 		return nil, err
 	}
+	// Related-order terms (order=rel(col)) are validated once the embeds they
+	// reference are resolved, so the relationship's cardinality is known.
+	if err := validateRelatedOrder(rel, q); err != nil {
+		return nil, err
+	}
 
 	return &ir.Plan{Query: q, Rel: rel, ReadOnly: true}, nil
 }
@@ -94,6 +99,11 @@ func resolveEmbeds(model *schema.Model, parent *schema.Relation, q *ir.Query, se
 			return err
 		}
 		if err := resolveEmbeds(model, rel.Target, &emb.Query, searchPath, aggEnabled); err != nil {
+			return err
+		}
+		// A nested related order (tasks.order=projects(id)) references the embed's
+		// own sub-embeds, now resolved.
+		if err := validateRelatedOrder(rel.Target, &emb.Query); err != nil {
 			return err
 		}
 	}
@@ -750,8 +760,55 @@ func coerce(canonicalType, text string) *pgerr.APIError {
 
 func validateOrder(rel *schema.Relation, terms []ir.OrderTerm) *pgerr.APIError {
 	for _, t := range terms {
+		// A related-order term (order=rel(col)) addresses a column of an embedded
+		// resource, not the parent. It is validated against the resolved embed in
+		// validateRelatedOrder, after the embeds are bound.
+		if t.Rel != "" {
+			continue
+		}
 		if err := checkColumn(rel, t.Path); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// validateRelatedOrder checks every order=rel(col) term of a query against its
+// resolved embeds: the named relation must be embedded in this request (PGRST108
+// otherwise) and must be a to-one relationship (PGRST118 otherwise, since a
+// to-many embed gives no single sort key). The embed's own column is then
+// validated against the embedded relation. The embeds must already be resolved.
+func validateRelatedOrder(parent *schema.Relation, q *ir.Query) *pgerr.APIError {
+	for _, t := range q.Order {
+		if t.Rel == "" {
+			continue
+		}
+		emb := findEmbedByName(q.Embeds, t.Rel)
+		if emb == nil {
+			return pgerr.ErrRelatedOrderNotEmbedded(t.Rel)
+		}
+		if emb.Cardinality != ir.CardToOne {
+			return pgerr.ErrRelatedOrderNotToOne(parent.Name, t.Rel)
+		}
+		if err := checkColumn(emb.Rel.Target, t.Path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// findEmbedByName returns the embed an order=rel(col) term refers to, matched by
+// the embed's alias when it has one, otherwise its written target name. This is
+// the same spelling PostgREST resolves the related-order relation against.
+func findEmbedByName(embeds []ir.Embed, name string) *ir.Embed {
+	for i := range embeds {
+		emb := &embeds[i]
+		written := emb.Alias
+		if written == "" {
+			written = emb.Target.Name
+		}
+		if written == name {
+			return emb
 		}
 	}
 	return nil
