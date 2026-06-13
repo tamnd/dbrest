@@ -174,13 +174,35 @@ func CompileCount(d Dialect, q *ir.Query) (*Statement, *pgerr.APIError) {
 	b.sb.WriteString("SELECT count(*) FROM ")
 	parent := b.qualify(q.Relation)
 	b.sb.WriteString(parent)
+
+	// An embed-existence filter and an !inner embed's EXISTS both correlate to the
+	// parent by its bare table name here, since a count gives the parent no alias.
+	b.parentRef = parent
+	b.embeds = q.Embeds
+
+	wrote := false
 	if q.Where != nil {
-		// An embed-existence filter correlates to the parent by its bare table name
-		// here, since a count gives the parent no alias.
-		b.parentRef = parent
-		b.embeds = q.Embeds
 		b.sb.WriteString(" WHERE ")
 		if err := b.writeCond(*q.Where); err != nil {
+			return nil, err
+		}
+		wrote = true
+	}
+	// The row query restricts the parent with an EXISTS per !inner embed
+	// (compileReadEmbedded), so the count must carry the same predicates or
+	// Content-Range disagrees with the body it accompanies.
+	for i := range q.Embeds {
+		emb := &q.Embeds[i]
+		if emb.Join != ir.JoinInner {
+			continue
+		}
+		if wrote {
+			b.sb.WriteString(" AND ")
+		} else {
+			b.sb.WriteString(" WHERE ")
+			wrote = true
+		}
+		if err := b.writeEmbedExists(emb, parent); err != nil {
 			return nil, err
 		}
 	}

@@ -296,6 +296,54 @@ func TestEmbedPredicateInCount(t *testing.T) {
 	}
 }
 
+// A count over a query carrying an !inner embed restricts the parent with the
+// same EXISTS the row query adds, so an exact count matches the filtered body
+// (item 07.7). The EXISTS correlates to the bare table name, since the count
+// gives the parent no alias.
+func TestCountAppliesInnerEmbedExists(t *testing.T) {
+	m := embedModel()
+	q := &ir.Query{
+		Relation: ir.Ref{Schema: "public", Name: "directors"},
+		Embeds: []ir.Embed{{
+			OutKey: "films",
+			Join:   ir.JoinInner,
+			Target: ir.Ref{Schema: "public", Name: "films"},
+			Rel:    relate(t, m, "directors", "films"),
+		}},
+	}
+	st, err := CompileCount(embedStub{}, q)
+	if err != nil {
+		t.Fatalf("CompileCount: %v", err)
+	}
+	want := `SELECT count(*) FROM "public"."directors" ` +
+		`WHERE EXISTS (SELECT 1 FROM "public"."films" x1 ` +
+		`WHERE x1."director_id" = "public"."directors"."id")`
+	if st.SQL != want {
+		t.Errorf("\n got %q\nwant %q", st.SQL, want)
+	}
+}
+
+// A non-inner embed leaves the count unrestricted: only !inner embeds prune the
+// parent, so a plain to-many embed adds no EXISTS to the count.
+func TestCountIgnoresNonInnerEmbed(t *testing.T) {
+	m := embedModel()
+	q := &ir.Query{
+		Relation: ir.Ref{Schema: "public", Name: "directors"},
+		Embeds: []ir.Embed{{
+			OutKey: "films",
+			Target: ir.Ref{Schema: "public", Name: "films"},
+			Rel:    relate(t, m, "directors", "films"),
+		}},
+	}
+	st, err := CompileCount(embedStub{}, q)
+	if err != nil {
+		t.Fatalf("CompileCount: %v", err)
+	}
+	if strings.Contains(st.SQL, "WHERE") {
+		t.Errorf("non-inner embed should add no predicate, got %q", st.SQL)
+	}
+}
+
 // An embed's own horizontal filter is ANDed onto the join predicate, bound, and
 // qualified by the target alias.
 func TestEmbedHorizontalFilterIsBound(t *testing.T) {
