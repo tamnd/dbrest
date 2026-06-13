@@ -90,6 +90,20 @@ func planAnalyze(headers []string) bool {
 	return false
 }
 
+// vendorSynonym maps the suffixless PostgREST vendor spellings to their +json
+// forms, which PostgREST accepts as synonyms. Any other type passes through
+// unchanged.
+func vendorSynonym(full string) string {
+	switch full {
+	case "application/vnd.pgrst.array":
+		return mediaArray
+	case "application/vnd.pgrst.object":
+		return mediaObject
+	default:
+		return full
+	}
+}
+
 // negotiate picks the best supported response media type for the Accept header.
 // An absent or fully wildcard Accept yields application/json. The second return
 // is false when no listed media type can be produced, which the caller turns
@@ -114,7 +128,7 @@ func negotiate(headers []string) (string, bool) {
 				}
 			}
 		default:
-			full := r.typ + "/" + r.sub
+			full := vendorSynonym(r.typ + "/" + r.sub)
 			for _, m := range supportedMedia {
 				if m == full {
 					return m, true

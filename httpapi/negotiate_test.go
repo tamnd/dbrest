@@ -50,6 +50,17 @@ func TestNegotiateSkipsUnsupportedThenMatches(t *testing.T) {
 	}
 }
 
+// TestNegotiateSuffixlessVendorTypes checks the suffixless PostgREST vendor
+// spellings resolve to the same renderers as their +json forms.
+func TestNegotiateSuffixlessVendorTypes(t *testing.T) {
+	if got, ok := negotiate([]string{"application/vnd.pgrst.object"}); !ok || got != mediaObject {
+		t.Errorf("object synonym got (%q,%v), want %q", got, ok, mediaObject)
+	}
+	if got, ok := negotiate([]string{"application/vnd.pgrst.array"}); !ok || got != mediaArray {
+		t.Errorf("array synonym got (%q,%v), want %q", got, ok, mediaArray)
+	}
+}
+
 func TestNegotiateZeroQualityRefuses(t *testing.T) {
 	// q=0 explicitly refuses a type; with nothing else acceptable this is a 406.
 	if got, ok := negotiate([]string{"application/json;q=0"}); ok {
