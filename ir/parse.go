@@ -723,6 +723,9 @@ func parseAggregate(raw string) (Aggregate, bool, *pgerr.APIError) {
 		if agg.Cast == "" {
 			return Aggregate{}, false, pgerr.ErrParse("empty cast target")
 		}
+		if !validCastType(agg.Cast) {
+			return Aggregate{}, false, pgerr.ErrParse("invalid cast target " + agg.Cast)
+		}
 	}
 	// Strip a response-key alias: the leading name before a single ':' that is not
 	// part of a '::' cast and not inside quotes.
