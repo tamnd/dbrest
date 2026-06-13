@@ -25,7 +25,7 @@ func TestConstructorStatusAndCode(t *testing.T) {
 		{"range", ErrRangeNotSatisfiable(), http.StatusRequestedRangeNotSatisfiable, CodeRangeUnsatisfied},
 		{"not-acceptable", ErrNotAcceptable("text/csv"), http.StatusNotAcceptable, CodeMediaType},
 		{"unsupported-media", ErrUnsupportedMediaType("text/yaml"), http.StatusBadRequest, CodeInvalidBody},
-		{"unknown-table", ErrUnknownTable("films"), http.StatusNotFound, CodeUnknownTable},
+		{"unknown-table", ErrUnknownTable("public", "films"), http.StatusNotFound, CodeUnknownTable},
 		{"unknown-column", ErrUnknownColumn("titel", "films"), http.StatusBadRequest, CodeUnknownColumn},
 		{"undefined-column", ErrUndefinedColumn("todos.nope"), http.StatusBadRequest, CodeUndefinedColumn},
 		{"no-relationship", ErrNoRelationship("films", "actors", "public", ""), http.StatusBadRequest, CodeNoRelationship},

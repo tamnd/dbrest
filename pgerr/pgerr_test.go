@@ -112,7 +112,7 @@ func TestUnsupportedNamesFeatureAndBackend(t *testing.T) {
 
 func TestWriteSetsStatusAndContentType(t *testing.T) {
 	rec := httptest.NewRecorder()
-	ErrUnknownTable("films").Write(rec)
+	ErrUnknownTable("public", "films").Write(rec)
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", rec.Code)
 	}

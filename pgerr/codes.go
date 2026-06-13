@@ -109,10 +109,16 @@ func ErrUnsupportedMediaType(contentType string) *APIError {
 }
 
 // ErrUnknownTable is raised when a table or view is not in the schema model
-// (unknown, or not exposed by db-schemas).
-func ErrUnknownTable(name string) *APIError {
+// (unknown, or not exposed by db-schemas). PostgREST schema-qualifies the name in
+// its PGRST205 message ("Could not find the table 'api.films' in the schema
+// cache"), so schemaName is the schema the request resolved to; an empty schema
+// (a backend with no namespace) normalizes to public, the name PostgREST emits.
+func ErrUnknownTable(schemaName, name string) *APIError {
+	if schemaName == "" {
+		schemaName = "public"
+	}
 	return New(http.StatusNotFound, CodeUnknownTable,
-		fmt.Sprintf("Could not find the table '%s' in the schema cache", name))
+		fmt.Sprintf("Could not find the table '%s.%s' in the schema cache", schemaName, name))
 }
 
 // ErrUnknownColumn is raised when a column named in a write payload or the

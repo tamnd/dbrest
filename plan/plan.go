@@ -41,7 +41,7 @@ type Options struct {
 func Read(model *schema.Model, q *ir.Query, searchPath []string, opts Options) (*ir.Plan, *pgerr.APIError) {
 	rel, ok := model.Lookup(q.Relation.Name, searchPath)
 	if !ok {
-		return nil, pgerr.ErrUnknownTable(q.Relation.Name)
+		return nil, pgerr.ErrUnknownTable(searchSchema(searchPath), q.Relation.Name)
 	}
 	// Bind the resolved schema/name back onto the query so the compiler emits a
 	// fully qualified, model-validated reference.
@@ -179,7 +179,7 @@ func toCardinality(c schema.Card) ir.Cardinality {
 func Write(model *schema.Model, q *ir.Query, searchPath []string) (*ir.Plan, *pgerr.APIError) {
 	rel, ok := model.Lookup(q.Relation.Name, searchPath)
 	if !ok {
-		return nil, pgerr.ErrUnknownTable(q.Relation.Name)
+		return nil, pgerr.ErrUnknownTable(searchSchema(searchPath), q.Relation.Name)
 	}
 	q.Relation = ir.Ref{Schema: rel.Schema, Name: rel.Name}
 

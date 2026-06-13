@@ -188,6 +188,11 @@ func TestUnknownTableIs404Code(t *testing.T) {
 	if env["code"] != "PGRST205" {
 		t.Errorf("code = %v, want PGRST205", env["code"])
 	}
+	// PGRST205 schema-qualifies the relation name (item 04.3): a backend with no
+	// schema namespace still reports the default public schema, as PostgREST does.
+	if msg, _ := env["message"].(string); msg != "Could not find the table 'public.nope' in the schema cache" {
+		t.Errorf("message = %q, want it schema-qualified", msg)
+	}
 }
 
 func TestUnknownColumnIsError(t *testing.T) {

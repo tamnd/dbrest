@@ -714,7 +714,7 @@ func (s *Server) writeCall(w http.ResponseWriter, r *http.Request, call *ir.Call
 func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity, activeSchema string) {
 	relation := strings.Trim(r.URL.Path, "/")
 	if relation == "" || strings.Contains(relation, "/") {
-		writeError(w, pgerr.ErrUnknownTable(relation))
+		writeError(w, pgerr.ErrUnknownTable(activeSchema, relation))
 		return
 	}
 
@@ -885,7 +885,7 @@ func planContentType(opts backend.PlanOptions) string {
 func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.QueryKind, id identity, activeSchema string) {
 	relation := strings.Trim(r.URL.Path, "/")
 	if relation == "" || strings.Contains(relation, "/") {
-		writeError(w, pgerr.ErrUnknownTable(relation))
+		writeError(w, pgerr.ErrUnknownTable(activeSchema, relation))
 		return
 	}
 
