@@ -243,6 +243,12 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 		st, apiErr = sqlgen.CompileCall(Dialect{}, plan.Call, plan.Func, sqlgen.ContextArgs(rc))
 	} else {
 		st, apiErr = b.compileNativeCall(plan.Call)
+		if apiErr == nil {
+			// A table-valued function result supports the same select, filters,
+			// ordering, and window a table read does; the registry path wraps for
+			// these inside CompileCall, so the native path wraps here too.
+			st, apiErr = sqlgen.CompileNativeCallWrap(Dialect{}, plan.Call, st)
+		}
 	}
 	if apiErr != nil {
 		return nil, apiErr
@@ -395,10 +401,10 @@ func (b *Backend) compileNativeCallCount(c *ir.Call) (*sqlgen.Statement, *pgerr.
 	if apiErr != nil {
 		return nil, apiErr
 	}
-	return &sqlgen.Statement{
-		SQL:  "SELECT count(*) FROM (" + inner.SQL + ") _rpc",
-		Args: inner.Args,
-	}, nil
+	// Count over the same post-filter the row query applies, so a count=exact
+	// total matches the rows returned (the select, order, and window do not
+	// change the count).
+	return sqlgen.CompileNativeCallCountWrap(Dialect{}, c, inner)
 }
 
 // appendNativeArg writes one function argument as a safe SQL literal. Numbers

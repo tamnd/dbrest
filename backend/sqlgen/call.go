@@ -101,6 +101,77 @@ func CompileCall(d Dialect, c *ir.Call, fn *rpc.Function, ctxArgs map[string]any
 	return &Statement{SQL: b.sb.String(), Args: b.args}, nil
 }
 
+// CompileNativeCallWrap wraps a backend-built function-call statement in the read
+// clauses a table-valued function result supports: vertical projection, horizontal
+// filters, ordering, and the limit/offset window, aliased as _rpc. A NativeRPC
+// backend (no portable function body, so CompileCall does not apply) renders the
+// inner `SELECT * FROM schema.fn(args)` itself and passes it here so a native call
+// shapes its result the same way the registry path does. With no post-filter
+// clause the inner statement is returned unchanged. The inner statement's bound
+// arguments are preserved and the wrapper's own filters bind after them, so
+// placeholder numbering stays consistent.
+func CompileNativeCallWrap(d Dialect, c *ir.Call, inner *Statement) (*Statement, *pgerr.APIError) {
+	if !callHasPostFilter(c) {
+		return inner, nil
+	}
+	b := newBuilder(d)
+	b.args = append(b.args, inner.Args...)
+
+	const alias = "_rpc"
+	b.sb.WriteString("SELECT ")
+	if len(c.Select) > 0 {
+		if err := b.writeSelect(c.Select); err != nil {
+			return nil, err
+		}
+	} else {
+		b.sb.WriteString("*")
+	}
+	b.sb.WriteString(" FROM (")
+	b.sb.WriteString(inner.SQL)
+	b.sb.WriteString(") ")
+	b.sb.WriteString(alias)
+
+	if c.Where != nil {
+		b.sb.WriteString(" WHERE ")
+		if err := b.writeCond(*c.Where); err != nil {
+			return nil, err
+		}
+	}
+	hasOrder := len(c.Order) > 0
+	if hasOrder {
+		if err := b.writeOrder(c.Order); err != nil {
+			return nil, err
+		}
+	}
+	if clause := b.d.LimitOffset(c.Limit, c.Offset, hasOrder); clause != "" {
+		b.sb.WriteString(" ")
+		b.sb.WriteString(clause)
+	}
+	return &Statement{SQL: b.sb.String(), Args: b.args}, nil
+}
+
+// CompileNativeCallCountWrap wraps a backend-built function-call statement in a
+// count over its rows with the horizontal filter applied, so a native call's
+// count=exact total matches the rows the post-filter returns. The select, order,
+// and window do not change the count. Like CompileNativeCallWrap it is for the
+// NativeRPC path where there is no portable body to drive CompileCallCount.
+func CompileNativeCallCountWrap(d Dialect, c *ir.Call, inner *Statement) (*Statement, *pgerr.APIError) {
+	b := newBuilder(d)
+	b.args = append(b.args, inner.Args...)
+	const alias = "_rpc"
+	b.sb.WriteString("SELECT count(*) FROM (")
+	b.sb.WriteString(inner.SQL)
+	b.sb.WriteString(") ")
+	b.sb.WriteString(alias)
+	if c.Where != nil {
+		b.sb.WriteString(" WHERE ")
+		if err := b.writeCond(*c.Where); err != nil {
+			return nil, err
+		}
+	}
+	return &Statement{SQL: b.sb.String(), Args: b.args}, nil
+}
+
 // CompileCallCount lowers the count of an RPC result: the bound function wrapped
 // in a count over its rows, with a table return's WHERE post-filter applied (the
 // select, order, and window do not change the count). It runs as a separate
