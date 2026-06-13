@@ -159,7 +159,8 @@ func TestCallGetPartitionsArgsFromFilters(t *testing.T) {
 
 // TestCallGetFilterUnknownColumnRejected checks a partitioned filter is still
 // validated against the table return's declared columns, so a non-parameter key
-// naming no column is PGRST204 rather than silently dropped.
+// naming no column reaches PostgreSQL as 42703 (item 04.5) rather than silently
+// dropped.
 func TestCallGetFilterUnknownColumnRejected(t *testing.T) {
 	c := &ir.Call{
 		Function: ir.Ref{Name: "films_after"},
@@ -170,8 +171,8 @@ func TestCallGetFilterUnknownColumnRejected(t *testing.T) {
 		},
 	}
 	_, err := Call(reg(filmsAfter()), nil, c, true, nil)
-	if err == nil || err.Code != "PGRST204" {
-		t.Fatalf("want PGRST204, got %v", err)
+	if err == nil || err.Code != "42703" {
+		t.Fatalf("want 42703, got %v", err)
 	}
 }
 
@@ -238,8 +239,8 @@ func TestCallPostFilterUnknownColumn(t *testing.T) {
 		Select:   []ir.SelectItem{ir.Column{Path: []string{"bogus"}}},
 	}
 	_, err := Call(reg(tab), nil, c, true, nil)
-	if err == nil || err.Code != "PGRST204" {
-		t.Fatalf("want PGRST204, got %v", err)
+	if err == nil || err.Code != "42703" {
+		t.Fatalf("want 42703, got %v", err)
 	}
 }
 
@@ -313,8 +314,8 @@ func TestCallPostFilterWhereTreeUnknownColumn(t *testing.T) {
 	for name, where := range cases {
 		t.Run(name, func(t *testing.T) {
 			_, err := Call(reg(filmsAfter()), nil, callWith(where), true, nil)
-			if err == nil || err.Code != "PGRST204" {
-				t.Fatalf("want PGRST204, got %v", err)
+			if err == nil || err.Code != "42703" {
+				t.Fatalf("want 42703, got %v", err)
 			}
 		})
 	}
@@ -328,8 +329,8 @@ func TestCallPostFilterOrderUnknownColumn(t *testing.T) {
 		Order:    []ir.OrderTerm{{Path: []string{"ghost"}}},
 	}
 	_, err := Call(reg(filmsAfter()), nil, c, true, nil)
-	if err == nil || err.Code != "PGRST204" {
-		t.Fatalf("want PGRST204, got %v", err)
+	if err == nil || err.Code != "42703" {
+		t.Fatalf("want 42703, got %v", err)
 	}
 }
 

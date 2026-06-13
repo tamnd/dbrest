@@ -555,7 +555,7 @@ func validateCallFilters(fn *rpc.Function, c *ir.Call) *pgerr.APIError {
 			continue
 		}
 		if !has(col.Path) {
-			return pgerr.ErrUnknownColumn(col.Path[0])
+			return pgerr.ErrUndefinedColumn(col.Path[0])
 		}
 	}
 	if err := validateCallCond(cols, c.Where); err != nil {
@@ -563,7 +563,7 @@ func validateCallFilters(fn *rpc.Function, c *ir.Call) *pgerr.APIError {
 	}
 	for _, t := range c.Order {
 		if !has(t.Path) {
-			return pgerr.ErrUnknownColumn(t.Path[0])
+			return pgerr.ErrUndefinedColumn(t.Path[0])
 		}
 	}
 	return nil
@@ -595,7 +595,7 @@ func validateCallCond(cols map[string]bool, c *ir.Cond) *pgerr.APIError {
 		return validateCallCond(cols, &n.Kid)
 	case ir.Compare:
 		if len(n.Path) > 0 && !cols[n.Path[0]] {
-			return pgerr.ErrUnknownColumn(n.Path[0])
+			return pgerr.ErrUndefinedColumn(n.Path[0])
 		}
 	}
 	return nil
@@ -611,12 +611,12 @@ func validateWrite(rel *schema.Relation, w *ir.WriteSpec) *pgerr.APIError {
 	// compiler writes; validating it covers the payload that reaches SQL.
 	for _, c := range w.Columns {
 		if !rel.HasColumn(c) {
-			return pgerr.ErrUnknownColumn(c)
+			return pgerr.ErrUnknownColumn(c, rel.Name)
 		}
 	}
 	for k := range w.Set {
 		if !rel.HasColumn(k) {
-			return pgerr.ErrUnknownColumn(k)
+			return pgerr.ErrUnknownColumn(k, rel.Name)
 		}
 	}
 	if w.Conflict != nil && len(w.Conflict.Target) == 0 {
@@ -876,13 +876,16 @@ func findEmbedByName(embeds []ir.Embed, name string) *ir.Embed {
 
 // checkColumn validates that the base column of a path exists on the relation.
 // Only the base (first hop) is checked here; JSON sub-paths are opaque to the
-// model and validated when the JSON subsystem lands.
+// model and validated when the JSON subsystem lands. A column named in select, a
+// filter, or order that does not exist is PostgreSQL's 42703 (the reference
+// reaches the server under PostgREST), relation-qualified the way the server
+// spells it, not the schema-cache PGRST204 reserved for write payloads.
 func checkColumn(rel *schema.Relation, path []string) *pgerr.APIError {
 	if len(path) == 0 {
 		return nil
 	}
 	if !rel.HasColumn(path[0]) {
-		return pgerr.ErrUnknownColumn(path[0])
+		return pgerr.ErrUndefinedColumn(rel.Name + "." + path[0])
 	}
 	return nil
 }

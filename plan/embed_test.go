@@ -89,8 +89,10 @@ func TestEmbedHintDisambiguates(t *testing.T) {
 func TestEmbedUnknownColumnInEmbedIsRejected(t *testing.T) {
 	m := embedModel()
 	_, err := readEmbed(t, m, "title,people!director_id(nope)")
-	if err == nil || err.Code != "PGRST204" {
-		t.Fatalf("want PGRST204, got %v", err)
+	// An unknown column inside an embed's select reaches PostgreSQL: 42703
+	// (item 04.5), not the schema-cache PGRST204.
+	if err == nil || err.Code != "42703" {
+		t.Fatalf("want 42703, got %v", err)
 	}
 }
 

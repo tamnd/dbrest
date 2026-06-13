@@ -193,10 +193,15 @@ func TestUnknownTableIs404Code(t *testing.T) {
 func TestUnknownColumnIsError(t *testing.T) {
 	srv := newServer(t)
 	resp := do(t, srv, http.MethodGet, "/films?select=bogus", nil)
+	// An unknown select column reaches PostgreSQL: 42703 at 400 (item 04.5), not
+	// the schema-cache PGRST204 reserved for write payloads.
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
 	var env map[string]any
 	json.NewDecoder(resp.Body).Decode(&env)
-	if env["code"] != "PGRST204" {
-		t.Errorf("code = %v, want PGRST204", env["code"])
+	if env["code"] != "42703" {
+		t.Errorf("code = %v, want 42703", env["code"])
 	}
 }
 

@@ -69,12 +69,13 @@ func TestRelatedOrderToManyIsPGRST118(t *testing.T) {
 }
 
 // A related order naming a real embed but an unknown column on the target is the
-// ordinary unknown-column rejection (PGRST204), not a relation error.
+// ordinary unknown-column rejection (42703, the reference reaches PostgreSQL),
+// not a relation error.
 func TestRelatedOrderUnknownColumnIsRejected(t *testing.T) {
 	m := embedModel()
 	_, err := planOrder(t, m, "films",
 		"select=title,people!director_id(name)&order=people(nope).asc")
-	if err == nil || err.Code != "PGRST204" {
-		t.Fatalf("want PGRST204, got %v", err)
+	if err == nil || err.Code != "42703" {
+		t.Fatalf("want 42703, got %v", err)
 	}
 }

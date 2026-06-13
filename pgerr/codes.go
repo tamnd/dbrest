@@ -116,12 +116,14 @@ func ErrUnknownTable(name string) *APIError {
 }
 
 // ErrUnknownColumn is raised when a column named in a write payload or the
-// columns= parameter is not found on the target relation. PostgREST reserves
-// PGRST204 for those two; a column referenced by select, a filter, or order
-// reaches PostgreSQL instead and surfaces as 42703 (ErrUndefinedColumn).
-func ErrUnknownColumn(col string) *APIError {
+// columns= parameter is not found on the target relation; rel is that relation,
+// named in the message the way PostgREST spells PGRST204 ("Could not find the
+// 'X' column of 'Y' in the schema cache"). PostgREST reserves PGRST204 for those
+// two cases; a column referenced by select, a filter, or order reaches
+// PostgreSQL instead and surfaces as 42703 (ErrUndefinedColumn).
+func ErrUnknownColumn(col, rel string) *APIError {
 	return New(http.StatusBadRequest, CodeUnknownColumn,
-		fmt.Sprintf("Could not find the '%s' column in the schema cache", col))
+		fmt.Sprintf("Could not find the '%s' column of '%s' in the schema cache", col, rel))
 }
 
 // CodeUndefinedColumn is PostgreSQL's undefined_column. In PostgREST an unknown

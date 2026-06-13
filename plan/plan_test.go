@@ -42,8 +42,10 @@ func TestReadUnknownTable(t *testing.T) {
 func TestReadUnknownColumnInSelect(t *testing.T) {
 	q := &ir.Query{Relation: ir.Ref{Name: "films"}, Select: []ir.SelectItem{ir.Column{Path: []string{"bogus"}}}}
 	_, err := Read(model(), q, nil, Options{})
-	if err == nil || err.Code != "PGRST204" {
-		t.Fatalf("want PGRST204, got %v", err)
+	// A select column that does not exist reaches PostgreSQL: 42703, not the
+	// schema-cache PGRST204 reserved for write payloads (item 04.5).
+	if err == nil || err.Code != "42703" {
+		t.Fatalf("want 42703, got %v", err)
 	}
 }
 
@@ -51,16 +53,16 @@ func TestReadUnknownColumnInFilter(t *testing.T) {
 	where := ir.Cond(ir.Compare{Path: []string{"missing"}, Op: ir.OpEq, Value: ir.Value{Text: "x"}})
 	q := &ir.Query{Relation: ir.Ref{Name: "films"}, Where: &where}
 	_, err := Read(model(), q, nil, Options{})
-	if err == nil || err.Code != "PGRST204" {
-		t.Fatalf("want PGRST204, got %v", err)
+	if err == nil || err.Code != "42703" {
+		t.Fatalf("want 42703, got %v", err)
 	}
 }
 
 func TestReadUnknownColumnInOrder(t *testing.T) {
 	q := &ir.Query{Relation: ir.Ref{Name: "films"}, Order: []ir.OrderTerm{{Path: []string{"nope"}}}}
 	_, err := Read(model(), q, nil, Options{})
-	if err == nil || err.Code != "PGRST204" {
-		t.Fatalf("want PGRST204, got %v", err)
+	if err == nil || err.Code != "42703" {
+		t.Fatalf("want 42703, got %v", err)
 	}
 }
 
@@ -101,7 +103,7 @@ func TestReadNestedLogicalColumnChecked(t *testing.T) {
 	}})
 	q := &ir.Query{Relation: ir.Ref{Name: "films"}, Where: &where}
 	_, err := Read(model(), q, nil, Options{})
-	if err == nil || err.Code != "PGRST204" {
+	if err == nil || err.Code != "42703" {
 		t.Fatalf("nested unknown column should be caught, got %v", err)
 	}
 }
@@ -151,6 +153,12 @@ func TestWriteUnknownInsertColumn(t *testing.T) {
 	_, err := Write(model(), q, nil)
 	if err == nil || err.Code != "PGRST204" {
 		t.Fatalf("want PGRST204 for unknown insert column, got %v", err)
+	}
+	// A write payload is the schema-cache case PGRST204 is reserved for, and v14
+	// names the relation in the message (item 04.3).
+	want := "Could not find the 'bogus' column of 'films' in the schema cache"
+	if err.Message != want {
+		t.Errorf("message = %q, want %q", err.Message, want)
 	}
 }
 
@@ -325,8 +333,8 @@ func TestReadEmbedNullReclassifyLeavesColumns(t *testing.T) {
 	// title is not a directors column; the filter is a Compare, so column
 	// validation rejects it rather than mistaking it for an embed predicate.
 	_, err := Read(nullEmbedModel(), q, []string{"public"}, Options{})
-	if err == nil || err.Code != "PGRST204" {
-		t.Fatalf("want PGRST204 for unknown column, got %v", err)
+	if err == nil || err.Code != "42703" {
+		t.Fatalf("want 42703 for unknown filter column, got %v", err)
 	}
 }
 

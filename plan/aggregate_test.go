@@ -37,8 +37,10 @@ func TestAggregateArgColumnValidated(t *testing.T) {
 	// nope is not a films column; even with aggregates enabled the arg is checked.
 	q := aggQuery(ir.Aggregate{Func: ir.AggSum, Arg: &ir.Column{Path: []string{"nope"}}})
 	_, err := Read(model(), q, nil, Options{AggregatesEnabled: true})
-	if err == nil || err.Code != "PGRST204" {
-		t.Fatalf("want PGRST204 for unknown aggregate column, got %v", err)
+	// An aggregate over a column that does not exist reaches PostgreSQL: 42703
+	// (item 04.5), not the schema-cache PGRST204.
+	if err == nil || err.Code != "42703" {
+		t.Fatalf("want 42703 for unknown aggregate column, got %v", err)
 	}
 }
 
