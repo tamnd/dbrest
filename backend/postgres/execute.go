@@ -182,8 +182,11 @@ func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Co
 			res.controls.UpsertStatusKnown = true
 			res.controls.InsertedRows = inserted
 		}
-		res.cols, res.rows = cols, buf
+		// The affected count is the full mutated set, taken before the
+		// representation is shaped: order/limit/offset bound only the returned
+		// body, not the mutation (v13 dropped limited update/delete).
 		res.affected, res.hasAff = int64(len(buf)), true
+		res.cols, res.rows = cols, backend.ShapeWriteRepresentation(cols, buf, q)
 	} else {
 		tag, err := tx.Exec(ctx, st.SQL, st.Args...)
 		if err != nil {
