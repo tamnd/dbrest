@@ -22,6 +22,14 @@ func queueSessionItems(batch *pgx.Batch, b *Backend, rc *reqctx.Context) int {
 	if rc.Role != "" {
 		batch.Queue("SET LOCAL ROLE " + (Dialect{}).QuoteIdent(rc.Role))
 		n++
+		// Replay the impersonated role's ALTER ROLE ... SET settings as
+		// transaction-scoped settings, after the role switch and before the main
+		// statement, matching PostgREST. default_transaction_isolation is not here;
+		// it cannot be set after a statement has run, so it is applied at BeginTx.
+		for _, s := range b.roleSettings[rc.Role] {
+			batch.Queue("SELECT set_config($1,$2,true)", s.name, s.value)
+			n++
+		}
 	}
 	if sp := b.searchPathValue(rc); sp != "" {
 		// set_config(...,true) is SET LOCAL search_path. PostgREST sets it the same

@@ -50,15 +50,16 @@ func (b *Backend) Execute(ctx context.Context, plan *ir.Plan, rc *reqctx.Context
 // completes its batch before the main query is issued, so Parse runs as the
 // request role, which has the required privileges.
 func (b *Backend) executeRead(ctx context.Context, plan *ir.Plan, rc *reqctx.Context) (backend.Result, error) {
-	txOpts := pgx.TxOptions{AccessMode: pgx.ReadOnly}
+	txOpts := b.txOptions(rc, pgx.ReadOnly)
 	// A counted read runs the count and the page as two statements. At READ
 	// COMMITTED each takes its own snapshot, so a concurrent write between them can
 	// make the Content-Range total disagree with the rows returned. PostgREST
 	// reads both from one statement, hence one snapshot; pinning the transaction to
 	// REPEATABLE READ gives the two statements that same single snapshot. A
 	// read-only REPEATABLE READ transaction never raises a serialization error, so
-	// this only fixes consistency without adding a failure mode.
-	if plan.Query.Count != ir.CountNone {
+	// this only fixes consistency without adding a failure mode. A role that pins a
+	// stronger level (its default_transaction_isolation) keeps it.
+	if plan.Query.Count != ir.CountNone && !isoAtLeastRepeatableRead(txOpts.IsoLevel) {
 		txOpts.IsoLevel = pgx.RepeatableRead
 	}
 	tx, err := b.pool.BeginTx(ctx, txOpts)
@@ -103,7 +104,7 @@ func (b *Backend) executeRead(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 // returned rows. The transaction commits unless the client requested tx=rollback,
 // in which case the computed representation is returned but nothing is persisted.
 func (b *Backend) executeWrite(ctx context.Context, plan *ir.Plan, rc *reqctx.Context) (backend.Result, error) {
-	tx, err := b.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadWrite})
+	tx, err := b.pool.BeginTx(ctx, b.txOptions(rc, pgx.ReadWrite))
 	if err != nil {
 		return nil, b.MapError(err)
 	}
@@ -278,7 +279,7 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 		return b.executeCallRead(ctx, plan, rc, st)
 	}
 
-	tx, err := b.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadWrite})
+	tx, err := b.pool.BeginTx(ctx, b.txOptions(rc, pgx.ReadWrite))
 	if err != nil {
 		return nil, b.MapError(err)
 	}
@@ -332,7 +333,7 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 // executeCallRead handles a stable/immutable function in a read-only transaction.
 // An optional count runs as a separate statement before the function call itself.
 func (b *Backend) executeCallRead(ctx context.Context, plan *ir.Plan, rc *reqctx.Context, st *sqlgen.Statement) (backend.Result, error) {
-	tx, err := b.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	tx, err := b.pool.BeginTx(ctx, b.txOptions(rc, pgx.ReadOnly))
 	if err != nil {
 		return nil, b.MapError(err)
 	}
@@ -598,7 +599,7 @@ func (b *Backend) runExplain(ctx context.Context, tx pgx.Tx, opts backend.PlanOp
 // session setup (role + GUCs) so the planner sees the same context as a real
 // request.
 func (b *Backend) ExplainRead(ctx context.Context, p *ir.Plan, rc *reqctx.Context, opts backend.PlanOptions) ([]byte, error) {
-	tx, err := b.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	tx, err := b.pool.BeginTx(ctx, b.txOptions(rc, pgx.ReadOnly))
 	if err != nil {
 		return nil, b.MapError(err)
 	}
@@ -619,7 +620,7 @@ func (b *Backend) ExplainRead(ctx context.Context, p *ir.Plan, rc *reqctx.Contex
 // that always rolls back, so EXPLAIN ANALYZE (which executes the statement)
 // leaves nothing behind, matching PostgREST's plan-only contract.
 func (b *Backend) ExplainWrite(ctx context.Context, p *ir.Plan, rc *reqctx.Context, opts backend.PlanOptions) ([]byte, error) {
-	tx, err := b.pool.BeginTx(ctx, pgx.TxOptions{})
+	tx, err := b.pool.BeginTx(ctx, b.txOptions(rc, ""))
 	if err != nil {
 		return nil, b.MapError(err)
 	}
@@ -639,7 +640,7 @@ func (b *Backend) ExplainWrite(ctx context.Context, p *ir.Plan, rc *reqctx.Conte
 // ExplainCall runs EXPLAIN on the RPC function call. The read-write transaction
 // rolls back, so an EXPLAIN ANALYZE of a volatile function discards its effects.
 func (b *Backend) ExplainCall(ctx context.Context, p *ir.Plan, rc *reqctx.Context, opts backend.PlanOptions) ([]byte, error) {
-	tx, err := b.pool.BeginTx(ctx, pgx.TxOptions{})
+	tx, err := b.pool.BeginTx(ctx, b.txOptions(rc, ""))
 	if err != nil {
 		return nil, b.MapError(err)
 	}

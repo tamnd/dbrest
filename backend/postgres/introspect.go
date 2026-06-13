@@ -38,6 +38,16 @@ func (b *Backend) Introspect(ctx context.Context) (*schema.Model, error) {
 	}
 	b.funcVol = vol
 
+	// Impersonated-role settings (ALTER ROLE ... SET) are replayed per request as
+	// transaction-scoped settings, so they are loaded with the catalog and
+	// refreshed on every rebuild, the same lifecycle PostgREST gives them.
+	rs, iso, err := b.loadRoleSettings(ctx)
+	if err != nil {
+		return nil, err
+	}
+	b.roleSettings = rs
+	b.roleIsolation = iso
+
 	var out []*schema.Relation
 	for _, r := range rels {
 		cols, pk, err := b.columns(ctx, r.oid)

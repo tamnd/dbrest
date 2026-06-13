@@ -9,6 +9,7 @@ import (
 
 	"github.com/tamnd/dbrest/backend/postgres"
 	"github.com/tamnd/dbrest/ir"
+	"github.com/tamnd/dbrest/pgerr"
 	planpkg "github.com/tamnd/dbrest/plan"
 	"github.com/tamnd/dbrest/reqctx"
 )
@@ -1037,6 +1038,93 @@ func TestIntegrationNativeCallVolatilityAccessMode(t *testing.T) {
 	}
 	if n != 1 {
 		t.Errorf("after volatile insert POST rows = %d, want 1", n)
+	}
+}
+
+// TestIntegrationImpersonatedRoleSettings proves the backend replays an
+// impersonated role's ALTER ROLE ... SET settings as transaction-scoped settings,
+// like PostgREST: a role pinned to statement_timeout '50ms' carries that timeout
+// on every request, a slow call as that role is cancelled (SQLSTATE 57014 -> 500),
+// and the setting is transaction-scoped so it does not leak to a request that runs
+// without the role. Finding 02-P02. Verified against PostgREST 14.12.
+func TestIntegrationImpersonatedRoleSettings(t *testing.T) {
+	be := openBE(t)
+	ctx := context.Background()
+
+	// A role granted to the connected authenticator, pinned to a short timeout, so
+	// loadRoleSettings (which reads roles the authenticator is a member of) picks it
+	// up. Functions are PUBLIC-executable by default, so the role can call them.
+	if _, err := be.Pool().Exec(ctx, `
+		DROP ROLE IF EXISTS _dbrest_slow;
+		CREATE ROLE _dbrest_slow;
+		GRANT _dbrest_slow TO CURRENT_USER;
+		ALTER ROLE _dbrest_slow SET statement_timeout = '50ms';
+		CREATE OR REPLACE FUNCTION public._dbrest_show_timeout() RETURNS text
+			LANGUAGE sql STABLE AS $$ SELECT current_setting('statement_timeout') $$;
+		CREATE OR REPLACE FUNCTION public._dbrest_sleep() RETURNS text
+			LANGUAGE sql VOLATILE AS $$ SELECT pg_sleep(3)::text $$`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, `DROP FUNCTION IF EXISTS public._dbrest_show_timeout();
+			DROP FUNCTION IF EXISTS public._dbrest_sleep();
+			DROP ROLE IF EXISTS _dbrest_slow`)
+	})
+
+	// Refresh the catalog so the role's settings are loaded.
+	if _, err := be.Introspect(ctx); err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+
+	showTimeout := func(role string) string {
+		t.Helper()
+		plan := &ir.Plan{ReadOnly: true, Call: &ir.Call{
+			Function: ir.Ref{Name: "_dbrest_show_timeout"},
+			Args:     map[string]ir.Value{},
+		}}
+		res, err := be.Execute(ctx, plan, &reqctx.Context{Role: role, Method: "GET", Path: "/rpc/_dbrest_show_timeout"})
+		if err != nil {
+			t.Fatalf("show_timeout(%q): %v", role, err)
+		}
+		rs := res.Rows()
+		defer rs.Close()
+		if !rs.Next() {
+			t.Fatalf("show_timeout(%q): no rows", role)
+		}
+		vals, err := rs.Values()
+		if err != nil {
+			t.Fatalf("Values(%q): %v", role, err)
+		}
+		return vals[0].(string)
+	}
+
+	// The role carries its pinned timeout.
+	if got := showTimeout("_dbrest_slow"); got != "50ms" {
+		t.Errorf("statement_timeout as _dbrest_slow = %q, want 50ms", got)
+	}
+	// A request without the role does not inherit it (transaction-scoped, no leak).
+	if got := showTimeout(""); got == "50ms" {
+		t.Errorf("statement_timeout without the role = %q, want the server default (not 50ms)", got)
+	}
+
+	// A slow call as the role is cancelled by the pinned timeout.
+	sleepPlan := &ir.Plan{Call: &ir.Call{
+		Function: ir.Ref{Name: "_dbrest_sleep"},
+		Args:     map[string]ir.Value{},
+	}}
+	_, err := be.Execute(ctx, sleepPlan, &reqctx.Context{Role: "_dbrest_slow", Method: "POST", Path: "/rpc/_dbrest_sleep"})
+	if err == nil {
+		t.Fatal("slow call as _dbrest_slow: want a timeout error, got nil")
+	}
+	apiErr, ok := err.(*pgerr.APIError)
+	if !ok {
+		t.Fatalf("timeout error type = %T, want *pgerr.APIError", err)
+	}
+	if apiErr.Code != "57014" {
+		t.Errorf("timeout code = %q, want 57014", apiErr.Code)
+	}
+	if apiErr.HTTPStatus != 500 {
+		t.Errorf("timeout status = %d, want 500", apiErr.HTTPStatus)
 	}
 }
 
