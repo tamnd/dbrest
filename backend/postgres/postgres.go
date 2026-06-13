@@ -32,12 +32,12 @@ const defaultPoolMaxConns = 10
 // connection pool, the server version (which grades a couple of capabilities),
 // the function registry, and the search path applied to every request.
 type Backend struct {
-	pool          *pgxpool.Pool
-	version       Version
-	funcs         rpc.Registry
-	searchPath    []string
-	searchPathSQL string // pre-built "SET LOCAL search_path TO ..." statement
-	loc           *time.Location // server TimeZone, for rendering timestamptz like PostgREST
+	pool            *pgxpool.Pool
+	version         Version
+	funcs           rpc.Registry
+	searchPath      []string
+	extraSearchPath []string       // db-extra-search-path, appended after the active schema
+	loc             *time.Location // server TimeZone, for rendering timestamptz like PostgREST
 }
 
 // Open connects to PostgreSQL by connection string (a libpq URI or keyword/value
@@ -97,13 +97,22 @@ func (b *Backend) Pool() *pgxpool.Pool { return b.pool }
 // ServerVersion reports the parsed server version, for logging and tests.
 func (b *Backend) ServerVersion() Version { return b.version }
 
-// SetSchemas records the exposed schemas as the search path applied to every
-// request (SET LOCAL search_path), matching PostgREST's db-schemas behaviour so
-// unqualified names in policies and functions resolve the same way. The
-// corresponding SQL statement is pre-built once here and reused per request.
+// SetSchemas records the exposed schemas. The first is the default active
+// schema; the rest are reachable by Accept-Profile/Content-Profile. The
+// per-request search_path is built from the active schema (not the whole set),
+// matching PostgREST, which puts only the active schema plus db-extra-search-path
+// on the path so unqualified names resolve the same way (see queueSessionItems).
 func (b *Backend) SetSchemas(schemas []string) {
 	b.searchPath = schemas
-	b.searchPathSQL = buildSearchPathSQL(schemas)
+}
+
+// SetExtraSearchPath records db-extra-search-path: schemas appended to the
+// search_path after the active schema so type and function resolution can reach
+// them without exposing them as queryable schemas. PostgREST defaults this to
+// "public" and does not dedup, so a request on the public schema gets the path
+// "public", "public"; dbrest reproduces that verbatim.
+func (b *Backend) SetExtraSearchPath(schemas []string) {
+	b.extraSearchPath = schemas
 }
 
 // Register installs the portable function registry exposed at /rpc/<fn>. On

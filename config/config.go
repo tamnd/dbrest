@@ -170,6 +170,7 @@ func defaults() *Config {
 		ServerPort:         3000,
 		DBPool:             10,
 		OpenAPIMode:        OpenAPIFollowPrivileges,
+		ExtraSearchPath:    []string{"public"},
 		LogLevel:           "error",
 		TxEnd:              "commit",
 		HoistedTxSettings: []string{

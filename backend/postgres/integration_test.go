@@ -839,6 +839,122 @@ func TestIntegrationInListAny(t *testing.T) {
 	}
 }
 
+// TestIntegrationSearchPathShape proves the per-request search_path is the active
+// schema followed by db-extra-search-path (default "public"), not the whole
+// exposed schema set, and that the GUC string is the verbatim quoted value
+// PostgREST writes. It reads current_setting('search_path') through a native RPC
+// and switches the active schema via Accept-Profile (reqctx.Context.Schema).
+// Finding 02-P01. Verified against PostgREST 14.12, which sets the path with
+// set_config('search_path', '"<active>", "public"', true) and does not dedup, so
+// an active schema of public yields "public", "public".
+func TestIntegrationSearchPathShape(t *testing.T) {
+	be := openBE(t)
+	ctx := context.Background()
+
+	if _, err := be.Pool().Exec(ctx, `
+		CREATE SCHEMA IF NOT EXISTS _dbrest_sp1;
+		CREATE SCHEMA IF NOT EXISTS _dbrest_sp2;
+		CREATE OR REPLACE FUNCTION public.show_path() RETURNS text
+			LANGUAGE sql STABLE AS $$ SELECT current_setting('search_path') $$;
+		CREATE OR REPLACE FUNCTION _dbrest_sp1.show_path() RETURNS text
+			LANGUAGE sql STABLE AS $$ SELECT current_setting('search_path') $$;
+		CREATE OR REPLACE FUNCTION _dbrest_sp2.show_path() RETURNS text
+			LANGUAGE sql STABLE AS $$ SELECT current_setting('search_path') $$`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, `DROP FUNCTION IF EXISTS public.show_path();
+			DROP SCHEMA IF EXISTS _dbrest_sp1 CASCADE; DROP SCHEMA IF EXISTS _dbrest_sp2 CASCADE`)
+	})
+
+	path := func(schema string) string {
+		t.Helper()
+		plan := &ir.Plan{ReadOnly: true, Call: &ir.Call{
+			Function: ir.Ref{Name: "show_path"},
+			Args:     map[string]ir.Value{},
+			ReadOnly: true,
+		}}
+		res, err := be.Execute(ctx, plan, &reqctx.Context{Method: "GET", Path: "/rpc/show_path", Schema: schema})
+		if err != nil {
+			t.Fatalf("Execute(%q): %v", schema, err)
+		}
+		rs := res.Rows()
+		defer rs.Close()
+		if !rs.Next() {
+			t.Fatalf("Execute(%q): no rows", schema)
+		}
+		vals, err := rs.Values()
+		if err != nil {
+			t.Fatalf("Values(%q): %v", schema, err)
+		}
+		return vals[0].(string)
+	}
+
+	// Default active schema is public (the single configured schema), extra is the
+	// default "public"; PostgREST does not dedup, so the path is "public", "public".
+	be.SetSchemas([]string{"public"})
+	be.SetExtraSearchPath([]string{"public"})
+	if got := path(""); got != `"public", "public"` {
+		t.Errorf(`default search_path = %q, want "public", "public"`, got)
+	}
+
+	// Two exposed schemas: the active one (Accept-Profile) leads the path, not the
+	// first configured schema, and the whole set never appears.
+	be.SetSchemas([]string{"_dbrest_sp1", "_dbrest_sp2"})
+	if got := path("_dbrest_sp1"); got != `"_dbrest_sp1", "public"` {
+		t.Errorf(`sp1 search_path = %q, want "_dbrest_sp1", "public"`, got)
+	}
+	if got := path("_dbrest_sp2"); got != `"_dbrest_sp2", "public"` {
+		t.Errorf(`sp2 search_path = %q, want "_dbrest_sp2", "public"`, got)
+	}
+}
+
+// TestIntegrationSearchPathReachesExtra proves db-extra-search-path puts its
+// schemas on the path: a function running in a non-public active schema resolves
+// an unqualified helper defined in public because public is appended to the path.
+// Finding 02-P01.
+func TestIntegrationSearchPathReachesExtra(t *testing.T) {
+	be := openBE(t)
+	be.SetSchemas([]string{"_dbrest_spx"})
+	be.SetExtraSearchPath([]string{"public"})
+	ctx := context.Background()
+
+	if _, err := be.Pool().Exec(ctx, `
+		CREATE SCHEMA IF NOT EXISTS _dbrest_spx;
+		CREATE OR REPLACE FUNCTION public._dbrest_helper() RETURNS text
+			LANGUAGE sql IMMUTABLE AS $$ SELECT 'from-public' $$;
+		CREATE OR REPLACE FUNCTION _dbrest_spx.uses_helper() RETURNS text
+			LANGUAGE sql STABLE AS $$ SELECT _dbrest_helper() $$`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, `DROP FUNCTION IF EXISTS public._dbrest_helper();
+			DROP SCHEMA IF EXISTS _dbrest_spx CASCADE`)
+	})
+
+	plan := &ir.Plan{ReadOnly: true, Call: &ir.Call{
+		Function: ir.Ref{Name: "uses_helper"},
+		Args:     map[string]ir.Value{},
+		ReadOnly: true,
+	}}
+	res, err := be.Execute(ctx, plan, &reqctx.Context{Method: "GET", Path: "/rpc/uses_helper", Schema: "_dbrest_spx"})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	rs := res.Rows()
+	defer rs.Close()
+	if !rs.Next() {
+		t.Fatal("no rows")
+	}
+	vals, err := rs.Values()
+	if err != nil {
+		t.Fatalf("Values: %v", err)
+	}
+	if got := vals[0].(string); got != "from-public" {
+		t.Errorf("unqualified helper resolved to %q, want from-public", got)
+	}
+}
+
 func condPtr(c ir.Cond) *ir.Cond { return &c }
 func intPtr(n int) *int          { return &n }
 

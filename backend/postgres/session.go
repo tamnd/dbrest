@@ -23,8 +23,13 @@ func queueSessionItems(batch *pgx.Batch, b *Backend, rc *reqctx.Context) int {
 		batch.Queue("SET LOCAL ROLE " + (Dialect{}).QuoteIdent(rc.Role))
 		n++
 	}
-	if b.searchPathSQL != "" {
-		batch.Queue(b.searchPathSQL)
+	if sp := b.searchPathValue(rc); sp != "" {
+		// set_config(...,true) is SET LOCAL search_path. PostgREST sets it the same
+		// way rather than with SET ... TO <idents>, so the GUC string is the literal
+		// quoted value verbatim ("schema", "public"); a SET ... TO would let the
+		// server re-canonicalize and strip quotes from simple names, so a policy that
+		// reads current_setting('search_path') would see a different string.
+		batch.Queue("SELECT set_config('search_path',$1,true)", sp)
 		n++
 	}
 	if rc.TimeZone != "" {
@@ -112,19 +117,23 @@ func readResponseControls(ctx context.Context, tx pgx.Tx, controls *reqctx.Respo
 	return nil
 }
 
-// buildSearchPathSQL pre-computes the SET LOCAL search_path statement for a
-// Backend so the string is built once and reused per request.
-func buildSearchPathSQL(schemas []string) string {
-	if len(schemas) == 0 {
+// searchPathValue builds the per-request search_path GUC value. The path is the
+// request's active schema (the Accept-Profile/Content-Profile choice, or the
+// first configured schema by default) followed by db-extra-search-path, matching
+// PostgREST: only the active schema is on the path, not the whole exposed set,
+// and the extra entries are appended without deduplication. Each name is quoted,
+// so the joined string is the literal value PostgREST writes ("schema", "public").
+// An empty active schema (the emulated-namespace marker the engines without named
+// schemas use) yields an empty value, so no search_path is set.
+func (b *Backend) searchPathValue(rc *reqctx.Context) string {
+	active := b.callSchema(rc)
+	if active == "" {
 		return ""
 	}
-	var b strings.Builder
-	b.WriteString("SET LOCAL search_path TO ")
+	schemas := append([]string{active}, b.extraSearchPath...)
+	parts := make([]string, len(schemas))
 	for i, s := range schemas {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteString((Dialect{}).QuoteIdent(s))
+		parts[i] = (Dialect{}).QuoteIdent(s)
 	}
-	return b.String()
+	return strings.Join(parts, ", ")
 }
