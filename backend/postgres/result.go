@@ -137,6 +137,9 @@ func (s *bufStream) Close() error           { return nil }
 //     "2006-01-02T15:04:05[.ffffff]" with no suffix (Go would append "Z").
 //   - timestamptz (1184): render the instant in the server TimeZone with an ISO
 //     "+HH:MM" offset, matching PostgreSQL (Go's RFC3339 emits "Z" for UTC).
+//   - range / multirange: pgx returns pgtype.Range / pgtype.Multirange structs;
+//     format them to PostgreSQL's own range text ("[10,20)", "{[1,2),[5,8)}")
+//     rather than the Go struct json would marshal.
 //
 // loc is the server TimeZone; a nil loc defaults to UTC. Every other value is
 // left as pgx decoded it.
@@ -169,9 +172,168 @@ func normalizeValues(vals []any, fields []pgconn.FieldDescription, loc *time.Loc
 			if t.Valid {
 				vals[i] = formatInterval(t)
 			}
+		case pgtype.Range[any]:
+			if t.Valid {
+				vals[i] = formatRange(t, oid, loc)
+			}
+		case pgtype.Multirange[pgtype.Range[any]]:
+			vals[i] = formatMultirange(t, oid, loc)
 		}
 	}
 	return vals
+}
+
+// formatRange renders a range value as PostgreSQL's own text output (the spelling
+// `col::text` produces and the form PostgREST emits in JSON), instead of the
+// pgtype.Range Go struct json would otherwise marshal. An empty range is "empty";
+// otherwise the bracket reflects each bound's inclusivity ('[' / '(' lower, ']' /
+// ')' upper), an unbounded side renders as the empty string, and each present
+// bound is formatted by the range's element type and quoted by PostgreSQL's range
+// rules. oid is the range column OID, which selects the element formatting.
+func formatRange(r pgtype.Range[any], oid uint32, loc *time.Location) string {
+	if r.LowerType == pgtype.Empty || r.UpperType == pgtype.Empty {
+		return "empty"
+	}
+	var sb strings.Builder
+	if r.LowerType == pgtype.Inclusive {
+		sb.WriteByte('[')
+	} else {
+		sb.WriteByte('(')
+	}
+	if r.LowerType != pgtype.Unbounded {
+		sb.WriteString(quoteRangeBound(formatRangeElem(r.Lower, oid, loc)))
+	}
+	sb.WriteByte(',')
+	if r.UpperType != pgtype.Unbounded {
+		sb.WriteString(quoteRangeBound(formatRangeElem(r.Upper, oid, loc)))
+	}
+	if r.UpperType == pgtype.Inclusive {
+		sb.WriteByte(']')
+	} else {
+		sb.WriteByte(')')
+	}
+	return sb.String()
+}
+
+// formatMultirange renders a multirange as PostgreSQL's text output: the
+// brace-wrapped, comma-separated list of its member ranges. Each member is
+// formatted with the corresponding range OID so its element type is rendered the
+// same as a bare range.
+func formatMultirange(m pgtype.Multirange[pgtype.Range[any]], oid uint32, loc *time.Location) string {
+	relemOID := multirangeRangeOID(oid)
+	var sb strings.Builder
+	sb.WriteByte('{')
+	for i, r := range m {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(formatRange(r, relemOID, loc))
+	}
+	sb.WriteByte('}')
+	return sb.String()
+}
+
+// multirangeRangeOID maps a multirange OID to the OID of its member range type,
+// so formatRange formats each member's bounds by the right element type.
+func multirangeRangeOID(oid uint32) uint32 {
+	switch oid {
+	case pgtype.Int4multirangeOID:
+		return pgtype.Int4rangeOID
+	case pgtype.Int8multirangeOID:
+		return pgtype.Int8rangeOID
+	case pgtype.NummultirangeOID:
+		return pgtype.NumrangeOID
+	case pgtype.DatemultirangeOID:
+		return pgtype.DaterangeOID
+	case pgtype.TsmultirangeOID:
+		return pgtype.TsrangeOID
+	case pgtype.TstzmultirangeOID:
+		return pgtype.TstzrangeOID
+	}
+	return 0
+}
+
+// formatRangeElem renders one range bound by the range's element type. Temporal
+// element types are formatted to PostgreSQL's range text spelling (which uses the
+// raw timestamp output, not the ISO json spelling, so the timestamptz offset is
+// "+07" rather than "+07:00"); numeric elements use their decimal text, and the
+// rest fall back to their default string form.
+func formatRangeElem(v any, oid uint32, loc *time.Location) string {
+	switch oid {
+	case pgtype.DaterangeOID, pgtype.DatemultirangeOID:
+		if t, ok := v.(time.Time); ok {
+			return t.Format("2006-01-02")
+		}
+	case pgtype.TsrangeOID, pgtype.TsmultirangeOID:
+		if t, ok := v.(time.Time); ok {
+			return t.Format("2006-01-02 15:04:05.999999")
+		}
+	case pgtype.TstzrangeOID, pgtype.TstzmultirangeOID:
+		if t, ok := v.(time.Time); ok {
+			return formatTimestamptzText(t, loc)
+		}
+	}
+	switch x := v.(type) {
+	case pgtype.Numeric:
+		if b, err := x.MarshalJSON(); err == nil {
+			return string(b)
+		}
+	case []byte:
+		return string(x)
+	case string:
+		return x
+	}
+	return fmt.Sprint(v)
+}
+
+// formatTimestamptzText renders a timestamptz the way PostgreSQL's text output
+// (and thus range text) does: the wall clock in the server zone followed by a
+// signed offset that carries minutes only when non-zero and seconds rarer still,
+// e.g. "+07", "+05:30". This differs from the ISO "+07:00" json spelling used for
+// a bare timestamptz column.
+func formatTimestamptzText(t time.Time, loc *time.Location) string {
+	t = t.In(loc)
+	base := t.Format("2006-01-02 15:04:05.999999")
+	_, off := t.Zone()
+	sign := byte('+')
+	if off < 0 {
+		sign = '-'
+		off = -off
+	}
+	h := off / 3600
+	m := (off % 3600) / 60
+	s := off % 60
+	out := fmt.Sprintf("%s%c%02d", base, sign, h)
+	if m != 0 || s != 0 {
+		out += fmt.Sprintf(":%02d", m)
+	}
+	if s != 0 {
+		out += fmt.Sprintf(":%02d", s)
+	}
+	return out
+}
+
+// quoteRangeBound quotes a range bound the way PostgreSQL does: an empty string
+// or one containing a comma, brackets, parentheses, a quote, a backslash, or
+// whitespace is double-quoted with embedded quotes and backslashes escaped;
+// anything else is left bare.
+func quoteRangeBound(s string) string {
+	if s == "" {
+		return `""`
+	}
+	if !strings.ContainsAny(s, "(),[]\"\\ \t\n\r") {
+		return s
+	}
+	var sb strings.Builder
+	sb.WriteByte('"')
+	for _, r := range s {
+		if r == '"' || r == '\\' {
+			sb.WriteByte('\\')
+		}
+		sb.WriteRune(r)
+	}
+	sb.WriteByte('"')
+	return sb.String()
 }
 
 // formatTimeOfDay renders a time-of-day microsecond count as PostgreSQL's JSON
@@ -200,8 +362,8 @@ func formatInterval(iv pgtype.Interval) string {
 	mons := iv.Months % 12
 
 	var sb strings.Builder
-	wrote := false    // a field has been emitted
-	prevNeg := false  // the previous emitted field was negative
+	wrote := false   // a field has been emitted
+	prevNeg := false // the previous emitted field was negative
 
 	addInt := func(value int32, unit string) {
 		if value == 0 {

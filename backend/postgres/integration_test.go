@@ -2,6 +2,7 @@ package postgres_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -1533,6 +1534,103 @@ func TestIntegrationVoidCallStatus(t *testing.T) {
 	}
 	if got := status("_dbrest_void_volatile", "POST"); got != 204 {
 		t.Errorf("POST void status = %d, want 204", got)
+	}
+}
+
+// TestIntegrationRangeRendering proves int4range, numrange, daterange, tsrange,
+// tstzrange, and int4multirange columns render through the backend as the same
+// text PostgreSQL itself emits, instead of the pgtype.Range/Multirange Go structs
+// json would marshal. The expected values are read back with to_json so the
+// assertion tracks the live server's TimeZone for tstzrange. Finding 04-E05.
+func TestIntegrationRangeRendering(t *testing.T) {
+	be := openBE(t)
+	ctx := context.Background()
+
+	if _, err := be.Pool().Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS _dbrest_test_range (
+			id   int PRIMARY KEY,
+			i4   int4range,
+			nr   numrange,
+			dr   daterange,
+			tsr  tsrange,
+			ttzr tstzrange,
+			mr   int4multirange,
+			emp  int4range,
+			unb  int8range
+		);
+		TRUNCATE _dbrest_test_range;
+		INSERT INTO _dbrest_test_range VALUES (
+			1,
+			'[10,20)',
+			'(1.5,3.5]',
+			'[2020-01-01,2020-12-31)',
+			'[2020-01-01 10:00,2020-06-01 12:00)',
+			'[2020-01-01 10:00+05,2020-06-01 12:00+05)',
+			'{[1,3),[5,8)}',
+			'empty',
+			'[100,)'
+		)`); err != nil {
+		t.Fatalf("seed range table: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, "DROP TABLE IF EXISTS _dbrest_test_range")
+	})
+
+	cols := []string{"i4", "nr", "dr", "tsr", "ttzr", "mr", "emp", "unb"}
+	// The oracle: PostgreSQL's own JSON spelling for each column. to_json renders a
+	// range/multirange as a JSON string, so unmarshalling yields the bare text form
+	// (with the quoted-bound escaping already resolved) the renderer must produce.
+	want := make([]string, len(cols))
+	for i, c := range cols {
+		var j string
+		if err := be.Pool().QueryRow(ctx,
+			"SELECT to_json("+c+")::text FROM _dbrest_test_range WHERE id = 1").Scan(&j); err != nil {
+			t.Fatalf("oracle to_json(%s): %v", c, err)
+		}
+		if err := json.Unmarshal([]byte(j), &want[i]); err != nil {
+			t.Fatalf("oracle unmarshal(%s) %q: %v", c, j, err)
+		}
+	}
+
+	model, err := be.Introspect(ctx)
+	if err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+	rel, ok := model.Lookup("_dbrest_test_range", []string{"public"})
+	if !ok {
+		t.Fatal("_dbrest_test_range not found")
+	}
+	sel := make([]ir.SelectItem, len(cols))
+	for i, c := range cols {
+		sel[i] = ir.Column{Path: []string{c}}
+	}
+	plan := &ir.Plan{Rel: rel, Query: &ir.Query{
+		Kind:     ir.Read,
+		Relation: ir.Ref{Schema: "public", Name: "_dbrest_test_range"},
+		Select:   sel,
+	}}
+	res, err := be.Execute(ctx, plan, &reqctx.Context{Method: "GET", Path: "/_dbrest_test_range"})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	rs := res.Rows()
+	defer rs.Close()
+	if !rs.Next() {
+		t.Fatal("no rows")
+	}
+	vals, err := rs.Values()
+	if err != nil {
+		t.Fatalf("Values: %v", err)
+	}
+	for i, c := range cols {
+		got, ok := vals[i].(string)
+		if !ok {
+			t.Errorf("column %s rendered as %T (%v), want a string", c, vals[i], vals[i])
+			continue
+		}
+		if got != want[i] {
+			t.Errorf("column %s = %q, want %q (PostgreSQL to_json)", c, got, want[i])
+		}
 	}
 }
 
