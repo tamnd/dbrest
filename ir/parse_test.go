@@ -72,6 +72,41 @@ func TestParseEmbedInnerHint(t *testing.T) {
 	}
 }
 
+// TestParseEmbedHintWithInner covers a disambiguation hint composed with !inner
+// in either order, plus !hint!left (item 01.13).
+func TestParseEmbedHintWithInner(t *testing.T) {
+	cases := []struct {
+		sel  string
+		hint string
+		join JoinKind
+	}{
+		{"select=addresses!billing!inner(city)", "billing", JoinInner},
+		{"select=addresses!inner!billing(city)", "billing", JoinInner},
+		{"select=addresses!billing!left(city)", "billing", JoinLeft},
+		{"select=addresses!billing(city)", "billing", JoinLeft},
+	}
+	for _, c := range cases {
+		q := mustRead(t, c.sel)
+		emb := q.Embeds[0]
+		if emb.Target.Name != "addresses" {
+			t.Errorf("%s: target = %q, want addresses", c.sel, emb.Target.Name)
+		}
+		if emb.Hint != c.hint {
+			t.Errorf("%s: hint = %q, want %q", c.sel, emb.Hint, c.hint)
+		}
+		if emb.Join != c.join {
+			t.Errorf("%s: join = %v, want %v", c.sel, emb.Join, c.join)
+		}
+	}
+}
+
+func TestParseEmbedTwoHintsRejected(t *testing.T) {
+	_, err := ParseRead("films", "select=addresses!one!two(city)", nil)
+	if err == nil || err.Code != "PGRST100" {
+		t.Fatalf("want PGRST100 for two hints, got %v", err)
+	}
+}
+
 func TestParseFiltersAnded(t *testing.T) {
 	q := mustRead(t, "rating=gte.4&year=lt.2000")
 	and, ok := (*q.Where).(And)

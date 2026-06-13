@@ -677,16 +677,27 @@ func parseEmbed(raw string, lparen int) (Embed, *pgerr.APIError) {
 		emb.Alias = head[:c]
 		head = head[c+1:]
 	}
-	if b := strings.IndexByte(head, '!'); b >= 0 {
-		hint := head[b+1:]
-		head = head[:b]
-		switch hint {
-		case "inner":
-			emb.Join = JoinInner
-		case "left":
-			emb.Join = JoinLeft
-		default:
-			emb.Hint = hint
+	// A head may carry both a disambiguation hint and a join modifier, in either
+	// order (rel!hint!inner or rel!inner!hint). Split on every `!`: the first
+	// segment is the relation, each later one is "inner"/"left" (the join) or a
+	// hint. Two hints are a grammar error.
+	if strings.IndexByte(head, '!') >= 0 {
+		segs := strings.Split(head, "!")
+		head = segs[0]
+		sawHint := false
+		for _, seg := range segs[1:] {
+			switch seg {
+			case "inner":
+				emb.Join = JoinInner
+			case "left":
+				emb.Join = JoinLeft
+			default:
+				if sawHint {
+					return Embed{}, pgerr.ErrParse("embed carries more than one disambiguation hint")
+				}
+				emb.Hint = seg
+				sawHint = true
+			}
 		}
 	}
 	if strings.HasPrefix(head, "...") {
