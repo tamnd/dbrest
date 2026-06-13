@@ -1109,7 +1109,20 @@ func embedKeys(q *ir.Query) map[string]bool {
 		keys[k] = true
 	}
 	for i := range q.Embeds {
-		add(q.Embeds[i].OutKey)
+		emb := &q.Embeds[i]
+		// A spread embed lifts its columns flat rather than nesting under a key.
+		// A to-many spread lifts each column as a JSON array, so those lifted
+		// names must render raw; a to-one spread lifts plain scalars that render
+		// normally. A non-spread embed nests under its OutKey.
+		if emb.Spread {
+			if emb.Rel != nil && emb.Rel.Card != schema.CardToOne {
+				for _, name := range spreadLiftedNames(emb) {
+					add(name)
+				}
+			}
+			continue
+		}
+		add(emb.OutKey)
 	}
 	// A projection ending in -> (data->meta) yields JSON the renderer must splice
 	// verbatim, the same as an embed; a final ->> is text and renders normally.
@@ -1119,6 +1132,30 @@ func embedKeys(q *ir.Query) map[string]bool {
 		}
 	}
 	return keys
+}
+
+// spreadLiftedNames returns the parent-row column names a spread embed lifts,
+// mirroring the projection rules the sqlgen spread compiler uses: an empty or
+// star select lifts every target column; otherwise each named column lifts under
+// its output name.
+func spreadLiftedNames(emb *ir.Embed) []string {
+	target := emb.Rel.Target
+	if len(emb.Query.Select) == 0 {
+		return target.ColumnNames()
+	}
+	var names []string
+	for _, it := range emb.Query.Select {
+		c, ok := it.(ir.Column)
+		if !ok {
+			continue
+		}
+		if len(c.Path) == 1 && c.Path[0] == "*" {
+			names = append(names, target.ColumnNames()...)
+			continue
+		}
+		names = append(names, c.Name())
+	}
+	return names
 }
 
 // writeRead sets the headers and status for a successful read and writes the

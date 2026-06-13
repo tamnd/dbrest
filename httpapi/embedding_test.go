@@ -363,6 +363,48 @@ func TestRelatedEmptySelectInnerFilters(t *testing.T) {
 	}
 }
 
+// A to-one spread lifts the director's name straight onto the film row, with no
+// nested director object (item 07.9).
+func TestSpreadToOneLiftsColumn(t *testing.T) {
+	srv := newEmbedServer(t)
+	resp := do(t, srv, http.MethodGet,
+		"/films?select=title,...directors(director:name)&id=eq.1", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	rows := decodeArray(t, resp)
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	if _, nested := rows[0]["directors"]; nested {
+		t.Errorf("a spread must not nest a directors object, got %#v", rows[0])
+	}
+	if rows[0]["director"] != "Lang" {
+		t.Errorf("lifted director = %v, want Lang", rows[0]["director"])
+	}
+}
+
+// A to-many spread lifts the related column as an array onto the parent row.
+func TestSpreadToManyLiftsArray(t *testing.T) {
+	srv := newEmbedServer(t)
+	resp := do(t, srv, http.MethodGet,
+		"/directors?select=name,...films(title)&id=eq.1", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	rows := decodeArray(t, resp)
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	titles, ok := rows[0]["title"].([]any)
+	if !ok {
+		t.Fatalf("title = %#v, want an array", rows[0]["title"])
+	}
+	if len(titles) != 1 || titles[0] != "Metropolis" {
+		t.Errorf("lifted titles = %v, want [Metropolis]", titles)
+	}
+}
+
 func BenchmarkEmbedToMany(b *testing.B) {
 	srv := newEmbedServer(b)
 	req := httptest.NewRequest(http.MethodGet, "/directors?select=name,films(title)&order=id", nil)

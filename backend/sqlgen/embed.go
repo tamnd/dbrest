@@ -123,6 +123,21 @@ func (b *builder) writeEmbeddedSelect(q *ir.Query, parentAlias string) *pgerr.AP
 			if emb.EmptySelect {
 				continue
 			}
+			// A spread embed, ...client(name), lifts its columns into the parent
+			// row rather than nesting them under a key.
+			if emb.Spread {
+				pairs, err := b.spreadPairs(emb, parentAlias)
+				if err != nil {
+					return err
+				}
+				for _, p := range pairs {
+					sep()
+					b.sb.WriteString(p.Value)
+					b.sb.WriteString(" AS ")
+					b.sb.WriteString(b.d.QuoteIdent(p.Key))
+				}
+				continue
+			}
 			sub, err := b.embedExpr(emb, parentAlias)
 			if err != nil {
 				return err
@@ -316,6 +331,16 @@ func (b *builder) embedObject(emb *ir.Embed, alias string) (string, *pgerr.APIEr
 			if nested.EmptySelect {
 				continue
 			}
+			// A nested spread lifts its columns into this object, just as a
+			// top-level spread lifts into the parent row.
+			if nested.Spread {
+				lifted, err := b.spreadPairs(nested, alias)
+				if err != nil {
+					return "", err
+				}
+				pairs = append(pairs, lifted...)
+				continue
+			}
 			sub, err := b.embedExpr(nested, alias)
 			if err != nil {
 				return "", err
@@ -330,6 +355,87 @@ func (b *builder) embedObject(emb *ir.Embed, alias string) (string, *pgerr.APIEr
 		}
 	}
 	return b.d.JSONObject(pairs), nil
+}
+
+// spreadPairs lowers a spread embed (...rel) to the parent-level columns it
+// lifts, each a correlated subquery the caller projects flat into the parent row
+// (top level) or merges into the enclosing JSON object (nested). A to-one spread
+// lifts each column as a scalar; a to-many spread lifts each column as a JSON
+// array of that column's values across the related rows (v12.1). Renaming and
+// star expansion follow the ordinary projection rules. A spread over a
+// many-to-many relationship is not lowered and reports PGRST127 rather than emit
+// wrong SQL (item 07.9).
+func (b *builder) spreadPairs(emb *ir.Embed, parentAlias string) ([]Pair, *pgerr.APIError) {
+	rel := emb.Rel
+	if rel.Junction != nil {
+		return nil, pgerr.ErrUnsupported("spread over a many-to-many relationship", "sql")
+	}
+	b.aliasN++
+	alias := "t" + strconv.Itoa(b.aliasN)
+	from := b.qualify(ir.Ref{Schema: rel.Target.Schema, Name: rel.Target.Name}) + " " + alias
+
+	// The correlation predicate (join plus the embed's own filters) is shared by
+	// every lifted column, so render it once.
+	where, err := b.capture(func() *pgerr.APIError {
+		b.sb.WriteString(b.joinCond(alias, rel.Foreign, parentAlias, rel.Local))
+		return b.writeEmbedFilter(emb, alias)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	type lifted struct{ name, expr string }
+	var cols []lifted
+	saved := b.qual
+	b.qual = alias
+	addAll := func() {
+		for _, n := range rel.Target.ColumnNames() {
+			cols = append(cols, lifted{n, alias + "." + b.d.QuoteIdent(n)})
+		}
+	}
+	if len(emb.Query.Select) == 0 {
+		addAll()
+	} else {
+		for _, it := range emb.Query.Select {
+			col, ok := it.(ir.Column)
+			if !ok {
+				b.qual = saved
+				return nil, pgerr.ErrUnsupported("non-column item in a spread", "sql")
+			}
+			if isStar(col) {
+				addAll()
+				continue
+			}
+			expr, e := b.columnExpr(col)
+			if e != nil {
+				b.qual = saved
+				return nil, e
+			}
+			cols = append(cols, lifted{col.Name(), expr})
+		}
+	}
+	b.qual = saved
+
+	toMany := rel.Card != schema.CardToOne
+	pairs := make([]Pair, 0, len(cols))
+	for _, c := range cols {
+		var sub string
+		if toMany {
+			// COALESCE so a parent with no related rows lifts [] rather than NULL,
+			// matching the nested to-many array's empty case.
+			sub = "(SELECT COALESCE(" + b.d.JSONAgg(c.expr, "") + ", " +
+				b.d.Cast("'[]'", "json") + ") FROM " + from + " WHERE " + where + ")"
+		} else {
+			limClause := ""
+			lim := 1
+			if lo := b.d.LimitOffset(&lim, nil, false); lo != "" {
+				limClause = " " + lo
+			}
+			sub = "(SELECT " + c.expr + " FROM " + from + " WHERE " + where + limClause + ")"
+		}
+		pairs = append(pairs, Pair{Key: c.name, Value: sub})
+	}
+	return pairs, nil
 }
 
 // writeEmbedFilter appends the embed's own horizontal filters, ANDed onto the

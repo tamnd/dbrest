@@ -442,21 +442,103 @@ func TestEmbedEmptySelectInnerStillFilters(t *testing.T) {
 }
 
 // A spread embed is not yet lowered to SQL; it must report PGRST127 rather than
-// emit something wrong.
-func TestEmbedSpreadUnsupported(t *testing.T) {
+// A to-one spread (...director(name)) lifts the embedded column into the parent
+// row as a correlated scalar subquery aliased to the column name, not nested
+// under a relation key (item 07.9).
+func TestEmbedSpreadToOneLiftsColumns(t *testing.T) {
+	m := embedModel()
+	q := &ir.Query{
+		Relation: ir.Ref{Schema: "public", Name: "films"},
+		Select: []ir.SelectItem{
+			ir.Column{Path: []string{"title"}},
+			ir.EmbedRef{Index: 0},
+		},
+		Embeds: []ir.Embed{{
+			OutKey: "directors",
+			Spread: true,
+			Target: ir.Ref{Schema: "public", Name: "directors"},
+			Rel:    relate(t, m, "films", "directors"),
+			Query:  ir.Query{Select: []ir.SelectItem{ir.Column{Path: []string{"name"}}}},
+		}},
+	}
+	want := `SELECT t0."title", (SELECT t1."name" FROM "public"."directors" t1 ` +
+		`WHERE t1."id" = t0."director_id" LIMIT 1) AS "name" FROM "public"."films" t0`
+	if got := compileEmbed(t, q).SQL; got != want {
+		t.Errorf("\n got %q\nwant %q", got, want)
+	}
+}
+
+// A spread renames the lifted column when written col:alias, and the subquery is
+// aliased to the new name.
+func TestEmbedSpreadRenamesColumn(t *testing.T) {
+	m := embedModel()
+	q := &ir.Query{
+		Relation: ir.Ref{Schema: "public", Name: "films"},
+		Select: []ir.SelectItem{
+			ir.Column{Path: []string{"title"}},
+			ir.EmbedRef{Index: 0},
+		},
+		Embeds: []ir.Embed{{
+			OutKey: "directors",
+			Spread: true,
+			Target: ir.Ref{Schema: "public", Name: "directors"},
+			Rel:    relate(t, m, "films", "directors"),
+			Query:  ir.Query{Select: []ir.SelectItem{ir.Column{Path: []string{"name"}, Alias: "director_name"}}},
+		}},
+	}
+	if got := compileEmbed(t, q).SQL; !strings.Contains(got, `LIMIT 1) AS "director_name"`) {
+		t.Errorf("spread rename not applied, got %q", got)
+	}
+}
+
+// A to-many spread (...films(title)) lifts each column as a JSON array of that
+// column's values across the related rows, COALESCEd to [] for a parent with no
+// children (v12.1 semantics).
+func TestEmbedSpreadToManyLiftsArrays(t *testing.T) {
+	m := embedModel()
+	q := &ir.Query{
+		Relation: ir.Ref{Schema: "public", Name: "directors"},
+		Select: []ir.SelectItem{
+			ir.Column{Path: []string{"name"}},
+			ir.EmbedRef{Index: 0},
+		},
+		Embeds: []ir.Embed{{
+			OutKey: "films",
+			Spread: true,
+			Target: ir.Ref{Schema: "public", Name: "films"},
+			Rel:    relate(t, m, "directors", "films"),
+			Query:  ir.Query{Select: []ir.SelectItem{ir.Column{Path: []string{"title"}}}},
+		}},
+	}
+	got := compileEmbed(t, q).SQL
+	for _, want := range []string{
+		`json_group_array(t1."title")`,
+		`FROM "public"."films" t1 WHERE t1."director_id" = t0."id"`,
+		`) AS "title"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("to-many spread missing %q\n in %q", want, got)
+		}
+	}
+}
+
+// A spread over a many-to-many relationship is not lowered: it reports PGRST127
+// rather than emit wrong SQL.
+func TestEmbedSpreadManyToManyUnsupported(t *testing.T) {
 	m := embedModel()
 	q := &ir.Query{
 		Relation: ir.Ref{Schema: "public", Name: "films"},
 		Select:   []ir.SelectItem{ir.EmbedRef{Index: 0}},
 		Embeds: []ir.Embed{{
-			OutKey: "director",
+			OutKey: "actors",
 			Spread: true,
-			Target: ir.Ref{Schema: "public", Name: "directors"},
-			Rel:    relate(t, m, "films", "directors"),
+			Target: ir.Ref{Schema: "public", Name: "actors"},
+			Rel:    relate(t, m, "films", "actors"),
+			Query:  ir.Query{Select: []ir.SelectItem{ir.Column{Path: []string{"name"}}}},
 		}},
 	}
 	if _, err := CompileRead(embedStub{}, q); err == nil || err.Code != "PGRST127" {
-		t.Fatalf("spread embed err = %v, want PGRST127", err)
+		t.Fatalf("many-to-many spread err = %v, want PGRST127", err)
 	}
 }
 
