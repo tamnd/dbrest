@@ -38,6 +38,8 @@ type writeResult struct {
 	rows     [][]any
 	affected int64
 	hasAff   bool
+	count    int64
+	hasCount bool
 	controls *reqctx.ResponseControls
 }
 
@@ -45,7 +47,7 @@ func (r *writeResult) Body() io.Reader { return nil }
 func (r *writeResult) Rows() backend.RowStream {
 	return &bufStream{cols: r.cols, rows: r.rows, i: -1}
 }
-func (r *writeResult) Count() (int64, bool)                       { return 0, false }
+func (r *writeResult) Count() (int64, bool)                       { return r.count, r.hasCount }
 func (r *writeResult) Affected() (int64, bool)                    { return r.affected, r.hasAff }
 func (r *writeResult) ResponseControls() *reqctx.ResponseControls { return r.controls }
 

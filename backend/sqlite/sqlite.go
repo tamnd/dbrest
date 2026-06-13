@@ -209,6 +209,18 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 			rows.Close()
 			return nil, b.MapError(err)
 		}
+		// A portable function that steers the response projects reserved
+		// response-control columns. Buffer only then, so the common streaming
+		// path is untouched, lift the controls out, and strip them from the body.
+		if backend.HasResponseControlCols(cols) {
+			buf, err := drain(rows, len(cols))
+			rows.Close()
+			if err != nil {
+				return nil, b.MapError(err)
+			}
+			cols, buf = backend.LiftResponseControls(cols, buf, res.controls)
+			return &writeResult{cols: cols, rows: buf, count: res.count, hasCount: res.hasCount, controls: res.controls}, nil
+		}
 		res.rows, res.cols = rows, cols
 		return res, nil
 	}
@@ -234,7 +246,12 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 		return nil, b.MapError(err)
 	}
 
-	res := &writeResult{cols: cols, rows: buf, controls: rc.Controls()}
+	// A volatile function steers the response the same way a read-only one does:
+	// reserved columns lift into the controls and drop out of the body.
+	controls := rc.Controls()
+	cols, buf = backend.LiftResponseControls(cols, buf, controls)
+
+	res := &writeResult{cols: cols, rows: buf, controls: controls}
 	if plan.Call.Prefer.Tx != nil && *plan.Call.Prefer.Tx == ir.TxRollback {
 		return res, nil
 	}

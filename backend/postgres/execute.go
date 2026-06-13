@@ -277,6 +277,12 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 	if err := readResponseControls(ctx, tx, res.controls); err != nil {
 		return nil, b.MapError(err)
 	}
+	// A portable registry function may steer the response with reserved columns
+	// instead of the GUCs (the engine-agnostic mechanism); lift them out here too
+	// so a portable function behaves the same on postgres as on an emulated
+	// backend. A native function sets the GUCs and carries no such columns, so
+	// this is a no-op for it.
+	res.cols, res.rows = backend.LiftResponseControls(res.cols, res.rows, res.controls)
 	// Void-returning functions produce no meaningful body; signal 204 to the
 	// HTTP layer unless the function already set a status override via GUC.
 	if isVoid && res.controls.Status == 0 {
