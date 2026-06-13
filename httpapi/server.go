@@ -581,12 +581,13 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 		body = b
 	}
 
-	// A portable function with a single unnamed parameter takes the whole POST
-	// body as that argument, decoded by Content-Type. The native path discovers
-	// its own signatures, so it leaves the unnamed binding to the engine.
+	// A function with a single unnamed parameter takes the whole POST body as that
+	// argument, decoded by Content-Type. Both the portable registry and the native
+	// registry (once introspected) report this form, so the body is bound to the
+	// parameter rather than read as a JSON object of named arguments.
 	rawBodyParam, rawBodyType := "", ""
-	if !isGet && !s.backend.Capabilities().NativeRPC {
-		rawBodyParam, rawBodyType = singleRawBodyParam(s.backend.Functions(), fn)
+	if !isGet {
+		rawBodyParam, rawBodyType = singleRawBodyParam(s.rpcRegistry(activeSchema), fn)
 	}
 
 	t := timerFrom(r.Context())
@@ -630,13 +631,25 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 	planStart := time.Now()
 	var planned *ir.Plan
 	if s.backend.Capabilities().NativeRPC {
-		// PostgreSQL (and any other NativeRPC backend) discovers and executes
-		// the function from its own catalog. We skip the portable-registry lookup
-		// and build a minimal plan: ReadOnly follows the HTTP method (GET/HEAD
-		// means read-only; POST means the function may write). The engine enforces
-		// the volatility constraint — if a GET reaches a volatile function the
-		// read-only transaction fails with SQLSTATE 25006, which maps to 405.
-		planned = &ir.Plan{Call: call, ReadOnly: isGet}
+		// A NativeRPC backend that introspects its functions resolves a known name
+		// through the shared planner: overload resolution (PGRST202/PGRST203), GET
+		// argument-versus-filter partitioning, declared-type argument coercion, and
+		// the volatility-driven access mode (a POST to a STABLE or IMMUTABLE function
+		// runs read-only) all match the portable path. An unknown name (one the
+		// introspection did not model) falls back to a minimal engine-planned call so
+		// it still reaches the catalog rather than 404ing on a registry miss; the
+		// engine then enforces volatility (a GET to a volatile function fails with
+		// SQLSTATE 25006, mapped to 405).
+		reg := s.rpcRegistry(activeSchema)
+		if registryKnows(reg, call.Function.Name) {
+			planned, apiErr = plan.Call(reg, s.Model(), call, isGet, []string{activeSchema})
+			if apiErr != nil {
+				writeError(w, apiErr)
+				return
+			}
+		} else {
+			planned = &ir.Plan{Call: call, ReadOnly: isGet}
+		}
 	} else {
 		planned, apiErr = plan.Call(s.backend.Functions(), s.Model(), call, isGet, []string{activeSchema})
 		if apiErr != nil {
@@ -694,6 +707,34 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 // name and returns the first single-raw-body match; an absent or multi-parameter
 // function yields empty strings, leaving the normal named-arguments path. See
 // spec 12-rpc and the PostgREST single-unnamed-parameter rule.
+// rpcRegistry is the registry an RPC resolves against in the active schema. A
+// NativeRPC backend that introspects its functions (SchemaFunctioner) resolves
+// against that schema's native registry, so overload resolution, GET argument
+// partitioning, and the volatility-driven access mode all run through the shared
+// planner; any other backend uses the single portable registry for every schema.
+func (s *Server) rpcRegistry(activeSchema string) rpc.Registry {
+	if s.backend.Capabilities().NativeRPC {
+		if sf, ok := s.backend.(backend.SchemaFunctioner); ok {
+			return sf.SchemaFunctions(activeSchema)
+		}
+	}
+	return s.backend.Functions()
+}
+
+// registryKnows reports whether a registry has any overload of a function name. The
+// native path resolves a known name through the planner (so a wrong argument set is
+// PGRST202 and an ambiguous one PGRST203) and falls back to a minimal engine-planned
+// call for an unknown name, so a function the introspection did not model still
+// reaches the engine rather than 404ing on a registry miss.
+func registryKnows(reg rpc.Registry, name string) bool {
+	for _, fn := range reg.List() {
+		if fn.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 func singleRawBodyParam(reg rpc.Registry, name string) (string, string) {
 	for _, fn := range reg.List() {
 		if fn.Name != name {

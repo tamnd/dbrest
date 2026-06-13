@@ -433,6 +433,179 @@ func TestIntegrationFunctionRegistry(t *testing.T) {
 	}
 }
 
+// TestIntegrationNativeResolution covers finding 03-P03 end to end: a native RPC
+// resolves through the shared planner against the introspected registry, the same
+// way the portable path does. It proves overload resolution and its error codes
+// (PGRST202 for no match, PGRST203 for ambiguity), GET argument-versus-filter
+// partitioning, the volatility-driven access mode (a POST to a STABLE function runs
+// read-only), and that the resolved plan lowers and runs against the live engine.
+func TestIntegrationNativeResolution(t *testing.T) {
+	be := openBE(t)
+	be.SetSchemas([]string{"_dbrest_res"})
+	ctx := context.Background()
+
+	if _, err := be.Pool().Exec(ctx, `
+		CREATE SCHEMA IF NOT EXISTS _dbrest_res;
+		CREATE OR REPLACE FUNCTION _dbrest_res.add2(a int, b int) RETURNS int
+			LANGUAGE sql IMMUTABLE AS $$ SELECT a + b $$;
+		CREATE OR REPLACE FUNCTION _dbrest_res.films(year int) RETURNS TABLE(id int, title text, yr int)
+			LANGUAGE sql STABLE AS $$ SELECT * FROM (VALUES (1,'Dune',2021),(2,'Arrival',2016)) v(id,title,yr) WHERE yr >= year $$;
+		-- two overloads with the same parameter name but different types: a call
+		-- naming {a} satisfies both equally, which is PostgREST's PGRST203.
+		CREATE OR REPLACE FUNCTION _dbrest_res.amb(a int) RETURNS int
+			LANGUAGE sql STABLE AS $$ SELECT a $$;
+		CREATE OR REPLACE FUNCTION _dbrest_res.amb(a text) RETURNS text
+			LANGUAGE sql STABLE AS $$ SELECT a $$;
+		-- single unnamed json parameter: the whole POST body binds to it.
+		CREATE OR REPLACE FUNCTION _dbrest_res.takejson(json) RETURNS int
+			LANGUAGE sql STABLE AS $$ SELECT ($1->>'n')::int $$`); err != nil {
+		t.Fatalf("seed functions: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = be.Pool().Exec(ctx, "DROP SCHEMA IF EXISTS _dbrest_res CASCADE")
+	})
+	model, err := be.Introspect(ctx)
+	if err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+	reg := be.SchemaFunctions("_dbrest_res")
+	schemas := []string{"_dbrest_res"}
+
+	// PGRST202: an argument set no overload accepts (add2 has no parameter z).
+	t.Run("no overload is PGRST202", func(t *testing.T) {
+		call, apiErr := ir.ParseCall("add2", "", nil, false, "application/json", []byte(`{"a":1,"z":2}`), "", "")
+		if apiErr != nil {
+			t.Fatalf("ParseCall: %v", apiErr)
+		}
+		_, perr := planpkg.Call(reg, model, call, false, schemas)
+		if perr == nil || perr.Code != pgerr.CodeNoFunction {
+			t.Fatalf("plan.Call error = %v, want %s", perr, pgerr.CodeNoFunction)
+		}
+	})
+
+	// PGRST203: an argument set two overloads accept equally well.
+	t.Run("ambiguous overload is PGRST203", func(t *testing.T) {
+		call, apiErr := ir.ParseCall("amb", "", nil, false, "application/json", []byte(`{"a":1}`), "", "")
+		if apiErr != nil {
+			t.Fatalf("ParseCall: %v", apiErr)
+		}
+		_, perr := planpkg.Call(reg, model, call, false, schemas)
+		if perr == nil || perr.Code != pgerr.CodeAmbiguousFunc {
+			t.Fatalf("plan.Call error = %v, want %s", perr, pgerr.CodeAmbiguousFunc)
+		}
+	})
+
+	// GET argument-versus-filter partitioning: year is a parameter, title is a
+	// post-filter on the table result. After planning, the call carries year as an
+	// argument and title as a WHERE, and the lowered query applies both.
+	t.Run("GET partitions args from filters", func(t *testing.T) {
+		call, apiErr := ir.ParseCall("films", "year=2015&title=eq.Arrival", nil, true, "", nil, "", "")
+		if apiErr != nil {
+			t.Fatalf("ParseCall: %v", apiErr)
+		}
+		plan, perr := planpkg.Call(reg, model, call, true, schemas)
+		if perr != nil {
+			t.Fatalf("plan.Call: %v", perr)
+		}
+		if _, ok := call.Args["year"]; !ok {
+			t.Errorf("year should remain an argument, args = %v", call.Args)
+		}
+		if call.Where == nil {
+			t.Error("title=eq.Arrival should have been reclassified as a post-filter")
+		}
+		res, err := be.Execute(ctx, plan, &reqctx.Context{Method: "GET", Path: "/rpc/films"})
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		rs := res.Rows()
+		var titles []string
+		for rs.Next() {
+			vals, _ := rs.Values()
+			for i, c := range rs.Columns() {
+				if c == "title" {
+					titles = append(titles, vals[i].(string))
+				}
+			}
+		}
+		rs.Close()
+		// year>=2015 leaves Dune and Arrival; title=eq.Arrival narrows to Arrival.
+		if len(titles) != 1 || titles[0] != "Arrival" {
+			t.Errorf("filtered titles = %v, want [Arrival]", titles)
+		}
+	})
+
+	// A POST to a STABLE function runs read-only: plan.ReadOnly is set from the
+	// introspected volatility, not from the HTTP method.
+	t.Run("POST to stable runs read-only", func(t *testing.T) {
+		call, apiErr := ir.ParseCall("add2", "", nil, false, "application/json", []byte(`{"a":2,"b":3}`), "", "")
+		if apiErr != nil {
+			t.Fatalf("ParseCall: %v", apiErr)
+		}
+		plan, perr := planpkg.Call(reg, model, call, false, schemas)
+		if perr != nil {
+			t.Fatalf("plan.Call: %v", perr)
+		}
+		if !plan.ReadOnly {
+			t.Error("POST to an IMMUTABLE function should plan read-only")
+		}
+		res, err := be.Execute(ctx, plan, &reqctx.Context{Method: "POST", Path: "/rpc/add2"})
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		rs := res.Rows()
+		var sum int32
+		for rs.Next() {
+			vals, _ := rs.Values()
+			sum = vals[0].(int32)
+		}
+		rs.Close()
+		if sum != 5 {
+			t.Errorf("add2(2,3) = %d, want 5", sum)
+		}
+	})
+
+	// A function with a single unnamed body-typed parameter takes the whole POST
+	// body as that argument. The registry marks it raw-body, ParseCall binds the
+	// body to it positionally, and compileNativeCall splices it as the lone literal.
+	t.Run("single unnamed param binds the raw body", func(t *testing.T) {
+		var fn *rpc.Function
+		for _, f := range reg.List() {
+			if f.Name == "takejson" {
+				fn = f
+			}
+		}
+		if fn == nil {
+			t.Fatal("takejson missing from registry")
+		}
+		p, raw := fn.SingleRawBody()
+		if !raw {
+			t.Fatalf("takejson is not single-raw-body, params %+v", fn.Params)
+		}
+		call, apiErr := ir.ParseCall("takejson", "", nil, false, "application/json", []byte(`{"n":7}`), p.Name, p.Type)
+		if apiErr != nil {
+			t.Fatalf("ParseCall: %v", apiErr)
+		}
+		plan, perr := planpkg.Call(reg, model, call, false, schemas)
+		if perr != nil {
+			t.Fatalf("plan.Call: %v", perr)
+		}
+		res, err := be.Execute(ctx, plan, &reqctx.Context{Method: "POST", Path: "/rpc/takejson"})
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		rs := res.Rows()
+		var got int32
+		for rs.Next() {
+			vals, _ := rs.Values()
+			got = vals[0].(int32)
+		}
+		rs.Close()
+		if got != 7 {
+			t.Errorf("takejson({n:7}) = %d, want 7", got)
+		}
+	})
+}
+
 // TestIntegrationNativeVolatileCount covers finding 03-P02: a POST to a VOLATILE
 // set-returning function with Prefer: count=exact returns the exact total over the
 // filtered set, and the function runs exactly once. The read path counts with a

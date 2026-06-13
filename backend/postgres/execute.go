@@ -14,6 +14,7 @@ import (
 	"github.com/tamnd/dbrest/ir"
 	"github.com/tamnd/dbrest/pgerr"
 	"github.com/tamnd/dbrest/reqctx"
+	"github.com/tamnd/dbrest/rpc"
 	"github.com/tamnd/dbrest/schema"
 )
 
@@ -303,7 +304,7 @@ func (b *Backend) executeCall(ctx context.Context, plan *ir.Plan, rc *reqctx.Con
 	if portableCall(plan) {
 		st, apiErr = sqlgen.CompileCall(Dialect{}, plan.Call, plan.Func, sqlgen.ContextArgs(rc))
 	} else {
-		st, apiErr = b.compileNativeCall(plan.Call, b.callSchema(rc))
+		st, apiErr = b.compileNativeCall(plan.Call, b.callSchema(rc), plan.Func)
 		if apiErr == nil {
 			// A table-valued function result supports the same select, filters,
 			// ordering, and window a table read does; the registry path wraps for
@@ -425,7 +426,7 @@ func (b *Backend) executeCallRead(ctx context.Context, plan *ir.Plan, rc *reqctx
 		if portableCall(plan) {
 			cst, apiErr = sqlgen.CompileCallCount(Dialect{}, plan.Call, plan.Func, sqlgen.ContextArgs(rc))
 		} else {
-			cst, apiErr = b.compileNativeCallCount(plan.Call, b.callSchema(rc))
+			cst, apiErr = b.compileNativeCallCount(plan.Call, b.callSchema(rc), plan.Func)
 		}
 		if apiErr != nil {
 			return nil, apiErr
@@ -493,7 +494,7 @@ func (b *Backend) callSchema(rc *reqctx.Context) string {
 // signature and the call does not depend on pgx OID mapping. String values are
 // single-quote escaped; numeric JSON values are written as numeric literals;
 // booleans become TRUE/FALSE; null or absent values become NULL.
-func (b *Backend) compileNativeCall(c *ir.Call, schema string) (*sqlgen.Statement, *pgerr.APIError) {
+func (b *Backend) compileNativeCall(c *ir.Call, schema string, fn *rpc.Function) (*sqlgen.Statement, *pgerr.APIError) {
 	d := Dialect{}
 	var sb strings.Builder
 	sb.WriteString("SELECT * FROM ")
@@ -502,15 +503,42 @@ func (b *Backend) compileNativeCall(c *ir.Call, schema string) (*sqlgen.Statemen
 	sb.WriteString(d.QuoteIdent(c.Function.Name))
 	sb.WriteString("(")
 
-	i := 0
-	for name, val := range c.Args {
-		if i > 0 {
-			sb.WriteString(", ")
+	if fn != nil && len(fn.Params) > 0 {
+		// With a resolved descriptor the arguments are spliced in declared parameter
+		// order, which keeps the generated SQL text stable across identical requests
+		// (Go map iteration is randomized) so the pgx statement cache hits. A
+		// single-raw-body parameter is unnamed in the catalog, so it is passed
+		// positionally; every other argument uses the name := value form. Omitted
+		// optional arguments are left out, taking the function's default.
+		first := true
+		for _, p := range fn.Params {
+			val, ok := c.Args[p.Name]
+			if !ok {
+				continue
+			}
+			if !first {
+				sb.WriteString(", ")
+			}
+			if !p.RawBody {
+				sb.WriteString(d.QuoteIdent(p.Name))
+				sb.WriteString(" := ")
+			}
+			appendNativeArg(&sb, val)
+			first = false
 		}
-		sb.WriteString(d.QuoteIdent(name))
-		sb.WriteString(" := ")
-		appendNativeArg(&sb, val)
-		i++
+	} else {
+		// No descriptor (a function not introspected): fall back to the named form in
+		// map order. The result is correct, only non-deterministic in column text.
+		i := 0
+		for name, val := range c.Args {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString(d.QuoteIdent(name))
+			sb.WriteString(" := ")
+			appendNativeArg(&sb, val)
+			i++
+		}
 	}
 	sb.WriteString(")")
 	return &sqlgen.Statement{SQL: sb.String()}, nil
@@ -521,8 +549,8 @@ func (b *Backend) compileNativeCall(c *ir.Call, schema string) (*sqlgen.Statemen
 // sqlgen.CompileCallCount (plan.Func is nil), so the count is built here over the
 // same SELECT * FROM schema.fn(...) the row query runs; a scalar-returning function
 // yields its single row and counts as one, a setof yields its rows.
-func (b *Backend) compileNativeCallCount(c *ir.Call, schema string) (*sqlgen.Statement, *pgerr.APIError) {
-	inner, apiErr := b.compileNativeCall(c, schema)
+func (b *Backend) compileNativeCallCount(c *ir.Call, schema string, fn *rpc.Function) (*sqlgen.Statement, *pgerr.APIError) {
+	inner, apiErr := b.compileNativeCall(c, schema, fn)
 	if apiErr != nil {
 		return nil, apiErr
 	}
@@ -791,7 +819,7 @@ func (b *Backend) ExplainCall(ctx context.Context, p *ir.Plan, rc *reqctx.Contex
 	if portableCall(p) {
 		st, apiErr = sqlgen.CompileCall(Dialect{}, p.Call, p.Func, sqlgen.ContextArgs(rc))
 	} else {
-		st, apiErr = b.compileNativeCall(p.Call, b.callSchema(rc))
+		st, apiErr = b.compileNativeCall(p.Call, b.callSchema(rc), p.Func)
 		if apiErr == nil {
 			st, apiErr = sqlgen.CompileNativeCallWrap(Dialect{}, p.Call, st)
 		}

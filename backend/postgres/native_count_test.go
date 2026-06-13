@@ -19,11 +19,11 @@ func TestCompileNativeCallCountWrapsCall(t *testing.T) {
 	b := &Backend{searchPath: []string{"public"}}
 	c := &ir.Call{Function: ir.Ref{Name: "recent_films"}}
 
-	row, apiErr := b.compileNativeCall(c, "public")
+	row, apiErr := b.compileNativeCall(c, "public", nil)
 	if apiErr != nil {
 		t.Fatalf("compileNativeCall: %v", apiErr)
 	}
-	cnt, apiErr := b.compileNativeCallCount(c, "public")
+	cnt, apiErr := b.compileNativeCallCount(c, "public", nil)
 	if apiErr != nil {
 		t.Fatalf("compileNativeCallCount: %v", apiErr)
 	}
@@ -45,7 +45,7 @@ func TestCompileNativeCallCountWithArgs(t *testing.T) {
 		Function: ir.Ref{Name: "search"},
 		Args:     map[string]ir.Value{"q": {Text: "blade"}},
 	}
-	cnt, apiErr := b.compileNativeCallCount(c, "app")
+	cnt, apiErr := b.compileNativeCallCount(c, "app", nil)
 	if apiErr != nil {
 		t.Fatalf("compileNativeCallCount: %v", apiErr)
 	}
@@ -68,7 +68,7 @@ func TestCompileNativeCallCountedWrapRidesWindow(t *testing.T) {
 	b := &Backend{searchPath: []string{"public"}}
 	c := &ir.Call{Function: ir.Ref{Name: "enroll_and_list"}}
 
-	inner, apiErr := b.compileNativeCall(c, "public")
+	inner, apiErr := b.compileNativeCall(c, "public", nil)
 	if apiErr != nil {
 		t.Fatalf("compileNativeCall: %v", apiErr)
 	}
@@ -93,7 +93,7 @@ func TestCompileNativeCallCountedWrapPostFilters(t *testing.T) {
 		Select:   []ir.SelectItem{col("title")},
 		Limit:    &limit,
 	}
-	inner, apiErr := b.compileNativeCall(c, "public")
+	inner, apiErr := b.compileNativeCall(c, "public", nil)
 	if apiErr != nil {
 		t.Fatalf("compileNativeCall: %v", apiErr)
 	}

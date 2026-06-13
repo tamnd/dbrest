@@ -45,6 +45,17 @@ type Backend interface {
 	Close() error
 }
 
+// SchemaFunctioner is an optional capability of a NativeRPC backend that
+// introspects its own functions: it exposes them as a registry per exposed schema,
+// the function half of the schema cache. The frontend uses it to resolve native
+// overloads, raise PGRST202/PGRST203, and partition GET arguments from result
+// filters through the same planner the portable registry uses, instead of building
+// a minimal plan and deferring everything to the engine. A backend that does not
+// implement it keeps the verb-derived minimal plan. PostgreSQL implements it.
+type SchemaFunctioner interface {
+	SchemaFunctions(schema string) rpc.Registry
+}
+
 // Result is the streaming response abstraction. A backend returns either an
 // assembled Body (the engine built the JSON) or a RowStream the renderer shapes
 // in Go. Which one is recorded by the JSONAssembly capability (spec 03).
