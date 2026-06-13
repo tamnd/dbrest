@@ -433,3 +433,32 @@ const (
 	TxCommit
 	TxRollback
 )
+
+// TxEnd is the db-tx-end server policy that governs whether a request may
+// override the transaction outcome with Prefer: tx=. The two allow-override
+// variants honor the preference; the two fixed variants ignore it and force
+// their outcome server-side.
+type TxEnd uint8
+
+const (
+	TxEndCommit TxEnd = iota
+	TxEndCommitAllowOverride
+	TxEndRollback
+	TxEndRollbackAllowOverride
+)
+
+// ParseTxEnd maps a db-tx-end option string to a TxEnd. An empty or unknown
+// value is the default commit, matching the config default; the config layer
+// validates the spelling before this point.
+func ParseTxEnd(s string) TxEnd {
+	switch s {
+	case "commit-allow-override":
+		return TxEndCommitAllowOverride
+	case "rollback":
+		return TxEndRollback
+	case "rollback-allow-override":
+		return TxEndRollbackAllowOverride
+	default:
+		return TxEndCommit
+	}
+}

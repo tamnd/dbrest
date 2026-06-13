@@ -110,6 +110,7 @@ func (a *app) rebuildLocked() error {
 	srv.SetMaxRows(a.cfg.MaxRows)
 	srv.SetMaxRequestBody(a.cfg.MaxRequestBody)
 	srv.SetServerTimingEnabled(a.cfg.ServerTimingEnabled)
+	srv.SetTxEnd(a.cfg.TxEnd)
 	srv.SetPlanEnabled(a.cfg.PlanEnabled)
 	srv.SetAggregatesEnabled(a.cfg.AggregatesEnabled)
 	srv.SetPreRequest(a.cfg.PreRequest)

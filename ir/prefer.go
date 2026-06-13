@@ -160,6 +160,45 @@ func (p *PreferSet) set(k, v string) bool {
 	return true
 }
 
+// ResolveTx applies the db-tx-end server policy to a parsed tx= preference.
+// PostgREST only honors Prefer: tx= under the two allow-override variants; with
+// the fixed commit or rollback policy the preference is not honored, not echoed,
+// and is a handling=strict offender, and the rollback policy forces a rollback
+// even when the client said nothing. It must run after ParsePrefer and before
+// the effective TxMode is read; a later StrictError call then sees a disallowed
+// tx= as an offender.
+func (p *PreferSet) ResolveTx(policy TxEnd) {
+	clientToken, clientSent := p.applied["tx"]
+	override := policy == TxEndCommitAllowOverride || policy == TxEndRollbackAllowOverride
+	if !override {
+		// tx= cannot override the outcome: drop the echo, reject it under strict,
+		// and force the policy's fixed outcome.
+		if clientSent {
+			delete(p.applied, "tx")
+			if p.Handling == HandlingStrict {
+				p.invalid = append(p.invalid, clientToken)
+			}
+		}
+		if policy == TxEndRollback {
+			t := TxRollback
+			p.Tx = &t
+		} else {
+			p.Tx = nil
+		}
+		return
+	}
+	// An allow-override mode honors a client tx= (already echoed) and otherwise
+	// applies the mode default, which is not echoed.
+	if !clientSent {
+		if policy == TxEndRollbackAllowOverride {
+			t := TxRollback
+			p.Tx = &t
+		} else {
+			p.Tx = nil
+		}
+	}
+}
+
 // StrictError returns the PGRST122 a handling=strict request earns when it
 // carries any unknown preference or bad value, and nil otherwise (including the
 // default lenient handling, which ignores the offenders).

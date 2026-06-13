@@ -184,6 +184,9 @@ func TestRPCPostVolatilePersists(t *testing.T) {
 
 func TestRPCPostVolatileRollback(t *testing.T) {
 	srv := newRPCServer(t)
+	// tx= is only honored under an allow-override db-tx-end policy; the default
+	// commit ignores it (02.4). Enable override so the rollback takes effect.
+	srv.SetTxEnd("commit-allow-override")
 	resp := send(t, srv, http.MethodPost, "/rpc/bump_year", `{"film_id":2}`, map[string]string{
 		"Prefer": "tx=rollback",
 	})

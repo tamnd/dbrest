@@ -53,6 +53,7 @@ type Server struct {
 	appSettings     map[string]string
 	logQuery        bool // log-query, carried to the backend per request
 	timingEnabled   bool // server-timing-enabled; the Server-Timing header is off by default
+	txEnd           ir.TxEnd // db-tx-end; governs whether Prefer: tx= is honored
 }
 
 // NewServer builds a Server over a backend, its introspected model, and the
@@ -190,6 +191,11 @@ func (s *Server) SetLogQuery(on bool) { s.logQuery = on }
 // PostgREST, so the wire is unchanged until an operator opts in.
 func (s *Server) SetServerTimingEnabled(on bool) { s.timingEnabled = on }
 
+// SetTxEnd applies the db-tx-end option, the policy that decides whether a
+// request's Prefer: tx= may override the transaction outcome. The default
+// commit ignores the preference, matching PostgREST.
+func (s *Server) SetTxEnd(v string) { s.txEnd = ir.ParseTxEnd(v) }
+
 // SetVerifier attaches a JWT verifier. Once set, the role and claims of each
 // request come from its bearer token (spec 13), and a bad token is rejected
 // before any query runs. With no verifier the server keeps the static role.
@@ -292,6 +298,14 @@ func (s *Server) resolveSchema(r *http.Request) (string, bool, *pgerr.APIError) 
 func errUnacceptableSchema(profile string, schemas []string) *pgerr.APIError {
 	e := pgerr.New(http.StatusNotAcceptable, "PGRST106", "Invalid schema: "+profile)
 	return e.WithHint("Only the following schemas are exposed: " + strings.Join(schemas, ", "))
+}
+
+// applyTxPolicy resolves a request's Prefer: tx= against the db-tx-end server
+// policy and returns the PGRST122 a handling=strict request earns when tx= is
+// disallowed. It runs after parsing and before execution on every method.
+func (s *Server) applyTxPolicy(p *ir.PreferSet) *pgerr.APIError {
+	p.ResolveTx(s.txEnd)
+	return p.StrictError()
 }
 
 // applyControls applies a backend's response controls and returns the status to
@@ -580,6 +594,10 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request, fn string, id
 	}
 	t.mark("parse", parseStart)
 	call.Singular = media == mediaObject
+	if apiErr := s.applyTxPolicy(&call.Prefer); apiErr != nil {
+		writeError(w, apiErr)
+		return
+	}
 	// db-max-rows caps an RPC response like a read (an implicit LIMIT).
 	call.Limit = s.capLimit(call.Limit)
 
@@ -692,6 +710,11 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, id identity,
 	}
 	t.mark("parse", parseStart)
 	q.Singular = media == mediaObject
+
+	if apiErr := s.applyTxPolicy(&q.Prefer); apiErr != nil {
+		writeError(w, apiErr)
+		return
+	}
 
 	// Range: header overrides ?limit=&offset= and marks the request as a
 	// Range request so the server can return 206 Partial Content. PostgREST
@@ -813,6 +836,18 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, kind ir.Que
 	}
 	t.mark("parse", parseStart)
 	q.Singular = media == mediaObject
+
+	if apiErr := s.applyTxPolicy(&q.Prefer); apiErr != nil {
+		writeError(w, apiErr)
+		return
+	}
+	if q.Write != nil {
+		if q.Prefer.Tx != nil {
+			q.Write.Tx = *q.Prefer.Tx
+		} else {
+			q.Write.Tx = ir.TxAuto
+		}
+	}
 
 	planStart := time.Now()
 	planned, apiErr := plan.Write(s.Model(), q, []string{activeSchema})
