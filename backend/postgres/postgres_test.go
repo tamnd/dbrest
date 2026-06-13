@@ -4,10 +4,36 @@ import (
 	"context"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/tamnd/dbrest/pgerr"
 )
+
+// TestResolveExecMode covers finding 02-P09: the pooler-tolerant cache_describe
+// default is used only when the DSN does not name a mode, and an operator's
+// default_query_exec_mode choice in the DSN (the documented PgBouncer escape
+// hatch) is honored rather than clobbered.
+func TestResolveExecMode(t *testing.T) {
+	cases := []struct {
+		name   string
+		dsn    string
+		parsed pgx.QueryExecMode
+		want   pgx.QueryExecMode
+	}{
+		{"omitted defaults to cache_describe", "postgres://u:p@h/db", pgx.QueryExecModeCacheStatement, pgx.QueryExecModeCacheDescribe},
+		{"simple_protocol honored", "postgres://u:p@h/db?default_query_exec_mode=simple_protocol", pgx.QueryExecModeSimpleProtocol, pgx.QueryExecModeSimpleProtocol},
+		{"exec honored", "postgres://u:p@h/db?default_query_exec_mode=exec", pgx.QueryExecModeExec, pgx.QueryExecModeExec},
+		{"explicit cache_statement honored", "postgres://u:p@h/db?default_query_exec_mode=cache_statement", pgx.QueryExecModeCacheStatement, pgx.QueryExecModeCacheStatement},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveExecMode(tc.dsn, tc.parsed); got != tc.want {
+				t.Errorf("resolveExecMode(%q, %v) = %v, want %v", tc.dsn, tc.parsed, got, tc.want)
+			}
+		})
+	}
+}
 
 // MapError maps PostgreSQL SQLSTATE codes to the API error envelope the way
 // PostgREST does. Unit tests drive mapPgError and statusForSQLState directly so

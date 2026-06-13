@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -61,11 +62,7 @@ func Open(dsn string) (*Backend, error) {
 	if cfg.MaxConns < 1 {
 		cfg.MaxConns = defaultPoolMaxConns
 	}
-	// Enable automatic prepared-statement caching so the server parses each
-	// distinct query only once per connection. pgx stores the type-descriptor
-	// cache on the connection; pgxpool serializes reuse so the cache is
-	// consistent per connection lifetime.
-	cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeCacheDescribe
+	cfg.ConnConfig.DefaultQueryExecMode = resolveExecMode(dsn, cfg.ConnConfig.DefaultQueryExecMode)
 	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
 	if err != nil {
 		return nil, err
@@ -92,6 +89,22 @@ func Open(dsn string) (*Backend, error) {
 		}
 	}
 	return &Backend{pool: pool, version: ParseVersion(ver), loc: loc}, nil
+}
+
+// resolveExecMode picks the pool's default query exec mode. dbrest defaults to
+// cache_describe so the server parses each distinct query once per connection
+// while keeping unnamed statements, which a transaction-mode pooler (PgBouncer)
+// tolerates. An operator can still override it in the DSN
+// (default_query_exec_mode=simple_protocol or exec, pgx's documented escape hatch
+// for poolers); honor that choice rather than clobbering it. pgx parses the param
+// into parsed, but an omitted value and an explicit cache_statement both decode to
+// the same zero value, so the presence test keys on the raw DSN string, where the
+// param name is unambiguous.
+func resolveExecMode(dsn string, parsed pgx.QueryExecMode) pgx.QueryExecMode {
+	if strings.Contains(dsn, "default_query_exec_mode") {
+		return parsed
+	}
+	return pgx.QueryExecModeCacheDescribe
 }
 
 // Pool exposes the underlying connection pool, for tests that seed a database.
