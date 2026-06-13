@@ -988,6 +988,40 @@ func TestIntegrationDataRepresentations(t *testing.T) {
 	if !strings.Contains(got[0], "#0000ff") {
 		t.Errorf("read c = %q, want it formatted as #0000ff", got[0])
 	}
+
+	// GET /shirts?select=id,c&c=in.(#0000ff,#00ff00) filters by an IN list of
+	// formatted values: each element parses through the from-text cast over the
+	// unpacked array (= ANY), matching PostgREST. Only the seeded #0000ff row
+	// exists, so the list still resolves to one match.
+	inq, perr := ir.ParseRead("shirts", "select=id,c&c=in.(%230000ff,%2300ff00)", nil)
+	if perr != nil {
+		t.Fatalf("parse in: %v", perr)
+	}
+	inp, perr := planpkg.Read(model, inq, []string{"_p11dr"}, planpkg.Options{})
+	if perr != nil {
+		t.Fatalf("plan.Read in: %v", perr)
+	}
+	inp.Rel = rel
+	inres, err := be.Execute(ctx, inp, &reqctx.Context{Method: "GET", Path: "/shirts"})
+	if err != nil {
+		t.Fatalf("Execute(in read): %v", err)
+	}
+	irs := inres.Rows()
+	defer irs.Close()
+	var ingot []string
+	for irs.Next() {
+		vals, err := irs.Values()
+		if err != nil {
+			t.Fatalf("Values: %v", err)
+		}
+		ingot = append(ingot, fmt.Sprintf("%v", vals[1]))
+	}
+	if err := irs.Err(); err != nil {
+		t.Fatalf("row error: %v", err)
+	}
+	if len(ingot) != 1 || !strings.Contains(ingot[0], "#0000ff") {
+		t.Errorf("filter by representation IN returned %v, want one #0000ff row", ingot)
+	}
 }
 
 // TestIntegrationMergedRegistry covers finding 03-P13: a declared portable

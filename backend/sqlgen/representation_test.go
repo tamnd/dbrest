@@ -123,6 +123,83 @@ func TestRepInsertReturningAppliesToJSON(t *testing.T) {
 	}
 }
 
+// repWhere compiles a single-filter read over the shirts fixture and returns the
+// statement, keeping the operator tests short.
+func repWhere(t *testing.T, d Dialect, c ir.Compare) *Statement {
+	t.Helper()
+	where := ir.Cond(c)
+	st, err := CompileRead(d, &ir.Query{
+		Relation: ir.Ref{Name: "shirts"},
+		Where:    &where,
+		Reps:     map[string]ir.Rep{"c": colorRep},
+	})
+	if err != nil {
+		t.Fatalf("CompileRead: %v", err)
+	}
+	return st
+}
+
+// TestRepFilterMatchAppliesFromText: a regex match on a represented column parses
+// the pattern through the from-text cast, matching PostgREST's match/imatch path.
+func TestRepFilterMatchAppliesFromText(t *testing.T) {
+	st := repWhere(t, stub{}, ir.Compare{Path: []string{"c"}, Op: ir.OpMatch, Value: ir.Value{Text: "#ff"}})
+	want := `SELECT * FROM "shirts" WHERE "c" ~ "_p11dr"."color"($1::text)`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+}
+
+// TestRepFilterContainsAppliesFromText: the simple-operator path (cs/cd/ov, range)
+// parses the operand through the from-text cast, as PostgREST does.
+func TestRepFilterContainsAppliesFromText(t *testing.T) {
+	st := repWhere(t, stub{}, ir.Compare{Path: []string{"c"}, Op: ir.OpContains, Value: ir.Value{Text: "{1,2}"}})
+	want := `SELECT * FROM "shirts" WHERE "c" @> "_p11dr"."color"($1::text)`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+}
+
+// TestRepFilterLikeStaysRaw: like/ilike carry a wildcard pattern, so PostgREST
+// binds them raw even on a represented column. Confirm dbrest does not wrap them.
+func TestRepFilterLikeStaysRaw(t *testing.T) {
+	st := repWhere(t, stub{}, ir.Compare{Path: []string{"c"}, Op: ir.OpLike, Value: ir.Value{Text: "#ff%"}})
+	want := `SELECT * FROM "shirts" WHERE "c" LIKE $1`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+}
+
+// TestRepFilterInPerElement: on an engine without a native = ANY list bind, IN
+// expands per element and each element parses through the from-text cast.
+func TestRepFilterInPerElement(t *testing.T) {
+	st := repWhere(t, stub{}, ir.Compare{Path: []string{"c"}, Op: ir.OpIn, Value: ir.Value{List: []string{"#0000ff", "#00ff00"}}})
+	want := `SELECT * FROM "shirts" WHERE "c" IN (` +
+		`"_p11dr"."color"($1::text), "_p11dr"."color"($2::text))`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+}
+
+// anyListStub is a stub whose InList binds the list as one = ANY array, like the
+// PostgreSQL dialect, so the IN representation path can be asserted in its native
+// unnest form.
+type anyListStub struct{ stub }
+
+func (anyListStub) InList(col string) (string, bool) {
+	return col + " = ANY(" + PatternMark + ")", true
+}
+
+// TestRepFilterInAnyUnnest: on a = ANY engine the represented IN list parses each
+// element over the unpacked array, matching PostgREST's pgFmtArrayLiteralForField.
+func TestRepFilterInAnyUnnest(t *testing.T) {
+	st := repWhere(t, anyListStub{}, ir.Compare{Path: []string{"c"}, Op: ir.OpIn, Value: ir.Value{List: []string{"#0000ff", "#00ff00"}}})
+	want := `SELECT * FROM "shirts" WHERE "c" = ANY(` +
+		`(SELECT "_p11dr"."color"(unnest($1::text[]))))`
+	if st.SQL != want {
+		t.Errorf("SQL = %q, want %q", st.SQL, want)
+	}
+}
+
 // TestRepReadExplicitCastOptsOut confirms an explicit client cast (col::type)
 // suppresses the to-json representation: the client asked for a specific
 // rendering, so the domain's formatter is not applied.

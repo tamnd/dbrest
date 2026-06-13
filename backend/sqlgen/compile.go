@@ -131,21 +131,32 @@ func (b *builder) repCall(funcSchema, funcName, arg string) string {
 	return b.d.QuoteIdent(funcSchema) + "." + b.d.QuoteIdent(funcName) + "(" + arg + ")"
 }
 
-// filterValue binds a comparison literal, parsing it through the column's
-// from-text data representation when one is present (spec 11): a value the client
-// read back through a representation filters against the stored value via the
-// domain's text cast. It applies only to a plain (non-JSON-path) column, and the
-// placeholder is typed text so the schema-qualified cast function resolves as a
-// call rather than as the domain's own input syntax. A column with no from-text
-// cast binds the literal unchanged.
-func (b *builder) filterValue(c ir.Compare) string {
-	ph := b.bind(c.Value.Text)
-	if len(c.Path) == 1 {
-		if rep, ok := b.reps[c.Path[0]]; ok && rep.FromTextFunc != "" {
-			return b.repCall(rep.FromTextSchema, rep.FromTextFunc, ph+"::text")
-		}
+// fromTextValue binds a filter operand, parsing it through the column's from-text
+// data representation when one is present (spec 11). It mirrors PostgREST's
+// pgFmtUnknownLiteralForField: the domain's text cast wraps the operand for every
+// operator that compares against a typed value (eq, neq, the orderings, regex
+// match, the array/range operators, and each IN element). The placeholder is
+// typed text so the schema-qualified cast function resolves as a call rather than
+// as the domain's own input syntax. PostgREST skips the parse for like/ilike (the
+// operand is a wildcard pattern), full-text search, and is, so those callers bind
+// the literal directly instead of going through here. A JSON-path operand is
+// never a represented column, and a column with no from-text cast binds the
+// literal unchanged.
+func (b *builder) fromTextValue(colName string, isJSON bool, raw string) string {
+	ph := b.bind(raw)
+	if isJSON {
+		return ph
+	}
+	if rep, ok := b.reps[colName]; ok && rep.FromTextFunc != "" {
+		return b.repCall(rep.FromTextSchema, rep.FromTextFunc, ph+"::text")
 	}
 	return ph
+}
+
+// filterValue binds a comparison literal through the column's from-text data
+// representation, the common path for eq/neq and the orderings.
+func (b *builder) filterValue(c ir.Compare) string {
+	return b.fromTextValue(c.Path[0], len(c.Path) > 1, c.Value.Text)
 }
 
 // writeValue binds an insert/update value, parsing it through the column's
@@ -887,7 +898,7 @@ func (b *builder) writeCompare(c ir.Compare) *pgerr.APIError {
 			return pgerr.ErrUnsupported("case-insensitive LIKE", "sql")
 		}
 	case ir.OpIn:
-		frag, err = b.writeIn(col, c.Value.List)
+		frag, err = b.writeIn(col, c.Path[0], isJSON, c.Value.List)
 	case ir.OpIs:
 		frag, err = b.writeIs(col, c.Value.Text)
 	case ir.OpMatch, ir.OpIMatch:
@@ -902,8 +913,9 @@ func (b *builder) writeCompare(c ir.Compare) *pgerr.APIError {
 			return pgerr.ErrUnsupported("regular-expression match", "sql")
 		}
 		// Regex returns an already-formed boolean expression carrying PatternMark
-		// where the bound pattern placeholder goes.
-		frag = strings.Replace(expr, PatternMark, b.bind(c.Value.Text), 1)
+		// where the bound pattern placeholder goes. A represented column parses the
+		// pattern through its from-text cast, as PostgREST does for match/imatch.
+		frag = strings.Replace(expr, PatternMark, b.fromTextValue(c.Path[0], isJSON, c.Value.Text), 1)
 	case ir.OpFTS:
 		frag, err = b.writeFTS(c, col)
 	case ir.OpIsDistinct:
@@ -919,8 +931,10 @@ func (b *builder) writeCompare(c ir.Compare) *pgerr.APIError {
 			sqlOp = "&&"
 		}
 		// Normalize the PostgreSQL {a,b} array literal to the engine's format
-		// before binding; the dialect is a no-op for engines that accept {a,b}.
-		val := b.bind(b.d.ArrayLiteral(c.Value.Text))
+		// before binding; the dialect is a no-op for engines that accept {a,b}. A
+		// represented column parses the literal through its from-text cast, matching
+		// PostgREST's simple-operator path.
+		val := b.fromTextValue(c.Path[0], isJSON, b.d.ArrayLiteral(c.Value.Text))
 		var ok bool
 		frag, ok = b.d.ArrayOp(col, sqlOp, val, c.ColumnType)
 		if !ok {
@@ -941,7 +955,7 @@ func (b *builder) writeCompare(c ir.Compare) *pgerr.APIError {
 			rop = "-|-"
 		}
 		var ok bool
-		frag, ok = b.d.RangeOp(col, rop, b.bind(c.Value.Text))
+		frag, ok = b.d.RangeOp(col, rop, b.fromTextValue(c.Path[0], isJSON, c.Value.Text))
 		if !ok {
 			return pgerr.ErrUnsupported("range operator "+opName(c.Op), "sql")
 		}
@@ -982,11 +996,13 @@ func (b *builder) writeFTS(c ir.Compare, col string) (string, *pgerr.APIError) {
 	return strings.Replace(expr, PatternMark, b.bind(bindVal), 1), nil
 }
 
-func (b *builder) writeIn(col string, list []string) (string, *pgerr.APIError) {
+func (b *builder) writeIn(col, colName string, isJSON bool, list []string) (string, *pgerr.APIError) {
 	if len(list) == 0 {
 		// `col IN ()` is a syntax error; an empty IN matches nothing.
 		return "1 = 0", nil
 	}
+	rep, hasRep := b.reps[colName]
+	useRep := !isJSON && hasRep && rep.FromTextFunc != ""
 	// On an engine that binds the list as a single array (PostgreSQL's = ANY), every
 	// list length is one prepared statement instead of one per length. The element
 	// quoting is PostgreSQL's array-literal format, the same the array operators use,
@@ -998,11 +1014,22 @@ func (b *builder) writeIn(col string, list []string) (string, *pgerr.APIError) {
 			elems[i] = v
 		}
 		ph := b.bind(PGArrayLiteral(elems))
-		return strings.Replace(frag, PatternMark, ph, 1), nil
+		operand := ph
+		if useRep {
+			// A represented column parses each element through its from-text cast,
+			// applied over the unpacked array, matching PostgREST's
+			// pgFmtArrayLiteralForField.
+			operand = "(SELECT " + b.repCall(rep.FromTextSchema, rep.FromTextFunc, "unnest("+ph+"::text[])") + ")"
+		}
+		return strings.Replace(frag, PatternMark, operand, 1), nil
 	}
 	parts := make([]string, len(list))
 	for i, v := range list {
-		parts[i] = b.bind(v)
+		if useRep {
+			parts[i] = b.repCall(rep.FromTextSchema, rep.FromTextFunc, b.bind(v)+"::text")
+		} else {
+			parts[i] = b.bind(v)
+		}
 	}
 	return col + " IN (" + strings.Join(parts, ", ") + ")", nil
 }
@@ -1024,9 +1051,11 @@ func (b *builder) writeQuantified(col string, c ir.Compare) (string, *pgerr.APIE
 	if c.Quant == ir.QAll {
 		sep = " AND "
 	}
+	colName := c.Path[0]
+	isJSON := len(c.Path) > 1
 	parts := make([]string, len(list))
 	for i, v := range list {
-		frag, err := b.quantElem(col, c.Op, v)
+		frag, err := b.quantElem(col, colName, isJSON, c.Op, v)
 		if err != nil {
 			return "", err
 		}
@@ -1040,9 +1069,13 @@ func (b *builder) writeQuantified(col string, c ir.Compare) (string, *pgerr.APIE
 
 // quantElem lowers one element of a quantified list to its single-operator SQL
 // predicate, using the operator's real infix/regex/ILIKE form.
-func (b *builder) quantElem(col string, op ir.Op, v string) (string, *pgerr.APIError) {
+func (b *builder) quantElem(col, colName string, isJSON bool, op ir.Op, v string) (string, *pgerr.APIError) {
 	switch op {
-	case ir.OpEq, ir.OpGt, ir.OpGte, ir.OpLt, ir.OpLte, ir.OpLike:
+	case ir.OpEq, ir.OpGt, ir.OpGte, ir.OpLt, ir.OpLte:
+		return col + " " + binaryOp(op) + " " + b.fromTextValue(colName, isJSON, v), nil
+	case ir.OpLike:
+		// like carries a wildcard pattern, so PostgREST binds it raw even on a
+		// represented column.
 		return col + " " + binaryOp(op) + " " + b.bind(v), nil
 	case ir.OpILike:
 		expr, ok := b.d.ILike(col, b.bind(v))
@@ -1058,7 +1091,7 @@ func (b *builder) quantElem(col string, op ir.Op, v string) (string, *pgerr.APIE
 		if !ok {
 			return "", pgerr.ErrUnsupported("regular-expression match", "sql")
 		}
-		return strings.Replace(expr, PatternMark, b.bind(v), 1), nil
+		return strings.Replace(expr, PatternMark, b.fromTextValue(colName, isJSON, v), 1), nil
 	default:
 		return "", pgerr.ErrUnsupported("quantifier on "+opName(op), "sql")
 	}
