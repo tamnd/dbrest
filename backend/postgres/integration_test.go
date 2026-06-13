@@ -117,7 +117,7 @@ func TestIntegrationReadWrite(t *testing.T) {
 			Kind:     ir.Insert,
 			Relation: ir.Ref{Schema: "public", Name: "_dbrest_test_rw"},
 			Write: &ir.WriteSpec{
-				Rows:    []map[string]ir.Value{{"val": {Text: "hello"}}},
+				Rows:    []map[string]ir.Value{{"val": {JSON: "hello"}}},
 				Columns: []string{"val"},
 				Return:  ir.ReturnMinimal,
 			},
