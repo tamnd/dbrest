@@ -79,6 +79,9 @@ func (stub) SessionWrite(k string) (string, bool) { return "", false }
 func (stub) ArrayOp(col, op, val, _ string) (string, bool) {
 	return col + " " + op + " " + val, true
 }
+func (stub) RangeOp(col, op, val string) (string, bool) {
+	return col + " " + op + " " + val, true
+}
 func (stub) ArrayLiteral(s string) string         { return s }
 func (stub) ArrayArg(e []any) any                 { return JSONArrayArg(e) }
 func (stub) ILike(col, val string) (string, bool) { return col + " ILIKE " + val, true }
@@ -520,12 +523,13 @@ func TestCompileInsertEmptyPayloadRejected(t *testing.T) {
 	}
 }
 
-// The base SQL compiler does not lower the array and range operators; a backend
-// grades them per dialect. A read using one here reports PGRST127 and names the
-// operator, rather than emitting a quietly different predicate.
+// A range operator on an engine whose dialect declines (no range types) reports
+// PGRST127 and names the PostgREST token, rather than emitting a quietly
+// different predicate. A range-capable dialect lowers it instead; see
+// rangeop_test.go.
 func TestCompileRangeOperatorRejectedNamed(t *testing.T) {
 	where := ir.Cond(ir.Compare{Path: []string{"period"}, Op: ir.OpRangeSL, Value: ir.Value{Text: "[1,2)"}})
-	_, err := CompileRead(stub{}, &ir.Query{Relation: ir.Ref{Name: "t"}, Where: &where})
+	_, err := CompileRead(noRangeDialect{}, &ir.Query{Relation: ir.Ref{Name: "t"}, Where: &where})
 	if err == nil || err.Code != "PGRST127" {
 		t.Fatalf("want PGRST127, got %v", err)
 	}

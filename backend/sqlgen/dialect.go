@@ -131,6 +131,14 @@ type Dialect interface {
 	// JSON path. An engine without JSON paths returns ok=false and the compiler
 	// raises PGRST127.
 	JSONPath(base string, hops []string, asText bool) (frag string, ok bool)
+
+	// RangeOp renders a range-type operator expression (PostgREST sl/sr/nxr/nxl/
+	// adj), or reports ok=false when the engine has no range types so the compiler
+	// raises PGRST127. op is the engine-neutral PostgreSQL spelling "<<", ">>",
+	// "&<", "&>", or "-|-"; col is the quoted column; val is the placeholder
+	// returned by bind(). PostgreSQL emits the native operator; engines without
+	// range types decline.
+	RangeOp(col, op, val string) (string, bool)
 }
 
 // PatternMark is the sentinel a Dialect.Regex fragment carries where the bound

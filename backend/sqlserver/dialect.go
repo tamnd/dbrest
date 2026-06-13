@@ -243,6 +243,10 @@ func (Dialect) ArrayOp(col, op, val, _ string) (string, bool) {
 	return "", false
 }
 
+// RangeOp declines: SQL Server has no range types, so sl/sr/nxr/nxl/adj are
+// PGRST127.
+func (Dialect) RangeOp(_, _, _ string) (string, bool) { return "", false }
+
 // IsBool renders "col = 1" or "col = 0" for SQL Server BIT columns. SQL
 // Server's IS operator only accepts NULL/UNKNOWN, not integer literals.
 func (Dialect) IsBool(col string, v bool) (string, bool) {

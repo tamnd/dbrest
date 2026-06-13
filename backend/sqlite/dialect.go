@@ -217,6 +217,9 @@ func (dialect) ArrayOp(col, op, val, colType string) (string, bool) {
 	return "", false
 }
 
+// RangeOp declines: SQLite has no range types, so sl/sr/nxr/nxl/adj are PGRST127.
+func (dialect) RangeOp(_, _, _ string) (string, bool) { return "", false }
+
 // ILike uses plain LIKE which is case-insensitive for ASCII in SQLite.
 func (dialect) ILike(col, val string) (string, bool) { return col + " LIKE " + val, true }
 

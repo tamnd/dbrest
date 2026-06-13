@@ -755,6 +755,25 @@ func (b *builder) writeCompare(c ir.Compare) *pgerr.APIError {
 		if !ok {
 			return pgerr.ErrUnsupported("array operator "+sqlOp, "sql")
 		}
+	case ir.OpRangeSL, ir.OpRangeSR, ir.OpRangeNXR, ir.OpRangeNXL, ir.OpRangeAdj:
+		var rop string
+		switch c.Op {
+		case ir.OpRangeSL:
+			rop = "<<"
+		case ir.OpRangeSR:
+			rop = ">>"
+		case ir.OpRangeNXR:
+			rop = "&<"
+		case ir.OpRangeNXL:
+			rop = "&>"
+		default:
+			rop = "-|-"
+		}
+		var ok bool
+		frag, ok = b.d.RangeOp(col, rop, b.bind(c.Value.Text))
+		if !ok {
+			return pgerr.ErrUnsupported("range operator "+opName(c.Op), "sql")
+		}
 	default:
 		return pgerr.ErrUnsupported("filter operator "+opName(c.Op), "sql")
 	}

@@ -226,6 +226,11 @@ func (Dialect) ArrayOp(col, op, val, _ string) (string, bool) {
 	return col + " " + op + " " + val, true
 }
 
+// RangeOp renders PostgreSQL's native range operators (<<, >>, &<, &>, -|-).
+func (Dialect) RangeOp(col, op, val string) (string, bool) {
+	return col + " " + op + " " + val, true
+}
+
 // ILike renders col ILIKE val using PostgreSQL's native case-insensitive LIKE.
 func (Dialect) ILike(col, val string) (string, bool) { return col + " ILIKE " + val, true }
 

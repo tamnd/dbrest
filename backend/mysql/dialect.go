@@ -212,6 +212,9 @@ func (Dialect) ArrayOp(col, op, val, colType string) (string, bool) {
 	return "", false
 }
 
+// RangeOp declines: MySQL has no range types, so sl/sr/nxr/nxl/adj are PGRST127.
+func (Dialect) RangeOp(_, _, _ string) (string, bool) { return "", false }
+
 // ILike uses plain LIKE; MySQL's default utf8mb4_unicode_ci collation is CI.
 func (Dialect) ILike(col, val string) (string, bool) { return col + " LIKE " + val, true }
 
