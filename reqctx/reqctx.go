@@ -16,6 +16,7 @@ package reqctx
 
 import (
 	"encoding/json"
+	"maps"
 	"sort"
 	"strings"
 )
@@ -71,12 +72,31 @@ type Context struct {
 // ClaimsJSON marshals the verified claims into the object request.jwt.claims
 // carries. It is "{}" when there are no claims, never null, so a backend that
 // writes the GUC verbatim and a policy that reads it both see a valid object.
+//
+// The resolved request role is folded in under the "role" key, overwriting any
+// role the token carried, exactly as PostgREST does (PreQuery.hs inserts the
+// resolved role into the claims before writing the GUC). So an anonymous request
+// presents {"role":"<anon-role>"} rather than {}, and the common RLS pattern
+// current_setting('request.jwt.claims', true)::json->>'role' reads the role on
+// every request, the case PostgREST guarantees a value.
 func (c *Context) ClaimsJSON() []byte {
-	if len(c.Claims) == 0 {
-		return []byte("{}")
+	if c.Role == "" {
+		// No resolved role to fold in (the fail-closed frontend always sets one, so
+		// this is the degenerate case); marshal the claims as they are.
+		if len(c.Claims) == 0 {
+			return []byte("{}")
+		}
+		b, err := json.Marshal(c.Claims)
+		if err != nil {
+			return []byte("{}")
+		}
+		return b
 	}
+	merged := make(map[string]any, len(c.Claims)+1)
+	maps.Copy(merged, c.Claims)
+	merged["role"] = c.Role
 	// encoding/json sorts map keys, so the output is deterministic.
-	b, err := json.Marshal(c.Claims)
+	b, err := json.Marshal(merged)
 	if err != nil {
 		return []byte("{}")
 	}
@@ -84,13 +104,24 @@ func (c *Context) ClaimsJSON() []byte {
 }
 
 // HeadersJSON marshals the request headers into the object request.headers
-// carries: a JSON object of lower-cased header name to value, with a multi-valued
-// header joined by ", " as HTTP defines. Keys are sorted for a deterministic
-// document.
+// carries: a JSON object of lower-cased header name to value. Keys are sorted
+// for a deterministic document.
+//
+// Two rules match PostgREST exactly (ApiRequest.hs). The Cookie header is
+// excluded, because it is delivered separately as request.cookies; including it
+// would leak raw cookie material into code that only consults headers. A header
+// sent more than once resolves to its last value (later wins), not a comma-join,
+// reproducing how PostgREST's later pair overwrites the earlier in the object.
 func (c *Context) HeadersJSON() []byte {
 	flat := make(map[string]string, len(c.Headers))
 	for k, vs := range c.Headers {
-		flat[strings.ToLower(k)] = strings.Join(vs, ", ")
+		lk := strings.ToLower(k)
+		if lk == "cookie" {
+			continue
+		}
+		if len(vs) > 0 {
+			flat[lk] = vs[len(vs)-1]
+		}
 	}
 	return marshalSortedObject(flat)
 }

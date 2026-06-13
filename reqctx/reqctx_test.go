@@ -24,10 +24,40 @@ func TestHeadersJSONFlattensAndLowercases(t *testing.T) {
 		"Accept":        {"application/json"},
 		"Cache-Control": {"no-cache", "no-store"},
 	}}
-	// Lower-cased names, sorted keys, a multi-valued header joined by ", ".
-	want := `{"accept":"application/json","cache-control":"no-cache, no-store","x-tenant":"acme"}`
+	// Lower-cased names, sorted keys, a repeated header resolved to its last value
+	// (PostgREST's later-wins), not a comma-join.
+	want := `{"accept":"application/json","cache-control":"no-store","x-tenant":"acme"}`
 	if got := string(c.HeadersJSON()); got != want {
 		t.Errorf("HeadersJSON() = %q, want %q", got, want)
+	}
+}
+
+// The Cookie header is excluded from request.headers (it is request.cookies),
+// matching PostgREST, verified against PostgREST 14.12. A repeated header keeps
+// its last value.
+func TestHeadersJSONExcludesCookieAndKeepsLast(t *testing.T) {
+	c := &Context{Headers: map[string][]string{
+		"Cookie": {"sessionid=abc123"},
+		"X-Dup":  {"first", "second"},
+	}}
+	want := `{"x-dup":"second"}`
+	if got := string(c.HeadersJSON()); got != want {
+		t.Errorf("HeadersJSON() = %q, want %q", got, want)
+	}
+}
+
+// The resolved role is folded into request.jwt.claims under "role", overwriting
+// any token role, matching PostgREST 14.12 (anonymous presents the anon role).
+func TestClaimsJSONFoldsInRole(t *testing.T) {
+	// Anonymous: no claims, the resolved role still appears.
+	anon := &Context{Role: "anon"}
+	if got := string(anon.ClaimsJSON()); got != `{"role":"anon"}` {
+		t.Errorf("anon ClaimsJSON() = %q, want {\"role\":\"anon\"}", got)
+	}
+	// Authenticated: the resolved role overwrites whatever the token carried.
+	auth := &Context{Role: "web_user", Claims: map[string]any{"role": "stale", "sub": "alice"}}
+	if got := string(auth.ClaimsJSON()); got != `{"role":"web_user","sub":"alice"}` {
+		t.Errorf("auth ClaimsJSON() = %q", got)
 	}
 }
 

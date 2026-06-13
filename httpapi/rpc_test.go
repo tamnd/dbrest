@@ -640,7 +640,11 @@ func TestRPCInvertedRangeOnGetIs416(t *testing.T) {
 	}
 }
 
-func TestRPCContextJWTClaimsEmptyObject(t *testing.T) {
+// An anonymous request still carries the resolved role in request.jwt.claims:
+// PostgREST folds the role into the claims object even when the token had none,
+// so the claims are {"role":"<anon-role>"}, not {}. Verified against PostgREST
+// 14.12, where an anonymous call presents {"role":"<db-anon-role>"}.
+func TestRPCContextJWTClaimsCarriesAnonRole(t *testing.T) {
 	srv := newRPCServer(t)
 	resp := send(t, srv, http.MethodPost, "/rpc/get_jwt_claims", `{}`, nil)
 	if resp.StatusCode != http.StatusOK {
@@ -650,7 +654,7 @@ func TestRPCContextJWTClaimsEmptyObject(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&claims); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(claims) != 0 {
-		t.Errorf("claims = %v, want empty object for anonymous", claims)
+	if len(claims) != 1 || claims["role"] != "anon" {
+		t.Errorf("claims = %v, want {\"role\":\"anon\"}", claims)
 	}
 }
